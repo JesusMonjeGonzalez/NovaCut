@@ -106,10 +106,10 @@ pendiente en documentación competitiva.
 
 ## Después del gate alpha
 
-- Color scopes, LUTs, títulos, máscaras, tracking y estabilización GPU.
-- Detección de silencios y rough cut basado en transcript.
-- Gestión de trabajos cancelables y limpieza de cache de proxies.
+- Estabilización y seguimiento GPU más allá del reencuadre facial actual.
+- Gestión completa del ciclo de vida y espacio de la caché de proxies.
 - Corpus de codecs y benchmark reproducible antes de prometer paridad profesional.
+- Pruebas UI de recuperación, revinculado y cancelación de exportaciones.
 
 ## Hecho el 8 de agosto de 2026 (tarde)
 

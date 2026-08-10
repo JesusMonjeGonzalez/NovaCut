@@ -73,7 +73,9 @@ generación y límite de espacio de la caché siguen pendientes.
 La aplicación ofrece estos presets:
 
 - MP4 H.264 de máxima calidad.
+- MP4 HEVC de máxima calidad.
 - MP4 vertical 1080x1920.
+- MOV Apple ProRes 422.
 - Audio M4A.
 - Master MOV de máxima calidad.
 

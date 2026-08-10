@@ -15,7 +15,8 @@ GPT 5.6 Luna no está disponible aún porque requiere la API Responses.
 ## Datos enviados
 
 El modo local no usa red externa. OpenCode Go recibe la orden, nombres de clips,
-entrada, salida y duración. No recibe frames, audio ni el archivo multimedia.
+pistas, entrada, salida, duración, marcadores y texto transcrito. No recibe
+frames, audio ni el archivo multimedia.
 
 La credencial procede de la conexión existente de OpenCode y no se muestra ni se
 guarda dentro del proyecto Editorcito. OpenCode Go puede consumir cuota.
@@ -39,6 +40,7 @@ modo local cuando el recognizer declara soporte en el dispositivo. Si no está
 disponible, no envía el audio a un servicio remoto.
 
 Los segmentos se convierten en cues de subtítulo, se pueden editar con el cabezal
-en el inspector y se queman en el vídeo exportado. La eliminación automática de
-silencios, la búsqueda por palabra y el rough cut basado en transcript siguen
-pendientes.
+en el inspector y se queman en el vídeo exportado. El transcript permite buscar
+palabras en toda la biblioteca, revisar muletillas y eliminar una selección
+cerrando el hueco. La detección de silencios usa un umbral relativo a la sonoridad
+del material y propone una edición reversible.
