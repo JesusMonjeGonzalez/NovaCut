@@ -1,0 +1,9 @@
+/build/
+/target/
+.env*
+!.env.example
+*.log
+.DS_Store
+
+# Local screen recordings are not publishable test fixtures.
+/tests/corpus/*.mov

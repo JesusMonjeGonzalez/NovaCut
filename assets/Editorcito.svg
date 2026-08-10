@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="900" y2="940" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17243D"/>
+      <stop offset="0.52" stop-color="#101225"/>
+      <stop offset="1" stop-color="#090A12"/>
+    </linearGradient>
+    <linearGradient id="cut" x1="250" y1="250" x2="800" y2="760" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#62F6E9"/>
+      <stop offset="1" stop-color="#2F90FF"/>
+    </linearGradient>
+    <filter id="shadow"><feGaussianBlur stdDeviation="22"/></filter>
+  </defs>
+  <rect x="44" y="44" width="936" height="936" rx="228" fill="url(#bg)"/>
+  <path d="M240 300H708M240 512H650M240 724H708" stroke="#28354E" stroke-width="118" stroke-linecap="round" opacity=".8"/>
+  <path d="M240 300H690M240 512H610M240 724H690" stroke="url(#cut)" stroke-width="58" stroke-linecap="round"/>
+  <path d="M735 210V814" stroke="#FF3E96" stroke-width="28" stroke-linecap="round"/>
+  <path d="M735 190L680 265H790Z" fill="#FF3E96"/>
+  <circle cx="735" cy="512" r="62" fill="#FF3E96" opacity=".2" filter="url(#shadow)"/>
+  <circle cx="735" cy="512" r="18" fill="#FFF4FA"/>
+</svg>
