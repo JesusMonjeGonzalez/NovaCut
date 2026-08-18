@@ -292,44 +292,44 @@ struct VistaMontaje: View {
                 if pista.tipo == .video {
                     boton(
                         pista.visible ? "eye" : "eye.slash", activo: !pista.visible,
-                        ayuda: pista.visible ? "Ocultar esta pista de vídeo" : "Volver a mostrarla",
+                        ayuda: pista.visible ? "Ocultar esta pista de vídeo" : "Volver a mostrarla"
                     ) { editor.alternarPista(pista.id, .visible) }
                 } else {
                     boton(
                         pista.silenciada ? "speaker.slash.fill" : "speaker.wave.2",
                         activo: pista.silenciada,
-                        ayuda: pista.silenciada ? "Quitar el silencio" : "Silenciar esta pista",
+                         ayuda: pista.silenciada ? "Quitar el silencio" : "Silenciar esta pista"
                     ) { editor.alternarPista(pista.id, .silencio) }
                 }
                 boton(
                     "s.circle\(pista.solo ? ".fill" : "")", activo: pista.solo,
-                    ayuda: "Solo: silencia las demás pistas de su tipo",
+                     ayuda: "Solo: silencia las demás pistas de su tipo"
                 ) { editor.alternarPista(pista.id, .solo) }
                 if pista.tipo == .audio {
                     boton(
                         pista.duckingActivo ? "arrow.down.circle.fill" : "arrow.down.circle",
                         activo: pista.duckingActivo,
-                        ayuda: "Bajar esta pista bajo el diálogo de A1",
+                         ayuda: "Bajar esta pista bajo el diálogo de A1"
                     ) { editor.alternarPista(pista.id, .ducking) }
                     // Expandir la pista de audio: más altura para leer la forma
                     // de onda y la curva de ganancia, como el chevron de Premiere.
                     boton(
                         pista.altura > 58 ? "chevron.down" : "chevron.up",
                         activo: pista.altura > 58,
-                        ayuda: pista.altura > 58 ? "Contraer la pista de audio" : "Expandir: forma de onda grande",
+                         ayuda: pista.altura > 58 ? "Contraer la pista de audio" : "Expandir: forma de onda grande"
                     ) { editor.alternarAlturaDePista(pista.id) }
                     let conProcesamiento = pista.tieneProcesamientoDeAudio
                     boton(
                         "slider.horizontal.3",
                         activo: conProcesamiento,
-                        ayuda: conProcesamiento
-                            ? "Con procesamiento (clic derecho para ajustar)"
-                            : "Sin procesamiento (clic derecho para añadir)",
+                         ayuda: conProcesamiento
+                             ? "Con procesamiento (clic derecho para ajustar)"
+                             : "Sin procesamiento (clic derecho para añadir)"
                     ) { editor.pistaActiva = pista.id }
                 }
                 boton(
                     pista.bloqueada ? "lock.fill" : "lock.open", activo: pista.bloqueada,
-                    ayuda: pista.bloqueada ? "Desbloquear la pista" : "Bloquear: nada la podrá editar",
+                     ayuda: pista.bloqueada ? "Desbloquear la pista" : "Bloquear: nada la podrá editar"
                 ) { editor.alternarPista(pista.id, .bloqueo) }
             }
             Spacer(minLength: 0)
