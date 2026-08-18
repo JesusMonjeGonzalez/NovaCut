@@ -16,6 +16,14 @@ struct MediaItem: Identifiable, Hashable {
     /// Si es un subclip, qué recorte del medio base representa.
     var subclipDe: SubclipOrigen? = nil
 
+    static func == (lhs: MediaItem, rhs: MediaItem) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
     init(id: UUID = UUID(), url: URL, duration: Double, size: CGSize, fileSize: Int64 = 0, frameRate: Double = 0, variableFrameRate: Bool = false, bin: String = "Todos", subclipDe: SubclipOrigen? = nil) {
         self.id = id
         self.url = url
@@ -271,7 +279,7 @@ final class EditorState: ObservableObject {
             forInterval: CMTime(seconds: 1.0 / 20.0, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.playhead = time.seconds.isFinite ? time.seconds : 0
                 self.isPlaying = self.player.rate != 0
@@ -282,7 +290,7 @@ final class EditorState: ObservableObject {
             forInterval: CMTime(seconds: 1.0 / 20.0, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let frame = self.timebase.frames(segundos: time.seconds)
                 self.cabezalDeOrigen = max(0, min(frame, self.duracionDeOrigenEnFrames))
@@ -887,7 +895,7 @@ final class EditorState: ObservableObject {
         temporizadorDeAngulos?.invalidate()
         let objetivo = generacionDelVisor
         temporizadorDeAngulos = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard self.generacionDelVisor == objetivo, self.isPlaying else { return }
                 self.recorregirAngulosDelVisor()
@@ -3514,8 +3522,8 @@ final class EditorState: ObservableObject {
                 session.audioMix = render.mezclaDeAudio
                 session.shouldOptimizeForNetworkUse = true
                 activeExportSession = session
-                exportTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-                    Task { @MainActor in self?.exportProgress = Double(self?.activeExportSession?.progress ?? 0) }
+                exportTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self, session] _ in
+                    self?.exportProgress = Double(session.progress)
                 }
                 await session.export()
                 if session.status == .completed {
