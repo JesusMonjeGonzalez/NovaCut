@@ -839,6 +839,12 @@ struct MontajeRenderizable {
 /// Es una ley de balance, no de potencia constante: al extremo, el canal contrario
 /// se anula del todo, que es lo que se espera al girar una perilla.
 final class TapDePaneo {
+#if compiler(>=6.3)
+    private typealias TapOut = MTAudioProcessingTap?
+#else
+    private typealias TapOut = Unmanaged<MTAudioProcessingTap>?
+#endif
+
 
     /// La ganancia de cada canal sale del paneo: −1 es todo a la izquierda y +1
     /// todo a la derecha, con interpolación lineal entre medias.
@@ -902,14 +908,19 @@ final class TapDePaneo {
                 }
             }
         )
-        var tapOut: MTAudioProcessingTap?
+        var tapOut: TapOut = nil
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tapOut
         )
-        guard status == noErr, let tap = tapOut else {
+#if compiler(>=6.3)
+        let tap = tapOut
+#else
+        let tap = tapOut?.takeRetainedValue()
+#endif
+        guard status == noErr, let tap else {
             // Sin tap no hay paneo, pero el audio suena: el fallo no puede dejar
             // la pista muda, así que se degrada a centro.
             return TapDePaneo(paneo: 0).tapDeGradacion
@@ -932,14 +943,19 @@ final class TapDePaneo {
             unprepare: nil,
             process: { _, _, _, _, _, _ in }
         )
-        var tapOut: MTAudioProcessingTap?
+        var tapOut: TapOut = nil
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tapOut
         )
-        guard status == noErr, let tap = tapOut else {
+#if compiler(>=6.3)
+        let tap = tapOut
+#else
+        let tap = tapOut?.takeRetainedValue()
+#endif
+        guard status == noErr, let tap else {
             fatalError("editorcito: no se pudo crear el tap de paneo")
         }
         return tap
