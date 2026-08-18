@@ -642,6 +642,11 @@ final class MedidorEnVivo: @unchecked Sendable {
 /// finalización lo libera. Como el tap viaja dentro de `mezclaDeAudio`, la
 /// reproducción y la exportación aplican exactamente el mismo código.
 final class TapDeMezcla {
+#if compiler(>=6.3)
+    private typealias TapOut = MTAudioProcessingTap?
+#else
+    private typealias TapOut = Unmanaged<MTAudioProcessingTap>?
+#endif
 
     private let cadena: CadenaDeMezcla
 
@@ -676,14 +681,19 @@ final class TapDeMezcla {
                 mezcla.cadena.procesar(bufferList: bufferListInOut, frames: Int(numberOfFrames))
             }
         )
-        var tapOut: MTAudioProcessingTap?
+        var tapOut: TapOut = nil
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tapOut
         )
-        guard status == noErr, let tap = tapOut else {
+#if compiler(>=6.3)
+        let tap = tapOut
+#else
+        let tap = tapOut?.takeRetainedValue()
+#endif
+        guard status == noErr, let tap else {
             // Sin tap no hay procesamiento, pero el audio suena: se degrada a
             // un tap de identidad, como el paneo.
             return Self.tapDeGradacion
@@ -704,14 +714,19 @@ final class TapDeMezcla {
             unprepare: nil,
             process: { _, _, _, _, _, _ in }
         )
-        var tapOut: MTAudioProcessingTap?
+        var tapOut: TapOut = nil
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tapOut
         )
-        guard status == noErr, let tap = tapOut else {
+#if compiler(>=6.3)
+        let tap = tapOut
+#else
+        let tap = tapOut?.takeRetainedValue()
+#endif
+        guard status == noErr, let tap else {
             fatalError("editorcito: no se pudo crear el tap de mezcla")
         }
         return tap
