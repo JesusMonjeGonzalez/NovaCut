@@ -45,6 +45,9 @@ timeline model and uses native media frameworks from interaction through export.
 - Titles, captions, masks, 14 blend modes and adjustment layers.
 - RGB curves, `.cube` LUTs, color wheels, chroma key, waveform, vectorscope and histogram.
 - H.264, HEVC, vertical MP4, ProRes 422, audio-only and master export presets.
+- **Interchange**: EDL (CMX 3600) and FCPXML 1.11 export with exact timecodes,
+  A/V links and constant speeds. External-editor compatibility remains a release
+  validation gate, not a claim of full NLE parity.
 
 ## Architecture
 
@@ -96,15 +99,19 @@ There is currently no notarized binary release or installer.
 ```bash
 ./probar.sh
 ./probar.sh /path/to/a/redistributable-test-video.mp4
+./generar-corpus.sh
+./probar-corpus.sh build/corpus
 ./probar-sonoridad.sh
 ./probar-sonoridad-media.sh
 ```
 
 The harness exercises timeline behavior, transcript editing, silence detection,
-LUT parsing, scopes, color composition, audio DSP, generated multicam media and
-retimed frame progression. The optional media argument adds composition checks
-against a real file. The GitHub workflow verifies that the native application
-builds; it does not replace UI or heterogeneous-media validation.
+LUT parsing, scopes, color composition, audio DSP, generated multicam media,
+retimed frame progression and EDL/FCPXML model interchange. The optional media
+argument adds composition checks against a real file. The golden-media corpus
+must contain measurable clap material before its synchronization gate can pass.
+The GitHub workflow builds the native application and runs the native harness;
+it does not replace UI or heterogeneous-media validation.
 
 ## Optional Assisted Editing
 
@@ -130,11 +137,13 @@ remote provider.
 
 - Engineering alpha, not a production NLE replacement.
 - Apple Silicon and Spanish-first UI only.
-- VFR/PTS behavior has not completed the planned heterogeneous corpus gate.
+- VFR with dropped frames is detected (PTS scan) and warned, but PTS conforming
+  is not implemented yet: the real-VFR corpus gate remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
 - Proxy cleanup, storage limits and packaged releases remain unfinished.
 - No automated UI suite for recovery, relinking or export cancellation.
+- Premiere, Resolve and Final Cut opening have not been verified in this repository.
 - Swift concurrency and deprecated AVFoundation warnings remain migration work.
 
 ## Repository Map
