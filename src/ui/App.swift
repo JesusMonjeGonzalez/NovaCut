@@ -16,6 +16,14 @@ struct MediaItem: Identifiable, Hashable {
     /// Si es un subclip, qué recorte del medio base representa.
     var subclipDe: SubclipOrigen? = nil
 
+    static func == (lhs: MediaItem, rhs: MediaItem) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
     init(id: UUID = UUID(), url: URL, duration: Double, size: CGSize, fileSize: Int64 = 0, frameRate: Double = 0, variableFrameRate: Bool = false, bin: String = "Todos", subclipDe: SubclipOrigen? = nil) {
         self.id = id
         self.url = url
@@ -271,7 +279,7 @@ final class EditorState: ObservableObject {
             forInterval: CMTime(seconds: 1.0 / 20.0, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.playhead = time.seconds.isFinite ? time.seconds : 0
                 self.isPlaying = self.player.rate != 0
@@ -282,7 +290,7 @@ final class EditorState: ObservableObject {
             forInterval: CMTime(seconds: 1.0 / 20.0, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let frame = self.timebase.frames(segundos: time.seconds)
                 self.cabezalDeOrigen = max(0, min(frame, self.duracionDeOrigenEnFrames))
@@ -887,7 +895,7 @@ final class EditorState: ObservableObject {
         temporizadorDeAngulos?.invalidate()
         let objetivo = generacionDelVisor
         temporizadorDeAngulos = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard self.generacionDelVisor == objetivo, self.isPlaying else { return }
                 self.recorregirAngulosDelVisor()
@@ -1382,8 +1390,7 @@ final class EditorState: ObservableObject {
                         let transformed = naturalSize.applying(transform)
                         size = CGSize(width: abs(transformed.width), height: abs(transformed.height))
                         frameRate = Double(try await track.load(.nominalFrameRate))
-                        let minimo = try await track.load(.minFrameDuration)
-                        variableFrameRate = !minimo.isNumeric || minimo.value <= 0
+                        variableFrameRate = await MedioResuelto.esCadenciaVFR(pista: track)
                     } else {
                         size = .zero
                         frameRate = 0
@@ -1551,15 +1558,48 @@ final class EditorState: ObservableObject {
         panel.nameFieldStringValue = "\(projectName).edl"
         panel.allowedContentTypes = [UTType(filenameExtension: "edl") ?? .plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let edl = montaje.edl(nombreDeProyecto: projectName) { id in
-            media.first { $0.id == id }?.name ?? "Medio"
-        }
+        let edl = EDLDeEditorcito.exportar(montaje: montaje, medios: mediosParaExportar(), titulo: projectName)
         do {
             try edl.write(to: url, atomically: true, encoding: .utf8)
-            status = "EDL exportado · \(url.lastPathComponent)"
+            status = "EDL exportado · \(url.lastPathComponent) — léelo en Premiere o Resolve"
         } catch {
             status = "No se pudo exportar el EDL: \(error.localizedDescription)"
         }
+    }
+
+    /// Exporta el montaje como FCPXML 1.11: el intercambio moderno con Final
+    /// Cut Pro y Premiere Pro.
+    func exportarFCPXML() {
+        guard montaje.duracion > 0 else { status = "No hay montaje que exportar"; return }
+        let panel = NSSavePanel()
+        panel.title = "Exportar FCPXML"
+        panel.prompt = "Exportar"
+        panel.nameFieldStringValue = "\(projectName).fcpxml"
+        panel.allowedContentTypes = [UTType(filenameExtension: "fcpxml") ?? .xml]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let datos = FCPXMLDeEditorcito.exportar(montaje: montaje, medios: mediosParaExportar(), titulo: projectName)
+        do {
+            try datos.write(to: url)
+            status = "FCPXML exportado · \(url.lastPathComponent) — abrible en Final Cut o Premiere"
+        } catch {
+            status = "No se pudo exportar el FCPXML: \(error.localizedDescription)"
+        }
+    }
+
+    /// Los medios del montaje, en la forma mínima que piden los exportadores.
+    private func mediosParaExportar() -> [UUID: MedioParaExportar] {
+        let ids = Set(montaje.todosLosClips.map(\.clip.mediaID))
+        var resultado: [UUID: MedioParaExportar] = [:]
+        for item in media where ids.contains(item.id) {
+            resultado[item.id] = MedioParaExportar(
+                nombre: item.name,
+                url: item.url,
+                duracionSegundos: item.duration,
+                tamano: item.size,
+                fps: item.frameRate
+            )
+        }
+        return resultado
     }
 
     /// Importa otro proyecto: añade sus medios a la biblioteca y pega su
@@ -3483,7 +3523,10 @@ final class EditorState: ObservableObject {
                 session.shouldOptimizeForNetworkUse = true
                 activeExportSession = session
                 exportTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-                    Task { @MainActor in self?.exportProgress = Double(self?.activeExportSession?.progress ?? 0) }
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.exportProgress = Double(self.activeExportSession?.progress ?? 0)
+                    }
                 }
                 await session.export()
                 if session.status == .completed {
@@ -5687,6 +5730,8 @@ struct MenusDeEditorcito: Commands {
                 .disabled(editor.duracionEnFrames == 0)
             Button("Exportar EDL…") { editor.exportarEDL() }
                 .keyboardShortcut("e", modifiers: [.command, .option])
+                .disabled(editor.duracionEnFrames == 0)
+            Button("Exportar FCPXML…") { editor.exportarFCPXML() }
                 .disabled(editor.duracionEnFrames == 0)
             Button("Importar proyecto…") { editor.importarOtroProyecto() }
         }

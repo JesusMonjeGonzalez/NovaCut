@@ -72,23 +72,21 @@ enum SubtitulosService {
         request.shouldReportPartialResults = false
 
         // La tarea se cancela desde dos sitios: el timeout y la cancelación de la
-        // tarea circundante. El guard de `terminado` hace que solo uno de los dos
+        // tarea circundante. El estado protegido hace que solo uno de los dos
         // resuma el continuation.
         let caja = CajaDeReconocimiento()
         return try await withTaskCancellationHandler(
             operation: {
                 try await withCheckedThrowingContinuation { continuation in
-                    var terminado = false
                     caja.tarea = recognizer.recognitionTask(with: request) { resultado, error in
-                        if terminado { return }
                         if let error {
-                            terminado = true
+                            guard caja.reclamar() else { return }
                             caja.tarea?.cancel()
                             continuation.resume(throwing: error)
                             return
                         }
                         guard let resultado, resultado.isFinal else { return }
-                        terminado = true
+                        guard caja.reclamar() else { return }
                         continuation.resume(returning: resultado.bestTranscription)
                     }
                     // Un audio silencioso o un ruido continuo pueden no emitir
@@ -96,8 +94,7 @@ enum SubtitulosService {
                     // quedaría clavado para siempre.
                     Task {
                         try? await Task.sleep(for: .seconds(120))
-                        guard !terminado else { return }
-                        terminado = true
+                        guard caja.reclamar() else { return }
                         caja.tarea?.cancel()
                         continuation.resume(throwing: SubtitulosError.tiempoAgotado)
                     }
@@ -209,5 +206,15 @@ enum SubtitulosError: LocalizedError {
 /// Referencia compartida a la tarea de reconocimiento, para cancelarla desde el
 /// timeout o desde el handler de cancelación de la tarea circundante.
 private final class CajaDeReconocimiento: @unchecked Sendable {
+    private let cerrojo = NSLock()
+    private var terminado = false
     var tarea: SFSpeechRecognitionTask?
+
+    func reclamar() -> Bool {
+        cerrojo.lock()
+        defer { cerrojo.unlock() }
+        guard !terminado else { return false }
+        terminado = true
+        return true
+    }
 }

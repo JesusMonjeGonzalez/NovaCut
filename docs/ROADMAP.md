@@ -82,6 +82,22 @@ Este bloque queda cerrado. Las features anteriores están implementadas en el ho
 macOS y verificadas con el pipeline real; no deben seguir apareciendo como trabajo
 pendiente en documentación competitiva.
 
+## Hecho el 11 de agosto de 2026
+
+- **Corpus golden y arnés arreglado** (`generar-corpus.sh`, `probar-corpus.sh`):
+  el generador se colgaba y dejaba un patrón de 0 bytes; el arnés contaba la
+  reordenación de B-frames y los bloques PCM del muxer como huecos. Ahora siete
+  patrones de claqueta (CFR, VFR real, vertical, HEVC, ProRes, H.264+AAC,
+  audio solo) pasan sincronía ≤1,5 frames y cadencia sin huecos.
+- **Detección VFR real** (`MedioResuelto.esCadenciaVFR`): scan de PTS en vez
+  de la heurística de `minFrameDuration`, que no veía las grabaciones con
+  caídas de frames. Las Screen Recording de tests/corpus ahora se detectan.
+- **Intercambio profesional** (`src/ui/Intercambio.swift`): EDL CMX 3600
+  (canales V/A1/A2, velocidades como M2, anotaciones `*`, columnas de 80) y
+  FCPXML 1.11 (recursos, enlaces A/V, velocidades, aplastado con recorte de
+  capas, `<note>` con limitaciones), con «Exportar EDL…» y «Exportar FCPXML…»
+  en Archivo. 28 comprobaciones nuevas; `probar.sh` pasa 502.
+
 ## Ahora
 
 - Validar VFR, PTS y sincronización A/V con material legal y heterogéneo.

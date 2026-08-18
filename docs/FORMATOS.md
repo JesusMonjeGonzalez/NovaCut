@@ -95,3 +95,31 @@ Antes de afirmar compatibilidad profesional se necesita un corpus legal con MP4,
 MOV, M4V, audio, H.264, HEVC, ProRes, CFR, VFR, vídeo vertical, múltiples canales,
 archivos grandes, archivos truncados y codecs no soportados. Cada caso debe cubrir
 importación, seek, preview, guardado, reapertura y exportación.
+
+## Corpus (estado actual)
+
+`generar-corpus.sh` genera el corpus golden con claqueta (flash + pitido
+sincronizados en cinco puntos) y `probar-corpus.sh` lo mide:
+
+- **Sincronía A/V**: el flash se muestrea a 4× la cadencia y el pitido en
+  ventanas de 10 ms sobre un perfil de energía de toda la pista. Tolerancia
+  1,5 frames. El golden pasa con menos de 1,2 frames en el peor caso.
+- **Cadencia**: huecos reales sobre la cadencia mediana (los B-frames no son
+  huecos; un paquete PCM largo del muxer tampoco). El golden pasa sin huecos.
+- Las grabaciones reales con caídas de frames (p. ej. Screen Recording de
+  macOS) fallan la cadencia con razón y se detectan como VFR al importar.
+
+## Intercambio con otros editores
+
+El montaje sale hacia la industria por dos formatos desde Archivo:
+
+- **EDL (CMX 3600)**: cortes con timecodes de origen y montaje, canales
+  V/A1/A2, velocidad constante como efecto de movimiento. Se anotan como
+  comentarios `*` lo que el formato no lleva: fundidos, rampas, títulos,
+  anidados y multicámara.
+- **FCPXML 1.11**: secuencia de una espina, enlaces A/V unidos, velocidades
+  constantes, capas apiladas recortadas a sus tramos libres y una `<note>`
+  con las limitaciones. Títulos, anidados y multicámara se omiten con nota.
+
+Ambos son funciones puras verificadas en `tests/intercambio`. La exportación
+no degrada los medios: los archivos originales se referencian por ruta.
