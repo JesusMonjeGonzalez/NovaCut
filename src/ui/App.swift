@@ -3522,8 +3522,11 @@ final class EditorState: ObservableObject {
                 session.audioMix = render.mezclaDeAudio
                 session.shouldOptimizeForNetworkUse = true
                 activeExportSession = session
-                exportTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self, session] _ in
-                    self?.exportProgress = Double(session.progress)
+                exportTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.exportProgress = Double(self.activeExportSession?.progress ?? 0)
+                    }
                 }
                 await session.export()
                 if session.status == .completed {
