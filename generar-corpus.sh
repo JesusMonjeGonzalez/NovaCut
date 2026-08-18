@@ -164,7 +164,7 @@ let pitidoPorFlash = Dictionary(uniqueKeysWithValues: framesDeFlash.map { ($0, p
 
 func muestrasDelPitido(_ n: Int) -> Int16 {
     // El pitido empieza en el PTS de su flash y dura `indiceDePitido` frames.
-    for (frame, inicio) in pitidoPorFlash {
+    for (_, inicio) in pitidoPorFlash {
         let inicioEnMuestras = Int(inicio * muestreo)
         let m = n - inicioEnMuestras
         if m >= 0 && m < muestrasPorFrame * indiceDePitido {
