@@ -13,4 +13,4 @@ Still open before a distributable release:
 - external-editor opening checks for EDL/FCPXML;
 - UI recovery, relinking and cancellation checks;
 - signed/notarized packaging;
-- an explicit repository license.
+- a third-party dependency and asset inventory for packaged distribution.
