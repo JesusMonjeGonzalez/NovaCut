@@ -660,25 +660,6 @@ do {
     let datosSidechain = try! JSONEncoder().encode(tSidechain)
     let vueltaSidechain = try! JSONDecoder().decode(LineaDeTiempo.self, from: datosSidechain)
     igual(vueltaSidechain.pista(a2)?.fuenteDeDucking, a1, "y viaja en el proyecto")
-
-    // EDL: formato CMX3600 con eventos de vídeo y audio.
-    var tEDL = LineaDeTiempo.nueva(timebase: .p25)
-    let v1 = tEDL.pistas.first { $0.nombre == "V1" }!.id
-    let a1EDL = tEDL.pistas.first { $0.nombre == "A1" }!.id
-    let m1 = UUID(), m2 = UUID()
-    var clipVideo = Clip(mediaID: m1, nombre: "Entrevista", inicio: 25, duracion: 50, entradaEnOrigen: 10)
-    clipVideo.enlace = UUID()
-    tEDL.sobrescribir(clipVideo, enPista: v1, en: 25)
-    var clipAudio = Clip(mediaID: m1, nombre: "Entrevista", inicio: 25, duracion: 50, entradaEnOrigen: 10)
-    clipAudio.enlace = clipVideo.enlace
-    tEDL.sobrescribir(clipAudio, enPista: a1EDL, en: 25)
-    let edl = tEDL.edl(nombreDeProyecto: "Mi montaje") { $0 == m1 ? "Entrevista" : "Otro" }
-    igual(edl.contains("TITLE: Mi montaje"), true, "el EDL lleva el título del proyecto")
-    igual(edl.contains("FCM: NON-DROP FRAME"), true, "y la cadencia declarada")
-    igual(edl.contains("001  Entrevis V     C        00:00:00:10 00:00:02:10 00:00:01:00 00:00:03:00"),
-          true, "el evento de vídeo sale con sus timecodes (reel a 8 caracteres)")
-    igual(edl.contains("002  Entrevis A     C"), true, "y el audio después, en su pista")
-    igual(edl.contains("* FROM CLIP NAME: Entrevista"), true, "con el nombre original del clip")
 }
 
 print("")

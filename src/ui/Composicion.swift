@@ -80,8 +80,7 @@ struct MedioResuelto {
             tamano = try await video.load(.naturalSize)
             transformacion = try await video.load(.preferredTransform)
             fps = Double(try await video.load(.nominalFrameRate))
-            let minimo = try await video.load(.minFrameDuration)
-            esVFR = !minimo.isNumeric || minimo.value <= 0
+            esVFR = await Self.esCadenciaVFR(pista: video)
         }
         return MedioResuelto(
             id: id, url: url, asset: asset,
@@ -89,6 +88,46 @@ struct MedioResuelto {
             duracion: duracion, tamanoNatural: tamano,
             transformacionPreferida: transformacion, fps: fps, esVFR: esVFR
         )
+    }
+
+    /// Detección VFR por reloj de PTS, no por metadatos. El truco clásico de
+    /// comparar la duración mínima de frame contra la nominal no ve las
+    /// grabaciones con caídas de frames (Screen Recording de macOS graba a 60
+    /// y suelta fotogramas bajo carga: la duración mínima sigue siendo 1/60 y
+    /// nadie nota nada). Aquí se leen los tiempos de presentación de una
+    /// ventana inicial —solo demultiplexa, no decodifica— y se cuenta cuántos
+    /// saltos superan 1,5× la cadencia mediana: más de un 2 % es material que
+    /// un conformado ingenuo desfasaría.
+    static func esCadenciaVFR(pista: AVAssetTrack) async -> Bool {
+        let minimo = (try? await pista.load(.minFrameDuration)) ?? .invalid
+        if !minimo.isNumeric || minimo.value <= 0 { return true }
+        guard let asset = pista.asset, let lector = try? AVAssetReader(asset: asset) else { return false }
+        let salida = AVAssetReaderTrackOutput(track: pista, outputSettings: nil)
+        lector.add(salida)
+        guard lector.startReading() else { return false }
+
+        var pts = [Double]()
+        let tope = 400
+        while lector.status == .reading, let sb = salida.copyNextSampleBuffer(), pts.count < tope {
+            let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+            if t.isFinite { pts.append(t) }
+        }
+        lector.cancelReading()
+        guard pts.count > 30 else { return false }
+
+        pts.sort()
+        var unicos = [Double]()
+        for t in pts where unicos.last.map({ t - $0 > 1e-6 }) ?? true { unicos.append(t) }
+        guard unicos.count > 10 else { return false }
+
+        var deltas = [Double]()
+        for i in 1..<unicos.count { deltas.append(unicos[i] - unicos[i - 1]) }
+        let ordenados = deltas.sorted()
+        let mediana = ordenados[ordenados.count / 2]
+        guard mediana > 0 else { return false }
+        var huecos = 0
+        for d in deltas where d > mediana * 1.5 { huecos += 1 }
+        return Double(huecos) / Double(deltas.count) > 0.02
     }
 
     /// Captura una imagen pequeña para identificar el medio sin decodificarlo en

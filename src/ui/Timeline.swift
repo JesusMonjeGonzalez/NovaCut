@@ -1263,48 +1263,6 @@ struct LineaDeTiempo: Codable, Hashable, Sendable {
 
     // MARK: Consultas
 
-    /// Genera un EDL CMX3600 del montaje: el formato de listas de decisión de
-    /// edición que cualquier editor de la industria importa.    ///
-    /// Cada clip de vídeo y de audio se convierte en un evento con su entrada y
-    /// salida en origen y en montaje, en timecode del proyecto. Es el puente de
-    /// salida con Premiere, Resolve y las mesas de edición —un montaje hecho en
-    /// Editorcito se puede terminar en otro lado, y viceversa. Se escribe la
-    /// pista de vídeo primero y las de audio después, en el orden del montaje.
-    func edl(nombreDeProyecto: String, nombresDeMedios: (UUID) -> String) -> String {
-        let tc = timebase
-        var lineas: [String] = [
-            "TITLE: \(nombreDeProyecto)",
-            "FCM: \(timebase.dropFrame ? "DROP FRAME" : "NON-DROP FRAME")",
-        ]
-        var numero = 0
-        let eventos = todosLosClips.sorted { a, b in
-            if a.clip.inicio != b.clip.inicio { return a.clip.inicio < b.clip.inicio }
-            // El vídeo va antes que el audio en el EDL.
-            let esVideoA = pista(a.pista)?.tipo == .video
-            let esVideoB = pista(b.pista)?.tipo == .video
-            if esVideoA != esVideoB { return esVideoA }
-            return a.pista.uuidString < b.pista.uuidString
-        }
-        for (pistaID, clip) in eventos {
-            guard clip.velocidad == 1 else { continue }
-            numero += 1
-            let tipo = pista(pistaID)?.tipo == .video ? "V" : "A"
-            let reel = clip.nombre.replacingOccurrences(of: " ", with: "_")
-            let entradaOrigen = tc.timecode(clip.entradaEnOrigen)
-            let salidaOrigen = tc.timecode(clip.entradaEnOrigen + clip.duracion)
-            let entradaMontaje = tc.timecode(clip.inicio)
-            let salidaMontaje = tc.timecode(clip.fin)
-            // CMX3600 alinea el reel en 8 caracteres y el tipo en 1. El formato
-            // se compone por piezas: `String(format:)` con `%s` y strings de
-            // Swift es comportamiento indefinido (crash confirmado).
-            let reelAlineado = reel.padding(toLength: 8, withPad: " ", startingAt: 0)
-            lineas.append("\(String(format: "%03d", numero))  \(reelAlineado) \(tipo)     C        \(entradaOrigen) \(salidaOrigen) \(entradaMontaje) \(salidaMontaje)")
-            lineas.append("* FROM CLIP NAME: \(clip.nombre)")
-        }
-        lineas.append("")
-        return lineas.joined(separator: "\n")
-    }
-
     /// Describe en una frase qué cambió entre dos versiones del montaje, para
     /// el panel de historia de deshacer.
     ///
