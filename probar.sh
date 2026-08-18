@@ -146,6 +146,15 @@ swiftc -O -enforce-exclusivity=checked -target arm64-apple-macos14.0 \
     -o "$SALIDA/pruebaRetime"
 "$SALIDA/pruebaRetime" "$SALIDA/retime"
 
+# Intercambio con otros editores: el EDL CMX 3600 y el FCPXML 1.11 son lógica
+# pura sobre el modelo (timecodes exactos, enlaces A/V, velocidades y
+# aplastado de capas), y se verifican sin abrir la aplicación.
+swiftc -O -enforce-exclusivity=checked -target arm64-apple-macos14.0 \
+    "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" \
+    "$RAIZ/src/ui/Intercambio.swift" "$RAIZ/tests/intercambio/main.swift" \
+    -o "$SALIDA/pruebaIntercambio"
+"$SALIDA/pruebaIntercambio"
+
 # Prueba de composición contra un archivo real, si se pasa uno:
 #   ./probar.sh /ruta/al/video.mp4
 # Verifica lo que ninguna prueba de modelo puede: que el montaje se convierte en
