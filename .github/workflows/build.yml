@@ -17,3 +17,7 @@ jobs:
         run: ./build-mac.sh
       - name: Run native harness
         run: ./probar.sh
+      - name: Generate and verify synthetic media corpus
+        run: |
+          ./generar-corpus.sh build/corpus-ci
+          ./probar-corpus.sh build/corpus-ci
