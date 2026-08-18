@@ -163,3 +163,7 @@ Detailed references:
 - [Architecture notes](docs/stack.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Assisted editing and privacy](docs/IA.md)
+- [Security policy](SECURITY.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+NovaCut is released under the [MIT License](LICENSE).
