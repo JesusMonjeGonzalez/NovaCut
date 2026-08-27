@@ -3210,40 +3210,30 @@ impl NovaCutWindows {
         if self.setup_result.is_some() {
             return;
         }
-        if !winget_available() {
-            self.status =
-                "WinGet no esta disponible en este equipo. Instala 'App Installer' desde la Microsoft Store o descarga FFmpeg manualmente."
-                    .to_owned();
+        let Some(app_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        else {
+            self.status = "No se pudo localizar la carpeta de la aplicacion".to_owned();
             return;
-        }
+        };
         let (sender, receiver) = mpsc::channel();
         self.setup_result = Some(receiver);
-        self.status =
-            "Descargando FFmpeg (~100 MB). Esto puede tardar varios minutos...".to_owned();
+        self.status = "Descargando FFmpeg (~80 MB). Esto puede tardar varios minutos...".to_owned();
         std::thread::spawn(move || {
-            let result = Command::new("winget.exe")
-                .args([
-                    "install",
-                    "--id",
-                    "Gyan.FFmpeg",
-                    "--exact",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                    "--silent",
-                    "--disable-interactivity",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .map_err(|error| format!("WinGet no se pudo ejecutar: {error}"))
-                .and_then(|output| {
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                        Err(if stderr.is_empty() { stdout } else { stderr })
+            let result = if winget_available() {
+                match run_winget_install() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let _ = sender.send(Err(format!(
+                            "WinGet fallo ({error}); intentando descarga directa..."
+                        )));
+                        run_powershell_install(&app_dir)
                     }
-                });
+                }
+            } else {
+                run_powershell_install(&app_dir)
+            };
             let _ = sender.send(result);
         });
     }
@@ -7609,6 +7599,78 @@ fn winget_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Intenta instalar Gyan.FFmpeg con WinGet.
+fn run_winget_install() -> Result<(), String> {
+    let output = Command::new("winget.exe")
+        .args([
+            "install",
+            "--id",
+            "Gyan.FFmpeg",
+            "--exact",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--silent",
+            "--disable-interactivity",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("WinGet no se pudo ejecutar: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+/// Descarga el build "release essentials" de gyan.dev y copia los binarios
+/// junto a la aplicacion, sin depender de WinGet ni de la Microsoft Store.
+/// PowerShell está disponible en todo Windows 10/11.
+fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
+    let script_path = std::env::temp_dir().join("novacut-install-ffmpeg.ps1");
+    let app_dir_ps = app_dir.display().to_string().replace('\'', "''");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$appDir = '{app_dir_ps}'
+$zip = Join-Path $env:TEMP 'novacut-ffmpeg.zip'
+$unzip = Join-Path $env:TEMP 'novacut-ffmpeg'
+if (Test-Path $unzip) {{ Remove-Item $unzip -Recurse -Force }}
+if (Test-Path $zip) {{ Remove-Item $zip -Force }}
+Invoke-WebRequest -UseBasicParsing -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip
+Expand-Archive -Path $zip -DestinationPath $unzip -Force
+$bin = Get-ChildItem $unzip -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+if (-not $bin) {{ throw 'El paquete descargado no contiene ffmpeg.exe' }}
+Copy-Item (Join-Path $bin.DirectoryName '*') $appDir -Force
+Remove-Item $unzip -Recurse -Force
+Remove-Item $zip -Force
+"#
+    );
+    let write_result = std::fs::write(&script_path, script);
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("PowerShell no se pudo ejecutar: {error}"));
+    let _ = std::fs::remove_file(&script_path);
+    write_result.map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
+    let output = output?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
 }
 
 fn multimedia_tools_available() -> bool {

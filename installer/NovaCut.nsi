@@ -38,6 +38,7 @@ Section "NovaCut (obligatorio)" SEC_APP
     SetOutPath "$INSTDIR"
     File "..\build\NovaCut-Windows\novacut-windows.exe"
     File /oname=LEEME-WINDOWS.md "..\docs\GUIA-WINDOWS.md"
+    File "ffmpeg-install.ps1"
     WriteUninstaller "$INSTDIR\Desinstalar-NovaCut.exe"
     WriteRegStr HKCU "Software\NovaCut" "InstallDir" "$INSTDIR"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut" "DisplayName" "NovaCut"
@@ -60,11 +61,11 @@ Section "Acceso directo en el escritorio" SEC_DESKTOP
 SectionEnd
 
 Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
-    DetailPrint "Instalando FFmpeg con WinGet..."
-    nsExec::ExecToLog 'winget.exe install --id Gyan.FFmpeg --exact --accept-package-agreements --accept-source-agreements --silent --disable-interactivity'
+    DetailPrint "Descargando e instalando FFmpeg (~80 MB)..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR"'
     Pop $0
     ${If} $0 <> 0
-        MessageBox MB_ICONEXCLAMATION|MB_OK "WinGet no pudo instalar FFmpeg. Descargalo de https://www.gyan.dev/ffmpeg/builds/ y copia ffmpeg.exe junto a NovaCut, o instalalo desde la Microsoft Store (App Installer)."
+        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo instalar FFmpeg. Descargalo de https://www.gyan.dev/ffmpeg/builds/ y copia ffmpeg.exe junto a NovaCut."
     ${EndIf}
 SectionEnd
 
@@ -77,6 +78,10 @@ Section "Uninstall"
     DeleteRegKey HKCU "Software\NovaCut"
     Delete "$INSTDIR\${APP_EXE}"
     Delete "$INSTDIR\LEEME-WINDOWS.md"
+    Delete "$INSTDIR\ffmpeg-install.ps1"
+    Delete "$INSTDIR\ffmpeg.exe"
+    Delete "$INSTDIR\ffprobe.exe"
+    Delete "$INSTDIR\ffplay.exe"
     Delete "$INSTDIR\Desinstalar-NovaCut.exe"
     RMDir "$INSTDIR"
     System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
