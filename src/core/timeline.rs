@@ -282,16 +282,14 @@ impl Timeline {
     }
 
     pub fn undo(&mut self) -> Option<TimelineCommand> {
-        self.undo_stack.pop().and_then(|cmd| {
+        self.undo_stack.pop().inspect(|cmd| {
             self.redo_stack.push(cmd.clone());
-            Some(cmd)
         })
     }
 
     pub fn redo(&mut self) -> Option<TimelineCommand> {
-        self.redo_stack.pop().and_then(|cmd| {
+        self.redo_stack.pop().inspect(|cmd| {
             self.undo_stack.push(cmd.clone());
-            Some(cmd)
         })
     }
 

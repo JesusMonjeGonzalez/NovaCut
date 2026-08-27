@@ -59,10 +59,14 @@ enum PresetExportacion: String, CaseIterable, Identifiable, Sendable {
     var esSoloAudio: Bool { self == .audio }
 }
 
-struct TrabajoDeExportacion: Identifiable, Sendable {
+struct TrabajoDeExportacion: Identifiable {
     let id = UUID()
     let preset: PresetExportacion
     let url: URL
+    /// Instantáneas del documento y sus medios al crear el trabajo. Una edición
+    /// posterior no debe cambiar silenciosamente lo que ya estaba en la cola.
+    let montaje: LineaDeTiempo
+    let medios: [UUID: MedioResuelto]
     /// Ganancia de máster en dB que la normalización decidió, si la hay.
     let ganancia: Double?
 }

@@ -3375,8 +3375,10 @@ final class EditorState: ObservableObject {
         guard panel.runModal() == .OK, let outputURL = panel.url else { return }
 
         let objetivo = normalizacionDeExportacion
+        let montajeDeTrabajo = montaje
+        let mediosDeTrabajo = mediosOriginales.isEmpty ? medios : mediosOriginales
         guard objetivo != .ninguno else {
-            encolar(preset: preset, url: outputURL, ganancia: nil)
+            encolar(preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: mediosDeTrabajo, ganancia: nil)
             return
         }
 
@@ -3387,13 +3389,13 @@ final class EditorState: ObservableObject {
         Task {
             do {
                 let render = ConstructorDeMontaje.construir(
-                    montaje,
-                    medios: mediosOriginales.isEmpty ? medios : mediosOriginales,
+                    montajeDeTrabajo,
+                    medios: mediosDeTrabajo,
                     tamanoDeSalida: preset.tamano
                 )
                 let rango: CMTimeRange?
-                if let entrada = montaje.entradaDeTrabajo, let salida = montaje.salidaDeTrabajo, salida > entrada {
-                    rango = CMTimeRange(start: timebase.tiempo(entrada), duration: timebase.tiempo(salida - entrada))
+                if let entrada = montajeDeTrabajo.entradaDeTrabajo, let salida = montajeDeTrabajo.salidaDeTrabajo, salida > entrada {
+                    rango = CMTimeRange(start: montajeDeTrabajo.timebase.tiempo(entrada), duration: montajeDeTrabajo.timebase.tiempo(salida - entrada))
                 } else {
                     rango = nil
                 }
@@ -3402,10 +3404,10 @@ final class EditorState: ObservableObject {
                 let medida = try await enSegundoPlano {
                     try SonoridadMedia.medir(composicion: composicion, mezcla: mezcla, timeRange: rango)
                 }
-                presentarPlan(objetivo.plan(para: medida), preset: preset, url: outputURL)
+                presentarPlan(objetivo.plan(para: medida), preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: mediosDeTrabajo)
             } catch {
                 status = "No se pudo medir el audio (\(error.localizedDescription)); se exporta sin tocar"
-                encolar(preset: preset, url: outputURL, ganancia: nil)
+                encolar(preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: mediosDeTrabajo, ganancia: nil)
             }
         }
     }
@@ -3415,10 +3417,10 @@ final class EditorState: ObservableObject {
     /// La decisión es del usuario porque el plan a veces no llega al objetivo:
     /// cuando el techo de pico lo impide, `PlanDeNormalizacion.resumen` lo dice
     /// y queda exportar con lo que hay o sin tocar nada.
-    private func presentarPlan(_ plan: PlanDeNormalizacion?, preset: PresetExportacion, url: URL) {
+    private func presentarPlan(_ plan: PlanDeNormalizacion?, preset: PresetExportacion, url: URL, montaje: LineaDeTiempo, medios: [UUID: MedioResuelto]) {
         guard let plan else {
             status = "El montaje no tiene audio medible; se exporta sin tocar"
-            encolar(preset: preset, url: url, ganancia: nil)
+            encolar(preset: preset, url: url, montaje: montaje, medios: medios, ganancia: nil)
             return
         }
         let alerta = NSAlert()
@@ -3433,16 +3435,16 @@ final class EditorState: ObservableObject {
             status = normalizar
                 ? "Normalizando \(String(format: "%+.1f dB", plan.ganancia)) al exportar"
                 : "Exportando sin normalizar"
-            encolar(preset: preset, url: url, ganancia: normalizar ? plan.ganancia : nil)
+            encolar(preset: preset, url: url, montaje: montaje, medios: medios, ganancia: normalizar ? plan.ganancia : nil)
         } else {
             alerta.addButton(withTitle: "Exportar")
             _ = alerta.runModal()
-            encolar(preset: preset, url: url, ganancia: nil)
+            encolar(preset: preset, url: url, montaje: montaje, medios: medios, ganancia: nil)
         }
     }
 
-    private func encolar(preset: PresetExportacion, url: URL, ganancia: Double?) {
-        exportQueue.append(TrabajoDeExportacion(preset: preset, url: url, ganancia: ganancia))
+    private func encolar(preset: PresetExportacion, url: URL, montaje: LineaDeTiempo, medios: [UUID: MedioResuelto], ganancia: Double?) {
+        exportQueue.append(TrabajoDeExportacion(preset: preset, url: url, montaje: montaje, medios: medios, ganancia: ganancia))
         exportQueueCount = exportQueue.count
         if ganancia == nil { status = "Trabajo añadido a la cola · \(preset.nombre)" }
         procesarSiguienteExportacion()
@@ -3475,7 +3477,7 @@ final class EditorState: ObservableObject {
                 // de audio de una copia del montaje: el constructor la convierte
                 // en rampas como a cualquier otro ajuste de mezcla, y el montaje
                 // de trabajo no se toca.
-                var paraExportar = montaje
+                var paraExportar = trabajo.montaje
                 if let ganancia = trabajo.ganancia, ganancia != 0 {
                     for i in paraExportar.pistas.indices where paraExportar.pistas[i].tipo == .audio {
                         paraExportar.pistas[i].volumen = (paraExportar.pistas[i].volumen ?? 0) + ganancia
@@ -3483,7 +3485,7 @@ final class EditorState: ObservableObject {
                 }
                 let render = ConstructorDeMontaje.construir(
                     paraExportar,
-                    medios: mediosOriginales.isEmpty ? medios : mediosOriginales,
+                    medios: trabajo.medios,
                     tamanoDeSalida: trabajo.preset.tamano
                 )
                 // Los avisos críticos cambian el resultado respecto al montaje: un
@@ -3510,10 +3512,10 @@ final class EditorState: ObservableObject {
                 }
                 session.outputURL = temporal
                 session.outputFileType = trabajo.preset.tipoDeArchivo
-                if let entrada = montaje.entradaDeTrabajo, let salida = montaje.salidaDeTrabajo, salida > entrada {
+                if let entrada = trabajo.montaje.entradaDeTrabajo, let salida = trabajo.montaje.salidaDeTrabajo, salida > entrada {
                     session.timeRange = CMTimeRange(
-                        start: timebase.tiempo(entrada),
-                        duration: timebase.tiempo(salida - entrada)
+                        start: trabajo.montaje.timebase.tiempo(entrada),
+                        duration: trabajo.montaje.timebase.tiempo(salida - entrada)
                     )
                 }
                 // Sin esto la exportación ignora capas, opacidad, encuadre y mezcla:
