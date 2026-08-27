@@ -2092,18 +2092,8 @@ impl NovaCutWindows {
         self.status = format!("Medio revinculado: {}", new_path.display());
     }
 
-    fn new(context: &eframe::CreationContext<'_>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(18, 20, 24);
-        visuals.window_fill = egui::Color32::from_rgb(24, 27, 33);
-        // Acento cian, como el tint(.cyan) de la aplicacion macOS.
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 190, 212);
-        visuals.selection.stroke =
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 235, 255));
-        visuals.hyperlink_color = egui::Color32::from_rgb(0, 190, 212);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 150, 170);
-        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0, 150, 170);
-        context.egui_ctx.set_visuals(visuals);
+    fn new(_context: &eframe::CreationContext<'_>) -> Self {
+        // El tema lo aplica `main` vía `theme::apply` antes de crear la app.
         let mut app = Self {
             project: RoughProject::default(),
             project_path: None,
@@ -4463,189 +4453,293 @@ impl eframe::App for NovaCutWindows {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        egui::TopBottomPanel::top("header").show(context, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new("EDITORCITO")
-                        .strong()
-                        .size(17.0)
-                        .color(egui::Color32::from_rgb(0, 190, 212)),
-                );
-                ui.separator();
-                let before_name = self.project.clone();
-                if ui.text_edit_singleline(&mut self.project.name).changed() {
-                    self.queue_edit(before_name);
-                }
-                ui.separator();
-                if ui.button("Nuevo").clicked() {
-                    self.request_document_action(DocumentAction::New);
-                }
-                if ui.button("Abrir").clicked() {
-                    self.request_document_action(DocumentAction::Open);
-                }
-                if ui.button("Guardar").clicked() {
-                    self.save_project(false);
-                }
-                if ui.button("Guardar como").clicked() {
-                    self.save_project(true);
-                }
-                if ui
-                    .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Deshacer"))
-                    .clicked()
-                {
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Rehacer"))
-                    .clicked()
-                {
-                    self.redo();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.ffmpeg_ready, egui::Button::new("+ Importar"))
-                    .clicked()
-                {
-                    self.import_media();
-                }
-                egui::ComboBox::from_id_salt("preset-export")
-                    .selected_text(match self.export_size {
-                        (1280, 720) => "720p",
-                        (1920, 1080) => "1080p",
-                        (3840, 2160) => "4K",
-                        (1080, 1920) => "Shorts/Reels/TikTok 1080x1920",
-                        (1080, 1080) => "Cuadrado (Instagram) 1080x1080",
-                        _ => "Personalizado",
-                    })
-                    .show_ui(ui, |ui| {
-                        let mut chosen = self.export_size;
-                        ui.selectable_value(&mut chosen, (1280, 720), "720p");
-                        ui.selectable_value(&mut chosen, (1920, 1080), "1080p (YouTube)");
-                        ui.selectable_value(&mut chosen, (3840, 2160), "4K");
-                        ui.selectable_value(
-                            &mut chosen,
-                            (1080, 1920),
-                            "Shorts/Reels/TikTok 1080x1920",
-                        );
-                        ui.selectable_value(
-                            &mut chosen,
-                            (1080, 1080),
-                            "Cuadrado (Instagram) 1080x1080",
-                        );
-                        self.export_size = chosen;
-                    });
-                egui::ComboBox::from_id_salt("formato-export")
-                    .selected_text(self.export_format.label())
-                    .show_ui(ui, |ui| {
-                        let mut chosen = self.export_format;
-                        ui.selectable_value(&mut chosen, ExportFormat::Mp4Video, "MP4 (video)");
-                        ui.selectable_value(
-                            &mut chosen,
-                            ExportFormat::WavAudio,
-                            "WAV (solo audio)",
-                        );
-                        ui.selectable_value(
-                            &mut chosen,
-                            ExportFormat::Mp3Audio,
-                            "MP3 (solo audio)",
-                        );
-                        self.export_format = chosen;
-                    });
-                if ui
-                    .add_enabled(
-                        self.ffmpeg_ready && self.export_result.is_none(),
-                        egui::Button::new(format!(
-                            "Exportar {}",
-                            self.export_format.extension().to_uppercase()
-                        )),
-                    )
-                    .clicked()
-                {
-                    self.export();
-                }
-                if self.export_result.is_some() && ui.button("Cancelar exportacion").clicked() {
-                    if let Some(cancel) = &self.export_cancel {
-                        cancel.store(true, Ordering::Relaxed);
-                        self.status = "Cancelando exportacion...".to_owned();
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BAR)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(context, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // Marca de la app + nombre del proyecto + punto de estado.
+                    theme::logo_mark(ui);
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("EDITORCITO")
+                            .strong()
+                            .size(15.0)
+                            .color(theme::TEXT),
+                    );
+                    theme::bar_separator(ui);
+                    let before_name = self.project.clone();
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.project.name)
+                                .desired_width(140.0)
+                                .font(egui::TextStyle::Small),
+                        )
+                        .changed()
+                    {
+                        self.queue_edit(before_name);
                     }
-                }
-                if ui.button("Partir en cabezal").clicked() {
-                    self.split_at_playhead();
-                }
-                if self.ffmpeg_ready && ui.button("+ Titulo").clicked() {
-                    self.add_title_at_playhead();
-                }
-                if self.ffmpeg_ready
-                    && ui
-                        .button("+ Ajuste")
-                        .on_hover_text(
-                            "Capa de ajuste: gradúa todo lo que hay debajo en la pista superior",
+                    theme::dirty_dot(ui, self.has_unsaved_changes());
+                    theme::bar_separator(ui);
+
+                    // Documento
+                    if theme::bar_button(ui, "Nuevo").clicked() {
+                        self.request_document_action(DocumentAction::New);
+                    }
+                    if theme::bar_button(ui, "Abrir").clicked() {
+                        self.request_document_action(DocumentAction::Open);
+                    }
+                    if theme::bar_button(ui, "Guardar").clicked() {
+                        self.save_project(false);
+                    }
+                    if theme::bar_button(ui, "Guardar como").clicked() {
+                        self.save_project(true);
+                    }
+                    theme::bar_separator(ui);
+
+                    // Historial
+                    if ui
+                        .add_enabled(
+                            !self.undo_stack.is_empty(),
+                            egui::Button::new(egui::RichText::new("Deshacer").size(11.0)),
                         )
                         .clicked()
-                {
-                    self.add_adjustment_layer_at_playhead();
-                }
-                if ui.button("+ Marcador").clicked() {
-                    self.add_marker();
-                }
-                if ui.button("Importar secuencia").clicked() {
-                    self.import_nested_project();
-                }
-                ui.checkbox(&mut self.use_proxies, "Usar proxies");
-                ui.checkbox(&mut self.snap_enabled, "Ajuste magnético");
+                    {
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.redo_stack.is_empty(),
+                            egui::Button::new(egui::RichText::new("Rehacer").size(11.0)),
+                        )
+                        .clicked()
+                    {
+                        self.redo();
+                    }
+                    theme::bar_separator(ui);
+
+                    // Medio
+                    if ui
+                        .add_enabled(
+                            self.ffmpeg_ready,
+                            egui::Button::new(egui::RichText::new("+ Importar").size(11.0)),
+                        )
+                        .clicked()
+                    {
+                        self.import_media();
+                    }
+                    if theme::bar_button(ui, "Importar secuencia").clicked() {
+                        self.import_nested_project();
+                    }
+                    theme::bar_separator(ui);
+
+                    // Timeline
+                    if theme::bar_button(ui, "Partir en cabezal").clicked() {
+                        self.split_at_playhead();
+                    }
+                    if self.ffmpeg_ready && theme::bar_button(ui, "+ Título").clicked() {
+                        self.add_title_at_playhead();
+                    }
+                    if self.ffmpeg_ready
+                        && ui
+                            .add(egui::Button::new(egui::RichText::new("+ Ajuste").size(11.0)))
+                            .on_hover_text(
+                                "Capa de ajuste: gradúa todo lo que hay debajo en la pista superior",
+                            )
+                            .clicked()
+                    {
+                        self.add_adjustment_layer_at_playhead();
+                    }
+                    if theme::bar_button(ui, "+ Marcador").clicked() {
+                        self.add_marker();
+                    }
+                    ui.toggle_value(&mut self.snap_enabled, egui::RichText::new("Imán").size(11.0))
+                        .on_hover_text("Ajuste magnético");
+                    ui.toggle_value(
+                        &mut self.use_proxies,
+                        egui::RichText::new("Proxies").size(11.0),
+                    );
+                    theme::bar_separator(ui);
+
+                    // Exportación: presets + botón principal en acento.
+                    egui::ComboBox::from_id_salt("preset-export")
+                        .selected_text(match self.export_size {
+                            (1280, 720) => "720p",
+                            (1920, 1080) => "1080p",
+                            (3840, 2160) => "4K",
+                            (1080, 1920) => "Shorts/Reels/TikTok 1080x1920",
+                            (1080, 1080) => "Cuadrado (Instagram) 1080x1080",
+                            _ => "Personalizado",
+                        })
+                        .show_ui(ui, |ui| {
+                            let mut chosen = self.export_size;
+                            ui.selectable_value(&mut chosen, (1280, 720), "720p");
+                            ui.selectable_value(&mut chosen, (1920, 1080), "1080p (YouTube)");
+                            ui.selectable_value(&mut chosen, (3840, 2160), "4K");
+                            ui.selectable_value(
+                                &mut chosen,
+                                (1080, 1920),
+                                "Shorts/Reels/TikTok 1080x1920",
+                            );
+                            ui.selectable_value(
+                                &mut chosen,
+                                (1080, 1080),
+                                "Cuadrado (Instagram) 1080x1080",
+                            );
+                            self.export_size = chosen;
+                        });
+                    egui::ComboBox::from_id_salt("formato-export")
+                        .selected_text(self.export_format.label())
+                        .show_ui(ui, |ui| {
+                            let mut chosen = self.export_format;
+                            ui.selectable_value(&mut chosen, ExportFormat::Mp4Video, "MP4 (video)");
+                            ui.selectable_value(
+                                &mut chosen,
+                                ExportFormat::WavAudio,
+                                "WAV (solo audio)",
+                            );
+                            ui.selectable_value(
+                                &mut chosen,
+                                ExportFormat::Mp3Audio,
+                                "MP3 (solo audio)",
+                            );
+                            self.export_format = chosen;
+                        });
+                    if ui
+                        .add_enabled(
+                            self.ffmpeg_ready && self.export_result.is_none(),
+                            egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "Exportar {}",
+                                    self.export_format.extension().to_uppercase()
+                                ))
+                                .size(11.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(8, 24, 27)),
+                            )
+                            .fill(theme::ACCENT)
+                            .min_size(egui::vec2(0.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        self.export();
+                    }
+                    if self.export_result.is_some() {
+                        let (pct, _) = self
+                            .render_progress
+                            .lock()
+                            .map(|state| (state.pct as f32, state.eta_secs))
+                            .unwrap_or((0.0, 0.0));
+                        ui.add(
+                            egui::ProgressBar::new(pct)
+                                .desired_height(14.0)
+                                .desired_width(150.0)
+                                .show_percentage(),
+                        );
+                        if theme::bar_button(ui, "Cancelar").clicked() {
+                            if let Some(cancel) = &self.export_cancel {
+                                cancel.store(true, Ordering::Relaxed);
+                                self.status = "Cancelando exportacion...".to_owned();
+                            }
+                        }
+                    }
+                });
             });
-            ui.add_space(8.0);
-        });
         self.show_unsaved_dialog(context);
         self.show_silence_review(context);
         self.show_scene_cut_review(context);
 
         if !self.ffmpeg_ready {
-            egui::CentralPanel::default().show(context, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(90.0);
-                    ui.heading("Prepara NovaCut para editar");
-                    ui.add_space(12.0);
-                    ui.label("NovaCut necesita FFmpeg para leer, previsualizar y exportar video.");
-                    ui.label("La instalacion es automatica y solo se hace una vez.");
-                    ui.add_space(20.0);
-                    if self.setup_result.is_some() {
-                        ui.spinner();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(20)))
+                .show(context, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(70.0);
+                        theme::logo_mark(ui);
+                        ui.add_space(10.0);
                         ui.label(
-                            "Descargando e instalando FFmpeg (~100 MB)...\nEsto puede tardar varios minutos.",
+                            egui::RichText::new("Prepara NovaCut para editar")
+                                .strong()
+                                .size(17.0),
                         );
-                    } else {
-                        if ui.button("Instalar FFmpeg automaticamente").clicked() {
-                            self.install_ffmpeg();
-                        }
-                        ui.add_space(6.0);
-                        if ui.button("Descargar FFmpeg manualmente").clicked() {
-                            self.open_ffmpeg_download(context);
-                        }
-                    }
-                    ui.add_space(12.0);
-                    ui.label(
-                        "Otra opcion: copia ffmpeg.exe, ffprobe.exe y ffplay.exe junto a\nnovacut-windows.exe y pulsa Volver a comprobar.",
-                    );
-                    if ui.button("Volver a comprobar").clicked() {
-                        self.ffmpeg_ready = multimedia_tools_available();
-                        self.status = if self.ffmpeg_ready {
-                            "Motor multimedia encontrado".to_owned()
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "NovaCut necesita FFmpeg para leer, previsualizar y exportar video.",
+                            )
+                            .size(12.0)
+                            .color(theme::TEXT_DIM),
+                        );
+                        ui.label(
+                            egui::RichText::new("La instalacion es automatica y solo se hace una vez.")
+                                .size(12.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(18.0);
+                        if self.setup_result.is_some() {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new(
+                                    "Descargando e instalando FFmpeg (~100 MB)...\nEsto puede tardar varios minutos.",
+                                )
+                                .size(11.5)
+                                .color(theme::TEXT_DIM),
+                            );
                         } else {
-                            "FFmpeg sigue sin estar disponible".to_owned()
-                        };
-                    }
+                            if theme::accent_button(ui, "Instalar FFmpeg automaticamente")
+                                .clicked()
+                            {
+                                self.install_ffmpeg();
+                            }
+                            ui.add_space(6.0);
+                            if theme::bar_button(ui, "Descargar FFmpeg manualmente").clicked() {
+                                self.open_ffmpeg_download(context);
+                            }
+                        }
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Otra opcion: copia ffmpeg.exe, ffprobe.exe y ffplay.exe junto a\nnovacut-windows.exe y pulsa Volver a comprobar.",
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
+                        );
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("Volver a comprobar").size(11.0),
+                            ))
+                            .clicked()
+                        {
+                            self.ffmpeg_ready = multimedia_tools_available();
+                            self.status = if self.ffmpeg_ready {
+                                "Motor multimedia encontrado".to_owned()
+                            } else {
+                                "FFmpeg sigue sin estar disponible".to_owned()
+                            };
+                        }
+                    });
                 });
-            });
-            egui::TopBottomPanel::bottom("status").show(context, |ui| {
-                ui.horizontal(|ui| {
-                    if self.setup_result.is_some() {
-                        ui.spinner();
-                    }
-                    ui.label(&self.status);
+            egui::TopBottomPanel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BAR)
+                        .inner_margin(egui::Margin::symmetric(12, 5)),
+                )
+                .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        if self.setup_result.is_some() {
+                            ui.spinner();
+                        }
+                        ui.label(
+                            egui::RichText::new(&self.status)
+                                .size(10.5)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
                 });
-            });
             return;
         }
 
@@ -4660,100 +4754,108 @@ impl eframe::App for NovaCutWindows {
         egui::SidePanel::left("medios")
             .default_width(250.0)
             .min_width(170.0)
+            .frame(egui::Frame::new().fill(theme::BG))
             .show(context, |ui| {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(format!("MEDIOS  {}", self.project.clips.len()))
-                        .strong()
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(170)),
-                );
-                ui.add_space(4.0);
-                ui.separator();
+                theme::panel_header(ui, "Medios", Some(self.project.clips.len()));
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for index in 0..self.project.clips.len() {
                         let clip = self.project.clips[index].clone();
                         let selected = self.selected == Some(index);
-                        let (r, g, b) = match label_color(clip.label) {
-                            Some(color) => (color.r(), color.g(), color.b()),
-                            None => (0, 0, 0),
-                        };
                         let full_name = clip.name();
-                        let name = if full_name.chars().count() > 24 {
-                            let mut trimmed: String = full_name.chars().take(24).collect();
+                        let name = if full_name.chars().count() > 22 {
+                            let mut trimmed: String = full_name.chars().take(22).collect();
                             trimmed.push('…');
                             trimmed
                         } else {
                             full_name
                         };
                         let duration = format!("{:.1} s", clip.duration());
-                        let response = ui
-                            .horizontal(|ui| {
-                                ui.add_space(6.0);
-                                if r > 0 || g > 0 || b > 0 {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(6.0, 6.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        3.0,
-                                        egui::Color32::from_rgb(r, g, b),
-                                    );
-                                } else {
-                                    ui.add_space(6.0);
-                                }
-                                ui.label(egui::RichText::new(&name).size(12.0).color(
-                                    if selected {
-                                        egui::Color32::from_rgb(0, 190, 212)
-                                    } else {
-                                        egui::Color32::from_gray(215)
-                                    },
-                                ));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(duration)
-                                                .size(10.0)
-                                                .color(egui::Color32::from_gray(130)),
-                                        );
-                                    },
+                        let row_h = 36.0;
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::Vec2::new(ui.available_width(), row_h),
+                            egui::Sense::click(),
+                        );
+                        let response =
+                            response.on_hover_text(clip.path.display().to_string());
+                        let painter = ui.painter();
+                        let fill = if selected {
+                            theme::ACCENT_SOFT
+                        } else if response.hovered() {
+                            theme::CARD_HOVER
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        painter.rect_filled(rect, 4.0, fill);
+                        if selected {
+                            painter.rect_stroke(
+                                rect,
+                                4.0,
+                                egui::Stroke::new(1.0_f32, theme::ACCENT),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        // Barra de la etiqueta de color, como en macOS.
+                        if let Some(color) = label_color(clip.label) {
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(rect.left() + 5.0, rect.top() + 7.0),
+                                    egui::pos2(rect.left() + 8.0, rect.bottom() - 7.0),
+                                ),
+                                1.5,
+                                color,
+                            );
+                        }
+                        // Miniatura si ya está generada.
+                        let thumb_x = rect.left() + 14.0;
+                        let thumb_size = row_h - 10.0;
+                        let mut text_x = thumb_x;
+                        if let Some(texture) = self.thumbnails.get(&clip.path) {
+                            if clip.has_video {
+                                painter.image(
+                                    texture.id(),
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(thumb_x, rect.top() + 5.0),
+                                        egui::vec2(thumb_size, thumb_size),
+                                    ),
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
                                 );
-                            })
-                            .response
-                            .on_hover_text(clip.path.display().to_string());
-                        let row = response.clone();
-                        if row.clicked() {
+                                text_x += thumb_size + 6.0;
+                            }
+                        }
+                        painter.text(
+                            egui::pos2(text_x, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &name,
+                            egui::FontId::proportional(12.0),
+                            if selected { theme::ACCENT } else { theme::TEXT },
+                        );
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            duration,
+                            egui::FontId::proportional(10.0),
+                            theme::TEXT_FAINT,
+                        );
+                        if response.clicked() {
                             self.selected = Some(index);
                             self.playhead = clip.timeline_start.max(0.0);
                             self.preview_texture = None;
                             self.request_preview();
                         }
-                        if selected {
-                            ui.painter().rect_filled(
-                                response.rect,
-                                4.0,
-                                egui::Color32::from_rgba_unmultiplied(0, 190, 212, 22),
-                            );
-                        }
-                        ui.add_space(2.0);
+                        ui.add_space(1.0);
                     }
                 });
             });
         egui::SidePanel::right("inspector")
             .default_width(280.0)
+            .frame(egui::Frame::new().fill(theme::BG))
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("INSPECTOR")
-                            .strong()
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(170)),
-                    );
-                    ui.add_space(4.0);
-                    ui.separator();
+                    theme::panel_header(ui, "Inspector", None);
                     if let Some(clip) = self
                         .selected
                         .and_then(|index| self.project.clips.get_mut(index))
@@ -4794,7 +4896,7 @@ impl eframe::App for NovaCutWindows {
                                     .add(egui::Slider::new(&mut title.position_y, 0.0..=1.0))
                                     .changed();
                             });
-                            ui.label("Color");
+                            theme::section_label(ui, "Color");
                             ui.horizontal(|ui| {
                                 ui.label("R");
                                 trim_changed |= ui
@@ -4844,7 +4946,7 @@ impl eframe::App for NovaCutWindows {
                             }
                         }
                         ui.add_space(12.0);
-                        ui.label("Etiqueta");
+                        theme::section_label(ui, "Etiqueta");
                         ui.horizontal(|ui| {
                             for option in 0u8..=6 {
                                 let selected = clip.label == option;
@@ -4874,7 +4976,7 @@ impl eframe::App for NovaCutWindows {
                         if !trim_allowed {
                             ui.small("Entrada/salida bloqueadas mientras exista una rampa.");
                         }
-                        ui.label("Entrada (segundos)");
+                        theme::section_label(ui, "Entrada (segundos)");
                         trim_changed |= ui
                             .add_enabled(
                                 trim_allowed,
@@ -4883,7 +4985,7 @@ impl eframe::App for NovaCutWindows {
                                     .range(0.0..=clip.out_seconds),
                             )
                             .changed();
-                        ui.label("Salida (segundos)");
+                        theme::section_label(ui, "Salida (segundos)");
                         trim_changed |= ui
                             .add_enabled(
                                 trim_allowed,
@@ -4915,7 +5017,7 @@ impl eframe::App for NovaCutWindows {
                                     .prefix(if clip.has_video { "V" } else { "A" }),
                             )
                             .changed();
-                        ui.label("Velocidad");
+                        theme::section_label(ui, "Velocidad");
                         trim_changed |= ui
                             .add(
                                 egui::DragValue::new(&mut clip.speed)
@@ -4994,7 +5096,7 @@ impl eframe::App for NovaCutWindows {
                         });
                         if clip.has_video && clip.title.is_none() {
                             ui.separator();
-                            ui.label("Color");
+                            theme::section_label(ui, "Color");
                             trim_changed |= ui
                                 .add(
                                     egui::Slider::new(&mut clip.exposure, -1.0..=1.0)
@@ -5641,19 +5743,28 @@ impl eframe::App for NovaCutWindows {
         let mut metadata_changed = false;
         let mut burn_changed = false;
         let mut scopes_changed = false;
-        egui::CentralPanel::default().show(context, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(12)))
+            .show(context, |ui| {
+            // Barra de título del monitor, al estilo de las cabeceras de panel.
             ui.horizontal(|ui| {
-                ui.heading("Monitor");
+                ui.label(
+                    egui::RichText::new("MONITOR")
+                        .strong()
+                        .size(10.0)
+                        .color(theme::TEXT),
+                );
                 if self.preview_result.is_some() {
                     ui.spinner();
                 }
                 let playing = self.playback.is_some();
                 if ui
-                    .button(if playing {
-                        "■ Detener"
-                    } else {
-                        "▶ Reproducir"
-                    })
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(if playing { "■ Detener" } else { "▶ Reproducir" })
+                                .size(11.0),
+                        ),
+                    )
                     .clicked()
                 {
                     self.toggle_playback();
@@ -5661,28 +5772,44 @@ impl eframe::App for NovaCutWindows {
                 if ui
                     .add_enabled(
                         self.frame_result.is_none(),
-                        egui::Button::new(if self.frame_result.is_some() {
-                            "Exportando fotograma..."
-                        } else {
-                            "Exportar fotograma"
-                        }),
+                        egui::Button::new(
+                            egui::RichText::new(if self.frame_result.is_some() {
+                                "Exportando fotograma..."
+                            } else {
+                                "Exportar fotograma"
+                            })
+                            .size(11.0),
+                        ),
                     )
                     .clicked()
                 {
                     self.export_frame();
                 }
-                scopes_changed |= ui.checkbox(&mut self.show_waveform, "Waveform").changed();
+                scopes_changed |=
+                    ui.checkbox(&mut self.show_waveform, egui::RichText::new("Waveform").size(11.0))
+                        .changed();
                 scopes_changed |= ui
-                    .checkbox(&mut self.show_vectorscope, "Vectorscope")
+                    .checkbox(
+                        &mut self.show_vectorscope,
+                        egui::RichText::new("Vectorscope").size(11.0),
+                    )
                     .changed();
                 ui.separator();
-                ui.label("Vol");
+                ui.label(egui::RichText::new("Vol").size(11.0).color(theme::TEXT_DIM));
                 ui.add_sized(
                     [80.0, 16.0],
                     egui::Slider::new(&mut self.monitor_volume, 0.0..=1.0).show_value(false),
                 );
-                ui.label(format!("{:.2} s", self.playhead));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:.2} s", self.playhead))
+                            .monospace()
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                });
             });
+            ui.add_space(8.0);
             let monitor_size = egui::vec2(
                 ui.available_width().min(640.0),
                 ui.available_width().min(640.0) * 9.0 / 16.0,
@@ -5690,13 +5817,21 @@ impl eframe::App for NovaCutWindows {
             ui.vertical_centered(|ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::BLACK)
+                    .corner_radius(6.0)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
                     .show(ui, |ui| {
                         ui.set_min_size(monitor_size);
                         if let Some(texture) = &self.preview_texture {
                             ui.image((texture.id(), monitor_size));
                         } else {
                             ui.centered_and_justified(|ui| {
-                                ui.label("Haz clic en la timeline para cargar el monitor");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Haz clic en la timeline para cargar el monitor",
+                                    )
+                                    .size(11.5)
+                                    .color(theme::TEXT_FAINT),
+                                );
                             });
                         }
                     });
@@ -5731,47 +5866,71 @@ impl eframe::App for NovaCutWindows {
                     ui.small(db);
                 });
             }
-            ui.add_space(10.0);
-            ui.heading("Timeline");
+            ui.add_space(12.0);
             let total = self.project.duration();
             let video_tracks = self.project.video_track_count();
             let audio_tracks = self.project.audio_track_count();
             let track_count = video_tracks + audio_tracks;
             let timeline_height = track_count as f32 * 54.0 + 12.0;
-            // --- Controles de zoom y desplazamiento ---
+            // --- Cabecera del timeline: título a la izquierda, zoom a la derecha ---
             ui.horizontal(|ui| {
-                if ui.button("−").clicked() {
-                    self.zoom = (self.zoom / 1.4).max(1.0);
-                    self.hscroll = self
-                        .hscroll
-                        .min((total - total / self.zoom as f64).max(0.0));
-                }
-                ui.label(format!("{:.0}%", self.zoom * 100.0));
-                if ui.button("+").clicked() {
-                    let view_old = total / self.zoom as f64;
-                    self.zoom = (self.zoom * 1.4).min(200.0);
-                    let view_new = total / self.zoom as f64;
-                    let anchor = self.playhead;
-                    self.hscroll =
-                        (anchor - (anchor - self.hscroll) * (view_new / view_old)).max(0.0);
-                }
-                if ui.button("Ajustar").clicked() {
-                    self.zoom = 1.0;
-                    self.hscroll = 0.0;
-                }
-                if self.zoom > 1.0 {
-                    let view_seconds = total / self.zoom as f64;
-                    let max_off = (total - view_seconds).max(0.0);
-                    let mut value = self.hscroll;
-                    let slider = egui::Slider::new(&mut value, 0.0..=max_off.max(0.001))
-                        .show_value(false)
-                        .text("");
-                    let response = ui.add(slider);
-                    if response.changed() {
-                        self.hscroll = value;
+                ui.label(
+                    egui::RichText::new("TIMELINE")
+                        .strong()
+                        .size(10.0)
+                        .color(theme::TEXT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Ajustar").size(10.5)),
+                        )
+                        .clicked()
+                    {
+                        self.zoom = 1.0;
+                        self.hscroll = 0.0;
                     }
-                }
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("+").size(11.0)))
+                        .clicked()
+                    {
+                        let view_old = total / self.zoom as f64;
+                        self.zoom = (self.zoom * 1.4).min(200.0);
+                        let view_new = total / self.zoom as f64;
+                        let anchor = self.playhead;
+                        self.hscroll =
+                            (anchor - (anchor - self.hscroll) * (view_new / view_old)).max(0.0);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("−").size(11.0)))
+                        .clicked()
+                    {
+                        self.zoom = (self.zoom / 1.4).max(1.0);
+                        self.hscroll = self
+                            .hscroll
+                            .min((total - total / self.zoom as f64).max(0.0));
+                    }
+                    if self.zoom > 1.0 {
+                        let view_seconds = total / self.zoom as f64;
+                        let max_off = (total - view_seconds).max(0.0);
+                        let mut value = self.hscroll;
+                        let slider = egui::Slider::new(&mut value, 0.0..=max_off.max(0.001))
+                            .show_value(false)
+                            .text("");
+                        let response = ui.add(slider);
+                        if response.changed() {
+                            self.hscroll = value;
+                        }
+                    }
+                });
             });
+            ui.add_space(4.0);
             let view_seconds = total / self.zoom as f64;
             let (timeline_rect, timeline_response) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), timeline_height),
@@ -5812,7 +5971,49 @@ impl eframe::App for NovaCutWindows {
             let max_off = (total - view_seconds).max(0.0);
             self.hscroll = self.hscroll.clamp(0.0, max_off);
 
-            painter.rect_filled(timeline_rect, 5.0, egui::Color32::from_rgb(11, 13, 17));
+            let tl_bg = egui::Rect::from_min_size(
+                timeline_rect.min,
+                egui::vec2(timeline_rect.width(), timeline_rect.height()),
+            );
+            painter.rect_filled(tl_bg, 6.0, egui::Color32::from_rgb(13, 14, 16));
+            painter.rect_stroke(
+                tl_bg,
+                6.0,
+                egui::Stroke::new(1.0_f32, theme::STROKE_SOFT),
+                egui::StrokeKind::Inside,
+            );
+            // Regla de tiempo: marcas cada 1/5/10/30/60/300 s según el zoom.
+            {
+                let steps: [f64; 7] = [0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0];
+                let step = steps
+                    .iter()
+                    .find(|&&step| step * pps >= 70.0)
+                    .unwrap_or(&steps[6]);
+                let first = (hs / step).floor() * step;
+                let mut t = first;
+                while t <= hs + view_seconds {
+                    let x = to_x(t);
+                    if x >= timeline_rect.left() {
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, timeline_rect.top()),
+                                egui::pos2(x, timeline_rect.top() + 6.0),
+                            ],
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
+                        );
+                        if step * pps >= 90.0 {
+                            painter.text(
+                                egui::pos2(x + 4.0, timeline_rect.top() + 4.0),
+                                egui::Align2::LEFT_TOP,
+                                format_seconds(t),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::from_gray(110),
+                            );
+                        }
+                    }
+                    t += step;
+                }
+            }
             let row_height = (timeline_rect.height() - 12.0) / track_count as f32;
             for row in 0..track_count {
                 let y = timeline_rect.bottom() - 6.0 - row as f32 * row_height;
@@ -5821,7 +6022,7 @@ impl eframe::App for NovaCutWindows {
                         egui::pos2(timeline_rect.left(), y),
                         egui::pos2(timeline_rect.right(), y),
                     ],
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(39, 42, 49)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 32, 36)),
                 );
                 painter.text(
                     egui::pos2(timeline_rect.left() + 5.0, y - row_height / 2.0),
@@ -5831,8 +6032,8 @@ impl eframe::App for NovaCutWindows {
                     } else {
                         format!("V{}", row - audio_tracks + 1)
                     },
-                    egui::FontId::monospace(11.0),
-                    egui::Color32::from_gray(170),
+                    egui::FontId::monospace(10.0),
+                    egui::Color32::from_gray(120),
                 );
             }
             const EDGE_GRAB: f32 = 6.0;
@@ -5851,13 +6052,26 @@ impl eframe::App for NovaCutWindows {
                     egui::pos2((right - 1.0).max(left + 3.0), bottom - 4.0),
                 );
                 let color = if self.selected == Some(index) {
-                    egui::Color32::from_rgb(126, 83, 218)
+                    egui::Color32::from_rgb(0, 132, 150)
                 } else if clip.has_video {
-                    egui::Color32::from_rgb(51, 91, 143)
+                    egui::Color32::from_rgb(44, 78, 124)
                 } else {
-                    egui::Color32::from_rgb(48, 124, 99)
+                    egui::Color32::from_rgb(38, 100, 82)
                 };
-                painter.rect_filled(rect, 3.0, color);
+                painter.rect_filled(rect, 4.0, color);
+                painter.rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(
+                        1.0_f32,
+                        if self.selected == Some(index) {
+                            theme::ACCENT
+                        } else {
+                            egui::Color32::from_rgb(16, 18, 22)
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
                 // Miniatura del clip cuando ya está generada.
                 let thumb = if clip.has_video && clip.title.is_none() {
                     self.thumbnails.get(&clip.path).map(|texture| texture.id())
@@ -5954,10 +6168,17 @@ impl eframe::App for NovaCutWindows {
                         );
                     }
                     painter.text(
+                        rect.center() + egui::vec2(1.0, 1.0),
+                        egui::Align2::CENTER_CENTER,
+                        clip.name(),
+                        egui::FontId::proportional(11.5),
+                        egui::Color32::from_black_alpha(160),
+                    );
+                    painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         clip.name(),
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(11.5),
                         egui::Color32::WHITE,
                     );
                 }
@@ -6436,53 +6657,79 @@ impl eframe::App for NovaCutWindows {
             self.toggle_playback();
         }
 
-        egui::TopBottomPanel::bottom("status").show(context, |ui| {
-            let rendering = self.export_result.is_some() || self.montage_render.is_some();
-            if rendering {
-                let (pct, eta) = self
-                    .render_progress
-                    .lock()
-                    .map(|state| (state.pct, state.eta_secs))
-                    .unwrap_or((0.0, 0.0));
-                ui.add(
-                    egui::ProgressBar::new(pct as f32)
-                        .show_percentage()
-                        .desired_height(14.0),
-                );
-                if pct > 0.002 {
-                    ui.label(format!(
-                        "Restante aproximado: {}",
-                        format_seconds((eta * 10.0).round() / 10.0)
-                    ));
-                }
-            }
-            ui.horizontal(|ui| {
-                if rendering {
-                    ui.spinner();
-                }
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let offline = self.missing_media_indices().len();
-                    if offline > 0 {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(246, 83, 83),
-                            format!("{offline} medio(s) OFFLINE"),
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BAR)
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(context, |ui| {
+                let rendering = self.export_result.is_some() || self.montage_render.is_some();
+                ui.horizontal(|ui| {
+                    if rendering {
+                        let (pct, eta) = self
+                            .render_progress
+                            .lock()
+                            .map(|state| (state.pct, state.eta_secs))
+                            .unwrap_or((0.0, 0.0));
+                        ui.add(
+                            egui::ProgressBar::new(pct as f32)
+                                .show_percentage()
+                                .desired_height(12.0)
+                                .desired_width(110.0),
                         );
+                        if pct > 0.002 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Restante aproximado: {}",
+                                    format_seconds((eta * 10.0).round() / 10.0)
+                                ))
+                                .size(10.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        }
+                        if theme::bar_button(ui, "Cancelar").clicked() {
+                            if let Some(cancel) = &self.export_cancel {
+                                cancel.store(true, Ordering::Relaxed);
+                                self.status = "Cancelando exportacion...".to_owned();
+                            }
+                        }
+                        ui.separator();
                     }
+                    let failed = self.status.contains("FALLO") || self.status.contains("error");
                     ui.label(
-                        egui::RichText::new("FFmpeg · Windows x64")
-                            .size(9.0)
-                            .color(egui::Color32::from_gray(130)),
+                        egui::RichText::new(&self.status)
+                            .size(10.5)
+                            .color(if failed { theme::WARN } else { theme::TEXT_DIM }),
                     );
-                    let total = self.project.duration();
-                    ui.label(format!(
-                        "{} clips | {:.1} s",
-                        self.project.clips.len(),
-                        total
-                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let total = self.project.duration();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} clips · {:.1} s",
+                                self.project.clips.len(),
+                                total
+                            ))
+                            .size(10.0)
+                            .color(theme::TEXT_FAINT),
+                        );
+                        ui.label(
+                            egui::RichText::new("FFmpeg · Windows x64")
+                                .size(9.0)
+                                .color(theme::TEXT_FAINT),
+                        );
+                        let offline = self.missing_media_indices().len();
+                        if offline > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("{offline} medio(s) OFFLINE"))
+                                    .size(10.0)
+                                    .strong()
+                                    .color(theme::DANGER),
+                            );
+                        }
+                    });
                 });
             });
-        });
     }
 }
 
@@ -7735,8 +7982,203 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "NovaCut Windows",
         options,
-        Box::new(|context| Ok(Box::new(NovaCutWindows::new(context)))),
+        Box::new(|context| {
+            theme::apply(&context.egui_ctx);
+            Ok(Box::new(NovaCutWindows::new(context)))
+        }),
     )
+}
+
+/// Lenguaje visual unificado con la app macOS: grises neutros, acento cian,
+/// esquinas suaves y densidad compacta. Todos los valores salen del diseño de
+/// `src/ui/App.swift` (0.075 de fondo, 0.115 la barra superior, 0.095 las
+/// cabeceras de panel, 0.12 las tarjetas).
+mod theme {
+    use crate::egui::{
+        self, Align2, Color32, CornerRadius, FontId, Margin, Pos2, Response, RichText, Sense,
+        Stroke, Ui, Vec2,
+    };
+
+    /// Acento cian, equivalente al tint(.cyan) de la app macOS.
+    pub const ACCENT: Color32 = Color32::from_rgb(0, 190, 212);
+    pub const ACCENT_DIM: Color32 = Color32::from_rgb(0, 132, 150);
+    pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(0, 21, 23, 28);
+
+    /// Fondo general del lienzo (calibratedWhite 0.075).
+    pub const BG: Color32 = Color32::from_rgb(19, 19, 19);
+    /// Barra superior (calibratedWhite 0.115).
+    pub const BAR: Color32 = Color32::from_rgb(29, 29, 29);
+    /// Cabeceras de panel (calibratedWhite 0.095).
+    pub const PANEL_HEADER: Color32 = Color32::from_rgb(24, 24, 24);
+    /// Tarjetas y filas (calibratedWhite 0.12).
+    pub const CARD: Color32 = Color32::from_rgb(31, 31, 31);
+    pub const CARD_HOVER: Color32 = Color32::from_rgb(42, 42, 42);
+    pub const STROKE: Color32 = Color32::from_rgb(52, 52, 52);
+    pub const STROKE_SOFT: Color32 = Color32::from_rgb(38, 38, 38);
+
+    pub const TEXT: Color32 = Color32::from_rgb(228, 228, 228);
+    pub const TEXT_DIM: Color32 = Color32::from_rgb(160, 160, 160);
+    pub const TEXT_FAINT: Color32 = Color32::from_rgb(120, 120, 120);
+
+    pub const OK: Color32 = Color32::from_rgb(90, 220, 120);
+    pub const WARN: Color32 = Color32::from_rgb(246, 140, 40);
+    pub const DANGER: Color32 = Color32::from_rgb(246, 83, 83);
+
+    pub const R: CornerRadius = CornerRadius::same(5);
+
+    /// Aplica el tema completo al contexto. Sustituye al antiguo
+    /// `Visuals::dark()` con retoques sueltos.
+    pub fn apply(ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        let v = &mut style.visuals;
+        v.dark_mode = true;
+        v.panel_fill = BG;
+        v.window_fill = Color32::from_rgb(26, 26, 26);
+        v.extreme_bg_color = Color32::from_rgb(14, 14, 15);
+        v.faint_bg_color = Color32::from_rgb(28, 28, 30);
+        v.hyperlink_color = ACCENT;
+        v.window_stroke = Stroke::NONE;
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(120, 235, 255));
+        v.widgets.noninteractive.bg_fill = CARD;
+        v.widgets.noninteractive.weak_bg_fill = CARD;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, STROKE_SOFT);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
+        v.widgets.noninteractive.corner_radius = CornerRadius::same(4);
+        v.widgets.inactive.bg_fill = CARD;
+        v.widgets.inactive.weak_bg_fill = CARD;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, STROKE);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        v.widgets.inactive.corner_radius = R;
+        v.widgets.hovered.bg_fill = CARD_HOVER;
+        v.widgets.hovered.weak_bg_fill = CARD_HOVER;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(72, 72, 72));
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        v.widgets.hovered.corner_radius = R;
+        v.widgets.active.bg_fill = ACCENT_DIM;
+        v.widgets.active.weak_bg_fill = ACCENT_DIM;
+        v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        v.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        v.widgets.active.corner_radius = R;
+        v.widgets.open.bg_fill = CARD;
+        v.widgets.open.weak_bg_fill = CARD;
+        v.widgets.open.bg_stroke = Stroke::new(1.0_f32, STROKE);
+        v.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        v.widgets.open.corner_radius = R;
+
+        let s = &mut style.spacing;
+        s.item_spacing = Vec2::new(8.0, 6.0);
+        s.button_padding = Vec2::new(10.0, 4.0);
+        s.interact_size = Vec2::new(40.0, 22.0);
+        s.indent = 18.0;
+        s.slider_width = 130.0;
+        s.slider_rail_height = 4.0;
+        s.window_margin = Margin::same(10);
+        s.menu_margin = Margin::same(6);
+        s.combo_width = 140.0;
+        style.animation_time = 0.1;
+
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            FontId::proportional(15.0),
+        );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, FontId::proportional(12.5));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, FontId::proportional(10.5));
+        ctx.set_style(style);
+    }
+
+    /// Marca de la app: cuadrado redondeado con la N, sustituye al icono real.
+    pub fn logo_mark(ui: &mut Ui) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, ACCENT_DIM);
+        painter.rect_stroke(rect, 6.0, Stroke::new(1.0_f32, ACCENT), egui::StrokeKind::Inside);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "N",
+            FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+    }
+
+    /// Separador vertical fino de 22 px, como los Divider().frame(height: 22).
+    pub fn bar_separator(ui: &mut Ui) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 22.0), Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(56));
+    }
+
+    /// Botón de la barra superior: texto 11 pt, como en macOS.
+    pub fn bar_button(ui: &mut Ui, label: &str) -> Response {
+        ui.add(egui::Button::new(RichText::new(label).size(11.0)))
+    }
+
+    /// Botón principal con el acento (buttonStyle .borderedProminent + tint cyan).
+    pub fn accent_button(ui: &mut Ui, label: &str) -> Response {
+        ui.add(
+            egui::Button::new(RichText::new(label).size(11.0).color(Color32::from_rgb(8, 24, 27)))
+                .fill(ACCENT)
+                .min_size(Vec2::new(0.0, 24.0)),
+        )
+    }
+
+    /// Cabecera de panel a lo `panelTitle` de la app Mac: barra de 30 px con
+    /// el título en mayúsculas, negrita y el contador en terciario.
+    pub fn panel_header(ui: &mut Ui, title: &str, count: Option<usize>) {
+        let height = 30.0;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, PANEL_HEADER);
+        painter.line_segment(
+            [Pos2::new(rect.left(), rect.bottom()), Pos2::new(rect.right(), rect.bottom())],
+            Stroke::new(1.0_f32, Color32::from_rgb(14, 14, 14)),
+        );
+        painter.text(
+            Pos2::new(rect.left() + 12.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            title.to_uppercase(),
+            FontId::proportional(10.0),
+            TEXT,
+        );
+        if let Some(count) = count {
+            let title_width = painter
+                .layout_no_wrap(title.to_uppercase(), FontId::proportional(10.0), TEXT)
+                .size()
+                .x;
+            painter.text(
+                Pos2::new(rect.left() + 12.0 + title_width + 6.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                count.to_string(),
+                FontId::proportional(10.0),
+                TEXT_FAINT,
+            );
+        }
+        ui.add_space(6.0);
+    }
+
+    /// Etiqueta de sección dentro del inspector, al estilo de los títulos
+    /// pequeños de la app Mac.
+    pub fn section_label(ui: &mut Ui, title: &str) {
+        ui.add_space(2.0);
+        ui.label(RichText::new(title.to_uppercase()).size(9.5).strong().color(TEXT_FAINT));
+    }
+
+    /// Punto de estado del documento: naranja si hay cambios sin guardar,
+    /// verde si todo está guardado.
+    pub fn dirty_dot(ui: &mut Ui, dirty: bool) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 3.5, if dirty { WARN } else { OK });
+    }
+
 }
 
 #[cfg(test)]
