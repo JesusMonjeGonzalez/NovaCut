@@ -13,7 +13,9 @@
 
 <p align="center">
   <a href="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/build.yml"><img src="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/build.yml/badge.svg" alt="macOS build"></a>
+  <a href="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/windows.yml"><img src="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/windows.yml/badge.svg" alt="Windows build"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-111111?logo=apple" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Windows-x64%20Rust%2Fegui-0078D6?logo=windows" alt="Windows x64">
   <img src="https://img.shields.io/badge/architecture-Apple%20Silicon-555555" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/status-engineering%20alpha-9B59B6" alt="Engineering alpha">
 </p>
@@ -116,19 +118,23 @@ and basic per-clip color (exposure, contrast, saturation, vignette) plus a
 fast whole-timeline preview, timeline zoom with edge trimming and clip
 thumbnails, NLE keyboard shortcuts (S to split, Delete, Home/End, arrows),
 color labels and offline-media detection with relinking. Exports support
-1080p, 4K and vertical 1080x1920 presets with render progress and ETA, plus
-audio-only WAV/MP3 delivery. Named timeline markers organize the edit and the
+1080p, 4K, vertical 1080x1920 (Shorts/Reels/TikTok) and square 1080x1080
+(Instagram) presets with render progress and ETA, plus audio-only WAV/MP3
+delivery. Named timeline markers organize the edit and the
 program monitor plays the whole composited timeline in real time (Space) with
-clip audio, an L/R level meter and volume control. Single-frame PNG export,
+clip audio, an L/R level meter, volume control and waveform/vectorscope
+overlays. Single-frame PNG export,
 gap closing, automatic project backups (last 10), gaussian blur, color wheels,
 RGB/luma curves, chroma key (green/blue screen with spill
 suppression), ripple delete, basic multicam cutting with keys 1-4 over
 aligned angle tracks with audio-based angle sync (envelope correlation),
 and in-app subtitle authoring with SRT import/export, styling, burn-in and
-optional local Whisper transcription. Transform keyframes animate clips;
-speed ramps, nested sequences, 14 blend modes, feathered masks, `.cube` LUTs,
-540p proxies, centered vertical reframe, waveform/vectorscope, track/master
-mixing, LUFS analysis/normalization and silence cutting are also available.
+optional local Whisper transcription (any `ggml-*.bin` model). Transform
+keyframes animate clips; speed ramps, nested sequences, 14 blend modes,
+feathered masks, `.cube` LUTs, 540p proxies, track/master mixing with stereo
+balance per clip, two-pass LUFS normalization, silence and scene-cut
+detection, magnetic timeline snapping and adjustment layers that grade
+everything beneath them are also available.
 Whisper is optional: place `whisper-cli.exe` and a `ggml-*.bin` model in a
 `whisper` directory beside the Windows executable.
 
