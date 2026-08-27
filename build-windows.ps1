@@ -44,6 +44,10 @@ if ($Installer) {
     } else {
         $makensis.FullName
     }
+    # NSIS no crea el directorio de salida; asegúralo antes (build/installer
+    # no existe en un checkout limpio de CI porque build/ está en .gitignore).
+    $installerDir = Join-Path $root "build\installer"
+    New-Item $installerDir -ItemType Directory -Force | Out-Null
     & $nsisPath -WX "installer\NovaCut.nsi"
     if ($LASTEXITCODE -ne 0) {
         throw "NSIS failed with exit code $LASTEXITCODE"
