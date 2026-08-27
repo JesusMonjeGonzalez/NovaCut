@@ -13,7 +13,9 @@
 
 <p align="center">
   <a href="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/build.yml"><img src="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/build.yml/badge.svg" alt="macOS build"></a>
+  <a href="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/windows.yml"><img src="https://github.com/JesusMonjeGonzalez/NovaCut/actions/workflows/windows.yml/badge.svg" alt="Windows build"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-111111?logo=apple" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Windows-x64%20Rust%2Fegui-0078D6?logo=windows" alt="Windows x64">
   <img src="https://img.shields.io/badge/architecture-Apple%20Silicon-555555" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/status-engineering%20alpha-9B59B6" alt="Engineering alpha">
 </p>
@@ -94,6 +96,48 @@ Install the ad-hoc-signed development build into `/Applications`:
 
 There is currently no notarized binary release or installer.
 
+### Windows rough-cut build
+
+NovaCut now has a native Windows host for multipista editing, composition,
+audio mixing, subtitles and H.264/audio delivery. Install FFmpeg
+(`winget install Gyan.FFmpeg`) and run
+`./build-windows.ps1` on Windows; the package is written to
+`build/NovaCut-Windows`. GitHub Actions publishes the same package as
+`novacut-windows-x64`.
+
+`./build-windows.ps1 -Installer` also creates a one-click NSIS installer
+with Start menu shortcuts, uninstall support, optional desktop shortcut,
+automatic FFmpeg setup and `.ncrough` file association.
+
+This remains an engineering alpha. Windows supports positioned clips, gaps,
+layered video tracks, independent audio
+tracks (WAV/MP3/M4A/FLAC), per-clip transforms (position, scale, rotation,
+opacity), audio/video fades, edge trimming by dragging clip borders in the
+timeline, fade-through-black transitions with the previous clip, text titles
+and basic per-clip color (exposure, contrast, saturation, vignette) plus a
+fast whole-timeline preview, timeline zoom with edge trimming and clip
+thumbnails, NLE keyboard shortcuts (S to split, Delete, Home/End, arrows),
+color labels and offline-media detection with relinking. Exports support
+1080p, 4K, vertical 1080x1920 (Shorts/Reels/TikTok) and square 1080x1080
+(Instagram) presets with render progress and ETA, plus audio-only WAV/MP3
+delivery. Named timeline markers organize the edit and the
+program monitor plays the whole composited timeline in real time (Space) with
+clip audio, an L/R level meter, volume control and waveform/vectorscope
+overlays. Single-frame PNG export,
+gap closing, automatic project backups (last 10), gaussian blur, color wheels,
+RGB/luma curves, chroma key (green/blue screen with spill
+suppression), ripple delete, basic multicam cutting with keys 1-4 over
+aligned angle tracks with audio-based angle sync (envelope correlation),
+and in-app subtitle authoring with SRT import/export, styling, burn-in and
+optional local Whisper transcription (any `ggml-*.bin` model). Transform
+keyframes animate clips; speed ramps, nested sequences, 14 blend modes,
+feathered masks, `.cube` LUTs, 540p proxies, track/master mixing with stereo
+balance per clip, two-pass LUFS normalization, silence and scene-cut
+detection, magnetic timeline snapping and adjustment layers that grade
+everything beneath them are also available.
+Whisper is optional: place `whisper-cli.exe` and a `ggml-*.bin` model in a
+`whisper` directory beside the Windows executable.
+
 ## Verification
 
 ```bash
@@ -159,6 +203,7 @@ assets/    application icon
 Detailed references:
 
 - [User guide](docs/GUIA-USUARIO.md)
+- [Windows alpha guide](docs/GUIA-WINDOWS.md)
 - [Formats and codec boundaries](docs/FORMATOS.md)
 - [Architecture notes](docs/stack.md)
 - [Roadmap](docs/ROADMAP.md)

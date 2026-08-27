@@ -8,10 +8,24 @@ name = "editorcito"
 path = "src/core/lib.rs"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[[bin]]
+name = "novacut-windows"
+path = "src/windows/main.rs"
+required-features = ["windows-host"]
+
+[features]
+default = []
+windows-host = ["dep:eframe", "dep:rfd", "dep:rodio"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] , optional = true }
+rfd = { version = "0.15", optional = true }
+rodio = { version = "0.20", optional = true, default-features = false }
 
 [profile.release]
 lto = true

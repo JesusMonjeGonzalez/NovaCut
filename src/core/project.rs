@@ -210,7 +210,11 @@ impl ProjectCodec {
             })
             .collect();
 
-        backups.sort_by_key(|e| e.modified().unwrap_or(std::time::UNIX_EPOCH));
+        backups.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        });
 
         while backups.len() > project.settings.max_backup_count {
             let first = backups.remove(0);

@@ -1,0 +1,35 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install installer compiler
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+      - name: Test and package Windows application
+        shell: pwsh
+        run: ./build-windows.ps1 -Installer
+      - name: Upload portable Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: novacut-windows-x64
+          path: build/NovaCut-Windows
+          if-no-files-found: error
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: novacut-windows-installer-x64
+          path: build/installer/NovaCut-Windows-Setup.exe
+          if-no-files-found: error
