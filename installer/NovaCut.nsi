@@ -62,6 +62,10 @@ SectionEnd
 Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
     DetailPrint "Instalando FFmpeg con WinGet..."
     nsExec::ExecToLog 'winget.exe install --id Gyan.FFmpeg --exact --accept-package-agreements --accept-source-agreements --silent --disable-interactivity'
+    Pop $0
+    ${If} $0 <> 0
+        MessageBox MB_ICONEXCLAMATION|MB_OK "WinGet no pudo instalar FFmpeg. Descargalo de https://www.gyan.dev/ffmpeg/builds/ y copia ffmpeg.exe junto a NovaCut, o instalalo desde la Microsoft Store (App Installer)."
+    ${EndIf}
 SectionEnd
 
 Section "Uninstall"

@@ -2096,7 +2096,13 @@ impl NovaCutWindows {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(18, 20, 24);
         visuals.window_fill = egui::Color32::from_rgb(24, 27, 33);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(111, 74, 203);
+        // Acento cian, como el tint(.cyan) de la aplicacion macOS.
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 190, 212);
+        visuals.selection.stroke =
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 235, 255));
+        visuals.hyperlink_color = egui::Color32::from_rgb(0, 190, 212);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 150, 170);
+        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0, 150, 170);
         context.egui_ctx.set_visuals(visuals);
         let mut app = Self {
             project: RoughProject::default(),
@@ -3204,9 +3210,16 @@ impl NovaCutWindows {
         if self.setup_result.is_some() {
             return;
         }
+        if !winget_available() {
+            self.status =
+                "WinGet no esta disponible en este equipo. Instala 'App Installer' desde la Microsoft Store o descarga FFmpeg manualmente."
+                    .to_owned();
+            return;
+        }
         let (sender, receiver) = mpsc::channel();
         self.setup_result = Some(receiver);
-        self.status = "Instalando el motor multimedia con WinGet...".to_owned();
+        self.status =
+            "Descargando FFmpeg (~100 MB). Esto puede tardar varios minutos...".to_owned();
         std::thread::spawn(move || {
             let result = Command::new("winget.exe")
                 .args([
@@ -3221,7 +3234,7 @@ impl NovaCutWindows {
                 ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
-                .map_err(|error| format!("WinGet no esta disponible: {error}"))
+                .map_err(|error| format!("WinGet no se pudo ejecutar: {error}"))
                 .and_then(|output| {
                     if output.status.success() {
                         Ok(())
@@ -3233,6 +3246,16 @@ impl NovaCutWindows {
                 });
             let _ = sender.send(result);
         });
+    }
+
+    fn open_ffmpeg_download(&mut self, context: &egui::Context) {
+        context.open_url(egui::OpenUrl {
+            url: "https://www.gyan.dev/ffmpeg/builds/".to_owned(),
+            new_tab: true,
+        });
+        self.status =
+            "Descarga el build 'release essentials' y copia ffmpeg.exe, ffprobe.exe y ffplay.exe junto a novacut-windows.exe"
+                .to_owned();
     }
 
     fn preview_selected(&mut self) {
@@ -4453,7 +4476,12 @@ impl eframe::App for NovaCutWindows {
         egui::TopBottomPanel::top("header").show(context, |ui| {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                ui.heading("NOVACUT");
+                ui.label(
+                    egui::RichText::new("EDITORCITO")
+                        .strong()
+                        .size(17.0)
+                        .color(egui::Color32::from_rgb(0, 190, 212)),
+                );
                 ui.separator();
                 let before_name = self.project.clone();
                 if ui.text_edit_singleline(&mut self.project.name).changed() {
@@ -4594,11 +4622,22 @@ impl eframe::App for NovaCutWindows {
                     ui.add_space(20.0);
                     if self.setup_result.is_some() {
                         ui.spinner();
-                        ui.label("Instalando motor multimedia...");
-                    } else if ui.button("Instalar FFmpeg automaticamente").clicked() {
-                        self.install_ffmpeg();
+                        ui.label(
+                            "Descargando e instalando FFmpeg (~100 MB)...\nEsto puede tardar varios minutos.",
+                        );
+                    } else {
+                        if ui.button("Instalar FFmpeg automaticamente").clicked() {
+                            self.install_ffmpeg();
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("Descargar FFmpeg manualmente").clicked() {
+                            self.open_ffmpeg_download(context);
+                        }
                     }
                     ui.add_space(12.0);
+                    ui.label(
+                        "Otra opcion: copia ffmpeg.exe, ffprobe.exe y ffplay.exe junto a\nnovacut-windows.exe y pulsa Volver a comprobar.",
+                    );
                     if ui.button("Volver a comprobar").clicked() {
                         self.ffmpeg_ready = multimedia_tools_available();
                         self.status = if self.ffmpeg_ready {
@@ -4626,11 +4665,104 @@ impl eframe::App for NovaCutWindows {
         let mut proxy_requested = false;
         let mut nest_requested = false;
         let mut unnest_requested = false;
+        // Panel de medios a la izquierda, como el "MEDIOS" de la app macOS:
+        // lista de clips del proyecto; un clic selecciona y centra el cabezal.
+        egui::SidePanel::left("medios")
+            .default_width(250.0)
+            .min_width(170.0)
+            .show(context, |ui| {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!("MEDIOS  {}", self.project.clips.len()))
+                        .strong()
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(170)),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for index in 0..self.project.clips.len() {
+                        let clip = self.project.clips[index].clone();
+                        let selected = self.selected == Some(index);
+                        let (r, g, b) = match label_color(clip.label) {
+                            Some(color) => (color.r(), color.g(), color.b()),
+                            None => (0, 0, 0),
+                        };
+                        let full_name = clip.name();
+                        let name = if full_name.chars().count() > 24 {
+                            let mut trimmed: String = full_name.chars().take(24).collect();
+                            trimmed.push('…');
+                            trimmed
+                        } else {
+                            full_name
+                        };
+                        let duration = format!("{:.1} s", clip.duration());
+                        let response = ui
+                            .horizontal(|ui| {
+                                ui.add_space(6.0);
+                                if r > 0 || g > 0 || b > 0 {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(6.0, 6.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        3.0,
+                                        egui::Color32::from_rgb(r, g, b),
+                                    );
+                                } else {
+                                    ui.add_space(6.0);
+                                }
+                                ui.label(egui::RichText::new(&name).size(12.0).color(
+                                    if selected {
+                                        egui::Color32::from_rgb(0, 190, 212)
+                                    } else {
+                                        egui::Color32::from_gray(215)
+                                    },
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(duration)
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(130)),
+                                        );
+                                    },
+                                );
+                            })
+                            .response
+                            .on_hover_text(clip.path.display().to_string());
+                        let row = response.clone();
+                        if row.clicked() {
+                            self.selected = Some(index);
+                            self.playhead = clip.timeline_start.max(0.0);
+                            self.preview_texture = None;
+                            self.request_preview();
+                        }
+                        if selected {
+                            ui.painter().rect_filled(
+                                response.rect,
+                                4.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 190, 212, 22),
+                            );
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+            });
         egui::SidePanel::right("inspector")
             .default_width(280.0)
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Inspector");
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("INSPECTOR")
+                            .strong()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(170)),
+                    );
+                    ui.add_space(4.0);
                     ui.separator();
                     if let Some(clip) = self
                         .selected
@@ -6347,6 +6479,11 @@ impl eframe::App for NovaCutWindows {
                             format!("{offline} medio(s) OFFLINE"),
                         );
                     }
+                    ui.label(
+                        egui::RichText::new("FFmpeg · Windows x64")
+                            .size(9.0)
+                            .color(egui::Color32::from_gray(130)),
+                    );
                     let total = self.project.duration();
                     ui.label(format!(
                         "{} clips | {:.1} s",
@@ -7291,7 +7428,8 @@ fn tool_path(name: &str) -> PathBuf {
         return path;
     }
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let winget_link = PathBuf::from(local_app_data)
+        let local = PathBuf::from(local_app_data);
+        let winget_link = local
             .join("Microsoft")
             .join("WinGet")
             .join("Links")
@@ -7299,8 +7437,39 @@ fn tool_path(name: &str) -> PathBuf {
         if winget_link.exists() {
             return winget_link;
         }
+        // Algunas versiones de WinGet no crean el enlace en Links y dejan el
+        // binario dentro de Packages\Gyan.FFmpeg_*\ffmpeg-*\bin\*.
+        let packages = local.join("Microsoft").join("WinGet").join("Packages");
+        if packages.is_dir() {
+            if let Some(found) = find_in_winget_packages(&packages, name) {
+                return found;
+            }
+        }
     }
     PathBuf::from(name)
+}
+
+/// Búsqueda acotada (máximo 4 niveles) de un ejecutable dentro del árbol de
+/// paquetes de WinGet.
+fn find_in_winget_packages(root: &Path, name: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+        if depth > 4 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, name, depth + 1) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    walk(root, name, 0)
 }
 
 fn recovery_path() -> Option<PathBuf> {
@@ -7429,6 +7598,17 @@ fn save_recovery(project: &RoughProject) {
 fn load_recovery() -> Option<RoughProject> {
     let json = std::fs::read_to_string(recovery_path()?).ok()?;
     serde_json::from_str(&json).ok()
+}
+
+/// ¿Está disponible el instalador `winget` (App Installer)?
+fn winget_available() -> bool {
+    Command::new("winget.exe")
+        .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn multimedia_tools_available() -> bool {
