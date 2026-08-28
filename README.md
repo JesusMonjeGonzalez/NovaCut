@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Editorcito.svg" width="104" alt="NovaCut application icon">
+  <img src="assets/icon.png" width="128" alt="NovaCut application icon">
 </p>
 
 <h1 align="center">NovaCut</h1>
