@@ -7,3 +7,6 @@
 
 # Local screen recordings are not publishable test fixtures.
 /tests/corpus/*.mov
+
+# Python caches del generador de iconos
+__pycache__/
