@@ -5,6 +5,9 @@ Este es el primer host Windows de NovaCut. Permite:
 - importar varios videos;
 - ordenar y eliminar planos;
 - ajustar puntos de entrada y salida;
+- elegir la base de tiempo del montaje, incluyendo 23.976, 29.97 DF y 59.94 DF;
+- detectar cadencia variable mediante una ventana de PTS y cuantizar el vídeo a la
+  base racional del montaje antes de previsualizar o exportar;
 - mover el cabezal en una timeline visual y partir clips con `Ctrl+K`;
 - ver el fotograma del cabezal en el monitor integrado;
 - previsualizar cada recorte;
@@ -66,6 +69,8 @@ Este es el primer host Windows de NovaCut. Permite:
   flechas mueven el cabezal, `Ctrl+S` guarda, `Espacio` reproduce el recorte;
 - detectar medios ausentes y revincularlos desde el inspector (barra inferior
   muestra "N medio(s) OFFLINE");
+- guardar medios, proxies y LUTs internos con rutas relativas para poder mover la
+  carpeta del proyecto sin romper sus enlaces;
 - ver miniaturas automaticas de cada clip de video en la timeline;
 - clasificar clips con etiquetas de color (se guardan en el proyecto);
 - exportar en 1080p, 4K o vertical 1080x1920 con barra de progreso y tiempo
@@ -82,7 +87,7 @@ Este es el primer host Windows de NovaCut. Permite:
 - deshacer y rehacer con `Ctrl+Z` y `Ctrl+Y` (escribir texto o arrastrar un
   control agrupa el gesto completo en un solo paso, no uno por tecla);
 - confirmar antes de perder cambios sin guardar al pulsar "Nuevo" o "Abrir";
-- recuperar automaticamente la ultima sesion;
+- decidir si se recupera o se descarta la ultima sesion encontrada;
 - exportar el montaje multipista a H.264 1080p con audio AAC.
 - cancelar una exportacion sin destruir el archivo de destino anterior.
 

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use editorcito::Timebase;
 use eframe::egui;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,27 @@ use std::sync::Arc;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Resumen pequeño del reloj de presentación que viaja con el clip. No se
+/// persisten todos los PTS, solo la evidencia suficiente para diagnosticar la
+/// fuente y decidir si el filtro CFR debe tratarla como VFR.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SourcePtsSummary {
+    frame_count: u64,
+    first_seconds: f64,
+    last_seconds: f64,
+    median_frame_duration_seconds: f64,
+    max_frame_duration_seconds: f64,
+    variable_delta_count: u64,
+    gap_count: u64,
+}
+
+impl SourcePtsSummary {
+    fn is_variable(&self) -> bool {
+        let deltas = self.frame_count.saturating_sub(1).max(1) as f64;
+        self.gap_count as f64 / deltas > 0.02 || self.variable_delta_count as f64 / deltas > 0.05
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RoughClip {
     path: PathBuf,
@@ -22,6 +44,16 @@ struct RoughClip {
     /// fabricar tiempo inexistente al extender un clip recortado.
     #[serde(default)]
     source_duration_seconds: Option<f64>,
+    /// Cadencia declarada por el medio. El montaje puede conformarla a su
+    /// propio timebase, pero no debe perder este dato al guardar.
+    #[serde(default)]
+    source_timebase: Option<Timebase>,
+    /// El scan de PTS encontro saltos por encima de la cadencia esperada.
+    #[serde(default)]
+    source_vfr: bool,
+    /// Evidencia persistida del scan de PTS para diagnóstico y conformado.
+    #[serde(default)]
+    source_pts: Option<SourcePtsSummary>,
     #[serde(default = "enabled_by_default")]
     has_video: bool,
     has_audio: bool,
@@ -665,8 +697,6 @@ const THUMB_HEIGHT: usize = 90;
 
 const MONITOR_WIDTH: usize = 640;
 const MONITOR_HEIGHT: usize = 360;
-const MONITOR_FPS: f64 = 30.0;
-
 /// Duración por defecto de una imagen fija al importarla.
 const DEFAULT_IMAGE_DURATION: f64 = 5.0;
 
@@ -689,6 +719,7 @@ struct Playback {
     rx: Receiver<Option<PreviewFrame>>,
     start_playhead: f64,
     last_consumed: u64,
+    timebase: Timebase,
     /// RMS de audio por canal, actualizado por el hilo lector.
     meter: Arc<std::sync::Mutex<(f32, f32)>>,
     /// Mantiene vivo el dispositivo de audio mientras se reproduce.
@@ -1471,6 +1502,9 @@ impl Default for RoughClip {
             in_seconds: 0.0,
             out_seconds: 1.0,
             source_duration_seconds: None,
+            source_timebase: None,
+            source_vfr: false,
+            source_pts: None,
             has_video: true,
             has_audio: true,
             speed: 1.0,
@@ -1962,6 +1996,10 @@ struct RoughProject {
     /// Fotogramas por segundo del montaje; base del timecode y del paso a paso.
     #[serde(default = "default_fps")]
     fps: f64,
+    /// Fuente canonica de la cadencia. `fps` se conserva para proyectos viejos
+    /// y para consumidores que aun no conocen este campo.
+    #[serde(default)]
+    timebase: Option<Timebase>,
     /// Número mínimo de pistas de vídeo, para poder crear pistas vacías y
     /// soltar material en ellas antes de que contengan nada.
     #[serde(default)]
@@ -1982,6 +2020,12 @@ impl RoughProject {
             }
             self.version = 2;
         }
+        let timebase = self
+            .timebase
+            .and_then(|rate| Timebase::new(rate.numerator, rate.denominator, rate.drop_frame).ok())
+            .unwrap_or_else(|| Timebase::from_fps(self.fps));
+        self.timebase = Some(timebase);
+        self.fps = timebase.fps();
         let inferred_source_durations: HashMap<PathBuf, f64> = self
             .clips
             .iter()
@@ -2020,6 +2064,16 @@ impl RoughProject {
             .iter()
             .map(|clip| clip.timeline_start + clip.duration())
             .fold(0.0, f64::max)
+    }
+
+    fn timebase(&self) -> Timebase {
+        self.timebase
+            .unwrap_or_else(|| Timebase::from_fps(self.fps))
+    }
+
+    fn set_timebase(&mut self, timebase: Timebase) {
+        self.timebase = Some(timebase);
+        self.fps = timebase.fps();
     }
 
     fn video_track_count(&self) -> usize {
@@ -2135,6 +2189,8 @@ struct MacTimeline {
 struct MacTimebase {
     numerador: i32,
     denominador: i32,
+    #[serde(default, rename = "dropFrame")]
+    drop_frame: bool,
 }
 
 #[derive(Deserialize)]
@@ -2307,6 +2363,7 @@ impl Default for RoughProject {
             video_locked: Vec::new(),
             audio_locked: Vec::new(),
             fps: default_fps(),
+            timebase: Some(Timebase::default()),
             min_video_tracks: 0,
             min_audio_tracks: 0,
         }
@@ -2374,6 +2431,8 @@ struct NovaCutWindows {
     show_waveform: bool,
     show_vectorscope: bool,
     pending_document_action: Option<DocumentAction>,
+    /// Recuperacion pendiente: se ofrece, nunca se carga silenciosamente.
+    pending_recovery: Option<RoughProject>,
     document_generation: u64,
     /// Edición en vivo (texto/arrastre) aún sin comprometer a undo/disco:
     /// (estado previo al gesto, instante del último cambio).
@@ -2522,7 +2581,16 @@ struct ImportTarget {
     is_video: bool,
 }
 
-type MediaProbeResult = (PathBuf, Result<(f64, bool, bool), String>);
+struct MediaProbe {
+    duration: f64,
+    has_video: bool,
+    has_audio: bool,
+    frame_rate: Option<Timebase>,
+    variable_frame_rate: bool,
+    source_pts: Option<SourcePtsSummary>,
+}
+
+type MediaProbeResult = (PathBuf, Result<MediaProbe, String>);
 type ImportJobResult = (u64, Option<ImportTarget>, Vec<MediaProbeResult>);
 
 /// Tamaño del fotograma del monitor de fuente.
@@ -2589,13 +2657,18 @@ fn recents_path() -> Option<PathBuf> {
 }
 
 /// Analiza `HH:MM:SS:FF`, `HH:MM:SS`, `MM:SS` o segundos decimales.
-fn parse_timecode(text: &str, fps: f64) -> Option<f64> {
+fn parse_timecode(text: &str, timebase: Timebase) -> Option<f64> {
     let text = text.trim().replace(',', ".");
     if text.is_empty() {
         return None;
     }
     if let Ok(seconds) = text.parse::<f64>() {
         return Some(seconds.max(0.0));
+    }
+    if text.split([':', ';']).count() == 4 {
+        return timebase
+            .frames_from_timecode(&text)
+            .map(|frames| timebase.seconds(frames));
     }
     let parts: Vec<f64> = text
         .split([':', ';'])
@@ -2604,9 +2677,7 @@ fn parse_timecode(text: &str, fps: f64) -> Option<f64> {
     if parts.iter().any(|part| *part < 0.0) {
         return None;
     }
-    let fps = fps.max(1.0);
     match parts.len() {
-        4 => Some(parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / fps),
         3 => Some(parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]),
         2 => Some(parts[0] * 60.0 + parts[1]),
         _ => None,
@@ -2674,6 +2745,8 @@ impl NovaCutWindows {
         self.dirty = false;
         self.clean_project_json = serde_json::to_string(&self.project).ok();
         self.pending_edit = None;
+        self.pending_recovery = None;
+        clear_recovery();
         self.work_in = None;
         self.work_out = None;
         self.export_range_only = false;
@@ -2935,6 +3008,61 @@ impl NovaCutWindows {
         }
     }
 
+    fn show_recovery_dialog(&mut self, context: &egui::Context) {
+        let Some(project) = self.pending_recovery.as_ref() else {
+            return;
+        };
+        let project_name = project.name.clone();
+        let mut recover = false;
+        let mut discard = false;
+        egui::Window::new("Recuperacion disponible")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                ui.label(format!(
+                    "NovaCut encontro cambios no guardados de «{project_name}»."
+                ));
+                ui.label("La sesion no se carga hasta que lo confirmes.");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    recover = ui.button("Recuperar").clicked();
+                    discard = ui.button("Descartar").clicked();
+                });
+            });
+        if recover {
+            let Some(project) = self.pending_recovery.take() else {
+                return;
+            };
+            self.cancel_document_jobs();
+            self.project = project;
+            self.project.normalize();
+            self.project_path = None;
+            self.clear_selection();
+            self.playhead = 0.0;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.preview_texture = None;
+            self.preview_result = None;
+            self.preview_refresh_pending = false;
+            self.dirty = true;
+            self.clean_project_json = None;
+            self.pending_edit = None;
+            self.work_in = None;
+            self.work_out = None;
+            self.export_range_only = false;
+            self.document_generation = self.document_generation.wrapping_add(1);
+            self.status = "Sesion anterior recuperada".to_owned();
+            if self.ffmpeg_ready {
+                self.request_preview();
+            }
+        } else if discard {
+            self.pending_recovery = None;
+            clear_recovery();
+            self.status = "Recuperacion descartada".to_owned();
+        }
+    }
+
     /// Clips con medio ausente en disco (los títulos nunca cuentan).
     fn missing_media_indices(&self) -> Vec<usize> {
         self.project
@@ -2969,9 +3097,44 @@ impl NovaCutWindows {
             return;
         };
         let before = self.project.clone();
-        self.project.clips[index].path = new_path.clone();
+        let metadata = if is_image_file(&new_path) {
+            Some(MediaProbe {
+                duration: DEFAULT_IMAGE_DURATION,
+                has_video: true,
+                has_audio: false,
+                frame_rate: None,
+                variable_frame_rate: false,
+                source_pts: None,
+            })
+        } else {
+            probe_media(&new_path).ok()
+        };
+        let metadata_ok = metadata.is_some();
+        let clip = &mut self.project.clips[index];
+        clip.path = new_path.clone();
+        if let Some(metadata) = metadata {
+            clip.source_duration_seconds = Some(metadata.duration);
+            clip.source_timebase = metadata.frame_rate;
+            clip.source_vfr = metadata.variable_frame_rate;
+            clip.source_pts = metadata.source_pts;
+        } else {
+            // No conservar la duración de una fuente distinta si el nuevo medio
+            // no se puede inspeccionar todavía.
+            clip.source_duration_seconds = None;
+            clip.source_timebase = None;
+            clip.source_vfr = false;
+            clip.source_pts = None;
+        }
+        self.project.normalize();
         self.finish_edit(before);
-        self.status = format!("Medio revinculado: {}", new_path.display());
+        self.status = if metadata_ok {
+            format!("Medio revinculado y analizado: {}", new_path.display())
+        } else {
+            format!(
+                "Medio revinculado; no se pudo analizar: {}",
+                new_path.display()
+            )
+        };
     }
 
     fn new(_context: &eframe::CreationContext<'_>) -> Self {
@@ -3020,6 +3183,7 @@ impl NovaCutWindows {
             show_waveform: false,
             show_vectorscope: false,
             pending_document_action: None,
+            pending_recovery: None,
             document_generation: 0,
             pending_edit: None,
             render_progress: Arc::new(std::sync::Mutex::new(RenderProgress::default())),
@@ -3073,10 +3237,8 @@ impl NovaCutWindows {
             }
         } else if let Some(mut project) = load_recovery() {
             project.normalize();
-            app.project = project;
-            app.dirty = true;
-            app.clean_project_json = None;
-            app.status = "Sesion anterior recuperada automaticamente".to_owned();
+            app.pending_recovery = Some(project);
+            app.status = "Hay una recuperacion pendiente de confirmacion".to_owned();
         } else if !app.ffmpeg_ready {
             app.status = "Falta el motor multimedia. Pulsa Instalar FFmpeg.".to_owned();
         }
@@ -3383,7 +3545,7 @@ impl NovaCutWindows {
                 });
             });
         if confirm {
-            match parse_timecode(&self.goto_text, self.project.fps) {
+            match parse_timecode(&self.goto_text, self.project.timebase()) {
                 Some(time) => {
                     self.stop_playback();
                     self.seek(time.min(self.timeline_extent()));
@@ -3549,6 +3711,7 @@ impl NovaCutWindows {
         let prepared = prepare_render_clips(&self.effective_clips());
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
+        let timebase = self.project.timebase();
         let generation = self.document_generation;
         let (sender, receiver) = mpsc::channel();
         self.loudness_result = Some(receiver);
@@ -3556,7 +3719,8 @@ impl NovaCutWindows {
         std::thread::spawn(move || {
             let mut command = Command::new(tool_path("ffmpeg.exe"));
             command.args(["-v", "info"]);
-            let (indices, titles) = push_render_inputs(&mut command, &prepared, (640, 360), false);
+            let (indices, titles) =
+                push_render_inputs(&mut command, &prepared, (640, 360), false, timebase);
             let result = build_render_filters(
                 &prepared,
                 &indices,
@@ -3567,6 +3731,7 @@ impl NovaCutWindows {
                 &track_gains,
                 master_gain_db,
                 false,
+                timebase,
                 None,
             )
             .and_then(|mut filters| {
@@ -4004,6 +4169,7 @@ impl NovaCutWindows {
             });
         match result {
             Ok(mut project) if !project.clips.is_empty() => {
+                resolve_project_paths(&mut project, path.parent());
                 project.normalize();
                 let first = project
                     .clips
@@ -4065,6 +4231,7 @@ impl NovaCutWindows {
         let prepared = prepare_render_clips(&self.project.clips);
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
+        let timebase = self.project.timebase();
         let generation = self.document_generation;
         let (sender, receiver) = mpsc::channel();
         self.transcription_result = Some(receiver);
@@ -4078,7 +4245,8 @@ impl NovaCutWindows {
             let _ = std::fs::remove_file(&srt);
             let mut ffmpeg = Command::new(tool_path("ffmpeg.exe"));
             ffmpeg.args(["-y", "-v", "error"]);
-            let (indices, titles) = push_render_inputs(&mut ffmpeg, &prepared, (640, 360), false);
+            let (indices, titles) =
+                push_render_inputs(&mut ffmpeg, &prepared, (640, 360), false, timebase);
             let result = build_render_filters(
                 &prepared,
                 &indices,
@@ -4089,6 +4257,7 @@ impl NovaCutWindows {
                 &track_gains,
                 master_gain_db,
                 false,
+                timebase,
                 None,
             )
             .and_then(|filters| {
@@ -4184,7 +4353,14 @@ impl NovaCutWindows {
                 .into_iter()
                 .map(|path| {
                     let info = if is_image_file(&path) {
-                        Ok((DEFAULT_IMAGE_DURATION, true, false))
+                        Ok(MediaProbe {
+                            duration: DEFAULT_IMAGE_DURATION,
+                            has_video: true,
+                            has_audio: false,
+                            frame_rate: None,
+                            variable_frame_rate: false,
+                            source_pts: None,
+                        })
                     } else {
                         probe_media(&path)
                     };
@@ -4210,20 +4386,25 @@ impl NovaCutWindows {
         let before = self.project.clone();
         let mut append_at = self.project.duration();
         let mut imported = 0;
+        let mut variable_frame_rate = 0;
         let mut errors: Vec<String> = Vec::new();
         let mut clips_to_add = Vec::new();
         for (path, result) in results {
             match result {
-                Ok((duration, has_video, has_audio))
-                    if duration > 0.0 && (has_video || has_audio) =>
-                {
+                Ok(probe) if probe.duration > 0.0 && (probe.has_video || probe.has_audio) => {
+                    if probe.variable_frame_rate {
+                        variable_frame_rate += 1;
+                    }
                     let mut clip = RoughClip {
                         path,
                         in_seconds: 0.0,
-                        out_seconds: duration,
-                        source_duration_seconds: Some(duration),
-                        has_video,
-                        has_audio,
+                        out_seconds: probe.duration,
+                        source_duration_seconds: Some(probe.duration),
+                        source_timebase: probe.frame_rate,
+                        source_vfr: probe.variable_frame_rate,
+                        source_pts: probe.source_pts,
+                        has_video: probe.has_video,
+                        has_audio: probe.has_audio,
                         speed: 1.0,
                         timeline_start: 0.0,
                         track: 0,
@@ -4268,7 +4449,7 @@ impl NovaCutWindows {
                     } else {
                         clip.timeline_start = append_at;
                     }
-                    append_at += duration;
+                    append_at += probe.duration;
                     clips_to_add.push(clip);
                     imported += 1;
                 }
@@ -4279,7 +4460,13 @@ impl NovaCutWindows {
         if imported > 0 {
             self.project.clips.extend(clips_to_add);
             self.select_only(self.project.clips.len() - 1);
-            self.status = format!("{imported} medio(s) importado(s)");
+            self.status = if variable_frame_rate > 0 {
+                format!(
+                    "{imported} medio(s) importado(s) · {variable_frame_rate} con VFR detectado"
+                )
+            } else {
+                format!("{imported} medio(s) importado(s)")
+            };
             self.finish_edit(before);
         } else {
             self.status = if errors.is_empty() {
@@ -4307,16 +4494,19 @@ impl NovaCutWindows {
             self.project_path.clone().expect("checked above")
         };
 
-        match serde_json::to_string_pretty(&self.project)
+        let stored_project = project_for_storage(&self.project, &path);
+        match serde_json::to_string_pretty(&stored_project)
             .map_err(|error| error.to_string())
-            .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+            .and_then(|json| write_text_atomically(&path, &json))
         {
             Ok(()) => {
-                save_backup(&path, &self.project);
+                save_backup(&path, &stored_project);
                 self.project_path = Some(path.clone());
                 self.dirty = false;
                 self.clean_project_json = serde_json::to_string(&self.project).ok();
                 self.push_recent(&path);
+                self.pending_recovery = None;
+                clear_recovery();
                 self.status = "Proyecto guardado".to_owned();
             }
             Err(error) => self.status = format!("No se pudo guardar: {error}"),
@@ -4350,6 +4540,7 @@ impl NovaCutWindows {
             });
         match result {
             Ok(mut project) if project.version == 1 || project.version == 2 => {
+                resolve_project_paths(&mut project, path.parent());
                 project.normalize();
                 self.cancel_document_jobs();
                 self.project = project;
@@ -4365,7 +4556,8 @@ impl NovaCutWindows {
                 self.clean_project_json = serde_json::to_string(&self.project).ok();
                 self.pending_edit = None;
                 self.document_generation = self.document_generation.wrapping_add(1);
-                save_recovery(&self.project);
+                self.pending_recovery = None;
+                clear_recovery();
                 self.push_recent(&path);
                 self.status = "Proyecto abierto".to_owned();
             }
@@ -4389,12 +4581,27 @@ impl NovaCutWindows {
         };
         let fps = f64::from(mac.montaje.timebase.numerador)
             / f64::from(mac.montaje.timebase.denominador.max(1));
+        let timebase = Timebase::new(
+            mac.montaje.timebase.numerador.max(1) as u32,
+            mac.montaje.timebase.denominador.max(1) as u32,
+            mac.montaje.timebase.drop_frame,
+        )
+        .unwrap_or_else(|_| Timebase::from_fps(fps));
         let project_directory = path.parent();
         let media: HashMap<String, PathBuf> = mac
             .medios
             .iter()
-            .filter_map(|item| {
-                resolve_mac_media(item, project_directory).map(|path| (item.id.clone(), path))
+            .map(|item| {
+                let path = resolve_mac_media(item, project_directory).unwrap_or_else(|| {
+                    project_directory
+                        .and_then(|directory| {
+                            item.ruta_relativa
+                                .as_deref()
+                                .map(|relative| directory.join(relative))
+                        })
+                        .unwrap_or_else(|| PathBuf::from(&item.ruta))
+                });
+                (item.id.clone(), path)
             })
             .collect();
         let video_tracks: Vec<&MacTrack> = mac
@@ -4442,25 +4649,42 @@ impl NovaCutWindows {
                     None
                 };
                 let speed = clip.velocidad.abs().clamp(0.1, 8.0);
-                let (media_path, source_in, has_audio, source_duration_seconds) = if clip.es_titulo
-                {
-                    (PathBuf::new(), 0.0, false, None)
+                let (
+                    media_path,
+                    source_in,
+                    has_audio,
+                    source_duration_seconds,
+                    source_timebase,
+                    source_vfr,
+                    source_pts,
+                ) = if clip.es_titulo {
+                    (PathBuf::new(), 0.0, false, None, None, false, None)
                 } else {
                     let Some(media_path) = media.get(&clip.media_id) else {
                         offline += 1;
                         continue;
                     };
+                    if !media_path.exists() {
+                        offline += 1;
+                    }
                     let media_info = probe_media(media_path).ok();
                     let has_audio = media_info
                         .as_ref()
-                        .map(|(_, _, audio)| *audio)
+                        .map(|info| info.has_audio)
                         .unwrap_or(true);
-                    let source_duration = media_info.map(|(duration, _, _)| duration);
+                    let source_duration = media_info.as_ref().map(|info| info.duration);
+                    let source_timebase = media_info.as_ref().and_then(|info| info.frame_rate);
+                    let source_vfr = media_info
+                        .as_ref()
+                        .is_some_and(|info| info.variable_frame_rate);
                     (
                         media_path.clone(),
                         clip.source_in as f64 / fps,
                         has_audio,
                         source_duration,
+                        source_timebase,
+                        source_vfr,
+                        media_info.as_ref().and_then(|info| info.source_pts.clone()),
                     )
                 };
                 clips.push(RoughClip {
@@ -4468,6 +4692,9 @@ impl NovaCutWindows {
                     in_seconds: source_in,
                     out_seconds: source_in + clip.duracion as f64 / fps * speed,
                     source_duration_seconds,
+                    source_timebase,
+                    source_vfr,
+                    source_pts,
                     has_video: true,
                     has_audio,
                     speed: if clip.es_titulo { 1.0 } else { speed },
@@ -4552,7 +4779,8 @@ impl NovaCutWindows {
                 .nombre
                 .unwrap_or_else(|| "Proyecto importado de Mac".to_owned()),
             clips,
-            fps: if fps >= 1.0 { fps } else { default_fps() },
+            fps: timebase.fps(),
+            timebase: Some(timebase),
             ..RoughProject::default()
         };
         self.project_path = None;
@@ -4567,7 +4795,8 @@ impl NovaCutWindows {
         self.preview_texture = None;
         self.preview_result = None;
         self.preview_refresh_pending = false;
-        save_recovery(&self.project);
+        self.pending_recovery = None;
+        clear_recovery();
         self.status = format!(
             "Proyecto Mac importado: {} pista(s), {offline} medio(s) offline, {unsupported} clip(s) especiales pendientes",
             video_tracks.len()
@@ -4670,6 +4899,7 @@ impl NovaCutWindows {
             self.preview_refresh_pending = true;
             return;
         }
+        let timebase = self.project.timebase();
         let resolved = prepare_render_clips(&self.effective_clips());
         let mut active: Vec<(usize, RoughClip, f64)> = resolved
             .iter()
@@ -4749,7 +4979,7 @@ impl NovaCutWindows {
         self.preview_result = Some(receiver);
         self.preview_refresh_pending = false;
         std::thread::spawn(move || {
-            let result = render_preview_frame(&sources);
+            let result = render_preview_frame(&sources, timebase);
             let _ = sender.send(result);
         });
     }
@@ -4926,6 +5156,7 @@ impl NovaCutWindows {
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
         let normalize_loudness = self.project.normalize_loudness;
+        let timebase = self.project.timebase();
         let measured_loudness = self.current_loudness_measurement().cloned();
         let (sender, receiver) = mpsc::channel();
         self.export_result = Some(receiver);
@@ -4947,6 +5178,7 @@ impl NovaCutWindows {
                 &track_gains,
                 master_gain_db,
                 normalize_loudness,
+                timebase,
                 measured_loudness.as_ref(),
                 &progress,
             )
@@ -5208,8 +5440,9 @@ impl NovaCutWindows {
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error", "-y"]);
         let size = self.export_size;
+        let timebase = self.project.timebase();
         let (input_indices, is_title_input) =
-            push_render_inputs(&mut command, &prepared, size, self.use_proxies);
+            push_render_inputs(&mut command, &prepared, size, self.use_proxies, timebase);
         let Ok(filters) = build_render_filters(
             &prepared,
             &input_indices,
@@ -5220,6 +5453,7 @@ impl NovaCutWindows {
             &self.project.track_gains,
             self.project.master_gain_db,
             self.project.normalize_loudness,
+            timebase,
             None,
         ) else {
             self.status = "No se pudo componer el fotograma".to_owned();
@@ -6472,7 +6706,7 @@ impl NovaCutWindows {
 
     /// Duración de un fotograma del montaje.
     fn frame_duration(&self) -> f64 {
-        1.0 / self.project.fps.max(1.0)
+        self.project.timebase().frame_duration()
     }
 
     fn quantize_time(&self, time: f64) -> f64 {
@@ -7417,6 +7651,8 @@ impl NovaCutWindows {
                 }
             }
         }
+        let timebase = self.project.timebase();
+        let start_playhead = timebase.seconds(timebase.frames(self.playhead));
         let prepared = prepare_render_clips(&self.effective_clips());
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error"]);
@@ -7425,6 +7661,7 @@ impl NovaCutWindows {
             &prepared,
             (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32),
             self.use_proxies,
+            timebase,
         );
         let Ok(mut filters) = build_render_filters(
             &prepared,
@@ -7436,6 +7673,7 @@ impl NovaCutWindows {
             &self.project.track_gains,
             self.project.master_gain_db,
             self.project.normalize_loudness,
+            timebase,
             None,
         ) else {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
@@ -7456,8 +7694,7 @@ impl NovaCutWindows {
             return;
         };
         let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
-        let start_playhead = self.playhead;
-        let skip_frames = (start_playhead * MONITOR_FPS).max(0.0) as u64;
+        let skip_frames = timebase.frames(start_playhead).max(0) as u64;
         let stdout = child.stdout.take();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -7491,7 +7728,7 @@ impl NovaCutWindows {
                 // Ritmo en tiempo real: el frame j se entrega en j/fps.
                 let due = started
                     + std::time::Duration::from_secs_f64(
-                        (index - skip_frames - 1) as f64 / MONITOR_FPS,
+                        timebase.seconds((index - skip_frames - 1) as i64),
                     );
                 let now = std::time::Instant::now();
                 if due > now {
@@ -7516,6 +7753,7 @@ impl NovaCutWindows {
             &prepared,
             (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32),
             self.use_proxies,
+            timebase,
         );
         let Ok(audio_filters) = build_render_filters(
             &prepared,
@@ -7527,6 +7765,7 @@ impl NovaCutWindows {
             &self.project.track_gains,
             self.project.master_gain_db,
             self.project.normalize_loudness,
+            timebase,
             self.current_loudness_measurement(),
         ) else {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
@@ -7603,6 +7842,7 @@ impl NovaCutWindows {
             rx: receiver,
             start_playhead,
             last_consumed: 0,
+            timebase,
             meter,
             _stream: stream,
             sink,
@@ -7621,15 +7861,15 @@ impl NovaCutWindows {
             return;
         };
         let audio_time = playback.sink.get_pos().as_secs_f64();
-        let expected = (audio_time * MONITOR_FPS) as u64;
+        let expected = playback.timebase.frames(audio_time).max(0) as u64;
         let mut reached_end = false;
         while playback.last_consumed < expected {
             match playback.rx.try_recv() {
                 Ok(Some(frame)) => {
                     playback.last_consumed += 1;
                     self.playhead = (playback.start_playhead
-                        + playback.last_consumed as f64 / MONITOR_FPS)
-                        .min(total);
+                        + playback.timebase.seconds(playback.last_consumed as i64))
+                    .min(total);
                     let image = egui::ColorImage::from_rgba_unmultiplied(
                         [frame.width, frame.height],
                         &frame.pixels,
@@ -7684,6 +7924,7 @@ impl NovaCutWindows {
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
         let normalize_loudness = self.project.normalize_loudness;
+        let timebase = self.project.timebase();
         let measured_loudness = self.current_loudness_measurement().cloned();
         let (sender, receiver) = mpsc::channel();
         self.montage_render = Some(receiver);
@@ -7705,6 +7946,7 @@ impl NovaCutWindows {
                 &track_gains,
                 master_gain_db,
                 normalize_loudness,
+                timebase,
                 measured_loudness.as_ref(),
                 &progress,
             )
@@ -8667,6 +8909,7 @@ impl eframe::App for NovaCutWindows {
                     }
                 });
             });
+        self.show_recovery_dialog(context);
         self.show_unsaved_dialog(context);
         self.show_goto_dialog(context);
         self.show_source_monitor(context);
@@ -10177,13 +10420,19 @@ impl eframe::App for NovaCutWindows {
                         egui::RichText::new(format!("{} fps ▾", self.project.fps.round()))
                             .size(10.0),
                         |ui| {
-                            for option in [23.976_f64, 24.0, 25.0, 30.0, 50.0, 60.0] {
-                                let label = if (option - 23.976).abs() < 0.01 {
-                                    "23.976 fps".to_owned()
-                                } else {
-                                    format!("{} fps", option)
-                                };
-                                let active = (self.project.fps - option).abs() < 0.01;
+                            for option in [
+                                ("23.976 fps", 23.976_f64),
+                                ("24 fps", 24.0),
+                                ("25 fps", 25.0),
+                                ("29.97 fps DF", 29.97),
+                                ("30 fps", 30.0),
+                                ("50 fps", 50.0),
+                                ("59.94 fps DF", 59.94),
+                                ("60 fps", 60.0),
+                            ] {
+                                let (label, requested_fps) = option;
+                                let rate = Timebase::from_fps(requested_fps);
+                                let active = self.project.timebase() == rate;
                                 if ui
                                     .add_enabled(
                                         !active,
@@ -10192,9 +10441,9 @@ impl eframe::App for NovaCutWindows {
                                     .clicked()
                                 {
                                     let before = self.project.clone();
-                                    self.project.fps = option;
+                                    self.project.set_timebase(rate);
                                     self.finish_edit(before);
-                                    self.status = format!("Proyecto cambiado a {option} fps");
+                                    self.status = format!("Proyecto cambiado a {label}");
                                     ui.close_menu();
                                 }
                             }
@@ -11625,57 +11874,232 @@ impl eframe::App for NovaCutWindows {
     }
 }
 
-fn probe_media(path: &Path) -> Result<(f64, bool, bool), String> {
-    let duration = Command::new(tool_path("ffprobe.exe"))
+#[derive(Deserialize)]
+struct ProbeDocument {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    format: Option<ProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    #[serde(default)]
+    codec_type: String,
+    #[serde(default)]
+    duration: Option<ProbeNumber>,
+    #[serde(default)]
+    avg_frame_rate: Option<String>,
+    #[serde(default)]
+    r_frame_rate: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+    #[serde(default)]
+    duration: Option<ProbeNumber>,
+}
+
+/// FFprobe serializa algunos números como texto y otros como JSON numbers.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProbeNumber {
+    Number(f64),
+    Text(String),
+}
+
+impl ProbeNumber {
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Number(value) => Some(*value),
+            Self::Text(value) => value.parse().ok(),
+        }
+        .filter(|value: &f64| value.is_finite())
+    }
+}
+
+fn parse_frame_rate(value: Option<&str>) -> Option<Timebase> {
+    let (numerator, denominator) = value?.split_once('/')?;
+    let numerator = numerator.parse::<u32>().ok()?;
+    let denominator = denominator.parse::<u32>().ok()?;
+    Timebase::new(numerator, denominator, false).ok()
+}
+
+/// Resume una secuencia de PTS para que el diagnóstico sobreviva al proyecto y
+/// pueda justificar por qué el render aplica conformado CFR.
+fn summarize_video_pts(pts: &[f64]) -> Option<SourcePtsSummary> {
+    let mut ordered: Vec<f64> = pts
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    ordered.sort_by(f64::total_cmp);
+    ordered.dedup_by(|left, right| (*left - *right).abs() < 1e-7);
+    if ordered.len() < 5 {
+        return None;
+    }
+    let deltas: Vec<f64> = ordered
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .filter(|delta| *delta > 0.0)
+        .collect();
+    if deltas.len() < 4 {
+        return None;
+    }
+    let mut sorted_deltas = deltas.clone();
+    sorted_deltas.sort_by(f64::total_cmp);
+    let median = sorted_deltas[sorted_deltas.len() / 2];
+    if median <= f64::EPSILON {
+        return None;
+    }
+    let gap_count = deltas.iter().filter(|delta| **delta > median * 1.5).count() as u64;
+    let variable_delta_count = deltas
+        .iter()
+        .filter(|delta| (**delta - median).abs() > median * 0.02)
+        .count() as u64;
+    Some(SourcePtsSummary {
+        frame_count: ordered.len() as u64,
+        first_seconds: ordered[0],
+        last_seconds: *ordered.last().unwrap_or(&ordered[0]),
+        median_frame_duration_seconds: median,
+        max_frame_duration_seconds: deltas.iter().copied().fold(0.0, f64::max),
+        variable_delta_count,
+        gap_count,
+    })
+}
+
+fn is_variable_frame_rate(pts: &[f64]) -> bool {
+    summarize_video_pts(pts).is_some_and(|summary| summary.is_variable())
+}
+
+/// Lee una ventana inicial del reloj de presentación. Un fallo del scan no
+/// invalida un medio que sí tiene metadatos válidos: en ese caso no se marca VFR.
+fn probe_video_pts(path: &Path) -> Vec<f64> {
+    let output = Command::new(tool_path("ffprobe.exe"))
         .args([
             "-v",
             "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            "%+10",
             "-show_entries",
-            "format=duration",
+            "frame=best_effort_timestamp_time",
             "-of",
-            "default=nw=1:nk=1",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut pts: Vec<f64> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .collect();
+    pts.sort_by(f64::total_cmp);
+    pts.dedup_by(|left, right| (*left - *right).abs() < 1e-7);
+    pts
+}
+
+fn probe_media(path: &Path) -> Result<MediaProbe, String> {
+    let output = Command::new(tool_path("ffprobe.exe"))
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
         ])
         .arg(path)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("FFprobe no esta disponible: {error}"))?;
-    if !duration.status.success() {
-        return Err(String::from_utf8_lossy(&duration.stderr).trim().to_owned());
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
-    let seconds = String::from_utf8_lossy(&duration.stdout)
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| "FFprobe no pudo leer la duracion".to_owned())?;
-    let has_stream = |selector: &str| -> Result<bool, String> {
-        let output = Command::new(tool_path("ffprobe.exe"))
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                selector,
-                "-show_entries",
-                "stream=index",
-                "-of",
-                "csv=p=0",
-            ])
-            .arg(path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|error| error.to_string())?;
-        Ok(output.status.success() && !output.stdout.is_empty())
-    };
-    Ok((seconds, has_stream("v:0")?, has_stream("a:0")?))
+    let document: ProbeDocument = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("FFprobe devolvio JSON invalido: {error}"))?;
+    let video = document
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video");
+    let audio = document
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type == "audio");
+    let duration = document
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_ref())
+        .and_then(ProbeNumber::as_f64)
+        .or_else(|| {
+            document
+                .streams
+                .iter()
+                .filter_map(|stream| stream.duration.as_ref().and_then(ProbeNumber::as_f64))
+                .max_by(f64::total_cmp)
+        })
+        .filter(|value| *value > 0.0)
+        .ok_or_else(|| "FFprobe no pudo leer la duracion".to_owned())?;
+    let frame_rate = video.and_then(|stream| {
+        parse_frame_rate(stream.avg_frame_rate.as_deref())
+            .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()))
+    });
+    let pts = video.map(|_| probe_video_pts(path)).unwrap_or_default();
+    let source_pts = summarize_video_pts(&pts);
+    let variable_frame_rate = is_variable_frame_rate(&pts);
+    Ok(MediaProbe {
+        duration,
+        has_video: video.is_some(),
+        has_audio: audio,
+        frame_rate,
+        variable_frame_rate,
+        source_pts,
+    })
 }
 
-fn render_preview_frame(sources: &[(RoughClip, f64)]) -> Result<PreviewFrame, String> {
+/// Conformado único de vídeo para todas las salidas Windows. Un medio marcado
+/// VFR fija también el origen del filtro en cero antes de cuantizar sus PTS a la
+/// cadencia racional del proyecto; el camino CFR usa la misma cuantización sin
+/// reinterpretar el reloj de origen.
+fn conform_video_filter(clip: &RoughClip, frame_rate: &str) -> String {
+    if clip.source_vfr
+        || clip
+            .source_pts
+            .as_ref()
+            .is_some_and(SourcePtsSummary::is_variable)
+    {
+        format!(",fps=fps={frame_rate}:start_time=0:round=near")
+    } else {
+        format!(",fps=fps={frame_rate}:round=near")
+    }
+}
+
+fn render_preview_frame(
+    sources: &[(RoughClip, f64)],
+    timebase: Timebase,
+) -> Result<PreviewFrame, String> {
     const WIDTH: usize = 640;
     const HEIGHT: usize = 360;
+    let frame_rate = timebase.ffmpeg_rate();
     let mut command = Command::new(tool_path("ffmpeg.exe"));
     command.args(["-v", "error"]);
     let mut is_title_input = Vec::with_capacity(sources.len());
     for (clip, source_time) in sources {
         if clip.title.is_some() || clip.is_adjustment {
-            command.args(["-f", "lavfi", "-i", "color=c=black@0.0:s=640x360:r=30"]);
+            command.args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=black@0.0:s=640x360:r={}", timebase.ffmpeg_rate()),
+            ]);
             is_title_input.push(true);
         } else {
             command
@@ -11684,7 +12108,10 @@ fn render_preview_frame(sources: &[(RoughClip, f64)]) -> Result<PreviewFrame, St
             is_title_input.push(false);
         }
     }
-    let mut filters = vec![format!("color=c=black:s={WIDTH}x{HEIGHT}:r=30:d=0.1[base]")];
+    let mut filters = vec![format!(
+        "color=c=black:s={WIDTH}x{HEIGHT}:r={}:d=0.1[base]",
+        timebase.ffmpeg_rate()
+    )];
     for (index, (clip, _)) in sources.iter().enumerate() {
         let angle = clip.rotation.to_radians();
         let opacity = (clip.opacity / 100.0).clamp(0.0, 1.0);
@@ -11728,6 +12155,7 @@ fn render_preview_frame(sources: &[(RoughClip, f64)]) -> Result<PreviewFrame, St
             let curves = curves_filter(clip.curves.as_ref());
             let lut = lut_filter(clip.lut.as_deref());
             let mask = mask_filter(clip.mask.as_ref(), width as f64, height as f64);
+            let cadence = conform_video_filter(clip, &frame_rate);
             let scale_mode = if is_blend { "increase" } else { "decrease" };
             let crop = if is_blend {
                 format!(",crop={WIDTH}:{HEIGHT}")
@@ -11742,7 +12170,7 @@ fn render_preview_frame(sources: &[(RoughClip, f64)]) -> Result<PreviewFrame, St
                 String::new()
             };
             filters.push(format!(
-                "[{index}:v:0]scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop}{wheels}{curves}{lut}{eq}{vig}{blur},format=rgba{chroma}{mask},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur},format=rgba{chroma}{mask},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
@@ -12030,6 +12458,7 @@ fn push_render_inputs(
     clips: &[RoughClip],
     size: (u32, u32),
     allow_proxy: bool,
+    timebase: Timebase,
 ) -> (Vec<usize>, Vec<bool>) {
     let mut input_indices = Vec::with_capacity(clips.len());
     let mut is_title_input = Vec::with_capacity(clips.len());
@@ -12044,7 +12473,12 @@ fn push_render_inputs(
                 "-t",
                 &format_seconds(clip.source_duration().max(0.04)),
                 "-i",
-                &format!("color=c=black@0.0:s={}x{}:r=30", size.0, size.1),
+                &format!(
+                    "color=c=black@0.0:s={}x{}:r={}",
+                    size.0,
+                    size.1,
+                    timebase.ffmpeg_rate()
+                ),
             ]);
             is_title_input.push(true);
         } else {
@@ -12140,9 +12574,11 @@ fn build_render_filters(
     track_gains: &[f64],
     master_gain_db: f64,
     normalize_loudness: bool,
+    timebase: Timebase,
     measured_loudness: Option<&LoudnessReport>,
 ) -> Result<Vec<String>, String> {
     let (out_w, out_h) = size;
+    let frame_rate = timebase.ffmpeg_rate();
     let mut filters = Vec::new();
     let total = clips
         .iter()
@@ -12150,7 +12586,7 @@ fn build_render_filters(
         .fold(0.0, f64::max);
     if include_video {
         filters.push(format!(
-            "color=c=black:s={out_w}x{out_h}:r=30:d={total:.6}[base]"
+            "color=c=black:s={out_w}x{out_h}:r={frame_rate}:d={total:.6}[base]"
         ));
     }
     let mut audio_inputs = String::new();
@@ -12242,11 +12678,12 @@ fn build_render_filters(
                     .freeze_at
                     .map(|_| {
                         let pad = (clips[index].duration() - 0.04).max(0.0);
-                        format!("tpad=stop_mode=clone:stop_duration={pad:.3},")
+                        format!(",tpad=stop_mode=clone:stop_duration={pad:.3}")
                     })
                     .unwrap_or_default();
+                let cadence = conform_video_filter(&clips[index], &frame_rate);
                 filters.push(format!(
-                    "[{media}:v:0]{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}+{start:.6}/TB,scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1,fps=30{wheels}{curves}{lut}{eq}{vig}{blur},format=rgba{chroma}{mask},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}{fade_filters}[v{index}]"
+                    "[{media}:v:0]{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur},format=rgba{chroma}{mask},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
                 ));
             }
         }
@@ -12415,6 +12852,7 @@ fn run_export(
     track_gains: &[f64],
     master_gain_db: f64,
     normalize_loudness: bool,
+    timebase: Timebase,
     measured_loudness: Option<&LoudnessReport>,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
@@ -12447,7 +12885,8 @@ fn run_export(
     let _ = std::fs::remove_file(&error_log);
     let mut command = Command::new(tool_path("ffmpeg.exe"));
     command.arg("-y");
-    let (input_indices, is_title_input) = push_render_inputs(&mut command, clips, size, false);
+    let (input_indices, is_title_input) =
+        push_render_inputs(&mut command, clips, size, false, timebase);
     let filters = build_render_filters(
         clips,
         &input_indices,
@@ -12458,6 +12897,7 @@ fn run_export(
         track_gains,
         master_gain_db,
         normalize_loudness,
+        timebase,
         measured_loudness,
     )?;
     let total = clips
@@ -12490,6 +12930,8 @@ fn run_export(
             if fast { "ultrafast" } else { "medium" },
             "-crf",
             if fast { "28" } else { "18" },
+            "-fps_mode",
+            "cfr",
             "-c:a",
             "aac",
             "-b:a",
@@ -12635,6 +13077,111 @@ fn recovery_path() -> Option<PathBuf> {
             .join("Recovery")
             .join("last-session.ncrough")
     })
+}
+
+fn clear_recovery() {
+    if let Some(path) = recovery_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Escribe primero fuera del destino para que un cierre durante la escritura
+/// no deje un `.ncrough` truncado. Windows no reemplaza con `rename` si el
+/// destino existe, por eso se elimina solo despues de que el temporal cierre.
+fn write_text_atomically(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "El proyecto no tiene carpeta contenedora".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("No se pudo crear la carpeta del proyecto: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "El proyecto no tiene un nombre valido".to_owned())?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, contents)
+        .map_err(|error| format!("No se pudo escribir el temporal: {error}"))?;
+    if path.exists() {
+        if let Err(error) = std::fs::remove_file(path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("No se pudo sustituir el proyecto: {error}"));
+        }
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("No se pudo instalar el proyecto: {error}"));
+    }
+    Ok(())
+}
+
+fn resolve_project_paths(project: &mut RoughProject, project_directory: Option<&Path>) {
+    let Some(directory) = project_directory.filter(|path| !path.as_os_str().is_empty()) else {
+        return;
+    };
+    for clip in &mut project.clips {
+        resolve_clip_paths(clip, directory);
+    }
+}
+
+fn resolve_clip_paths(clip: &mut RoughClip, project_directory: &Path) {
+    resolve_path(&mut clip.path, project_directory);
+    if let Some(proxy) = &mut clip.proxy {
+        resolve_path(proxy, project_directory);
+    }
+    if let Some(lut) = &mut clip.lut {
+        resolve_path(lut, project_directory);
+    }
+    if let Some(children) = &mut clip.nested {
+        for child in children {
+            resolve_clip_paths(child, project_directory);
+        }
+    }
+}
+
+fn project_for_storage(project: &RoughProject, project_path: &Path) -> RoughProject {
+    let mut stored = project.clone();
+    let Some(directory) = project_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return stored;
+    };
+    for clip in &mut stored.clips {
+        relativize_clip_paths(clip, directory);
+    }
+    stored
+}
+
+fn relativize_clip_paths(clip: &mut RoughClip, project_directory: &Path) {
+    relativize_path(&mut clip.path, project_directory);
+    if let Some(proxy) = &mut clip.proxy {
+        relativize_path(proxy, project_directory);
+    }
+    if let Some(lut) = &mut clip.lut {
+        relativize_path(lut, project_directory);
+    }
+    if let Some(children) = &mut clip.nested {
+        for child in children {
+            relativize_clip_paths(child, project_directory);
+        }
+    }
+}
+
+fn resolve_path(path: &mut PathBuf, project_directory: &Path) {
+    if !path.as_os_str().is_empty() && path.is_relative() {
+        *path = project_directory.join(&*path);
+    }
+}
+
+fn relativize_path(path: &mut PathBuf, project_directory: &Path) {
+    if path.as_os_str().is_empty() || path.is_relative() {
+        return;
+    }
+    if let Ok(relative) = path.strip_prefix(project_directory) {
+        if !relative.as_os_str().is_empty() {
+            *path = relative.to_path_buf();
+        }
+    }
 }
 
 fn resolve_mac_media(media: &MacMedia, project_directory: Option<&Path>) -> Option<PathBuf> {
@@ -12865,19 +13412,8 @@ fn default_fps() -> f64 {
 
 /// Timecode HH:MM:SS:FF como el visor de la app macOS.
 fn timecode(seconds: f64, fps: f64) -> String {
-    let fps = if fps >= 1.0 { fps } else { default_fps() };
-    let seconds = seconds.max(0.0);
-    let total_frames = (seconds * fps).round().max(0.0) as u64;
-    let frames_per_second = fps.round().max(1.0) as u64;
-    let frame = total_frames % frames_per_second;
-    let whole = total_frames / frames_per_second;
-    format!(
-        "{:02}:{:02}:{:02}:{:02}",
-        whole / 3600,
-        (whole / 60) % 60,
-        whole % 60,
-        frame
-    )
+    let timebase = Timebase::from_fps(if fps >= 1.0 { fps } else { default_fps() });
+    timebase.timecode(timebase.frames(seconds))
 }
 
 /// Duración legible para reglas y mensajes: 8s, 1:05, 1:02:03.
@@ -13177,6 +13713,9 @@ mod tests {
             in_seconds: 8.0,
             out_seconds: 3.0,
             source_duration_seconds: None,
+            source_timebase: None,
+            source_vfr: false,
+            source_pts: None,
             has_video: true,
             has_audio: true,
             speed: 1.0,
@@ -13234,6 +13773,9 @@ mod tests {
                 in_seconds: 1.5,
                 out_seconds: 4.0,
                 source_duration_seconds: Some(12.0),
+                source_timebase: None,
+                source_vfr: false,
+                source_pts: None,
                 has_video: true,
                 has_audio: false,
                 speed: 1.0,
@@ -13342,6 +13884,9 @@ mod tests {
             in_seconds: 0.0,
             out_seconds: 4.0,
             source_duration_seconds: Some(4.0),
+            source_timebase: None,
+            source_vfr: false,
+            source_pts: None,
             has_video: true,
             has_audio: true,
             speed: 1.0,
@@ -13394,6 +13939,9 @@ mod tests {
             in_seconds: 2.0,
             out_seconds: 10.0,
             source_duration_seconds: Some(10.0),
+            source_timebase: None,
+            source_vfr: false,
+            source_pts: None,
             has_video: true,
             has_audio: true,
             speed: 2.0,
@@ -13446,8 +13994,13 @@ mod tests {
             ..Default::default()
         };
         let mut command = Command::new("ffmpeg");
-        let (indices, titles) =
-            push_render_inputs(&mut command, &[clip.clone()], (1920, 1080), false);
+        let (indices, titles) = push_render_inputs(
+            &mut command,
+            &[clip.clone()],
+            (1920, 1080),
+            false,
+            Timebase::default(),
+        );
         let filters = build_render_filters(
             &[clip.clone()],
             &indices,
@@ -13458,6 +14011,7 @@ mod tests {
             &[],
             0.0,
             false,
+            Timebase::default(),
             None,
         )
         .unwrap();
@@ -13474,6 +14028,7 @@ mod tests {
             &[],
             0.0,
             false,
+            Timebase::default(),
             None,
         )
         .unwrap();
@@ -13504,7 +14059,13 @@ mod tests {
         };
         let clips = vec![base, adjustment];
         let mut command = Command::new("ffmpeg");
-        let (indices, titles) = push_render_inputs(&mut command, &clips, (1920, 1080), false);
+        let (indices, titles) = push_render_inputs(
+            &mut command,
+            &clips,
+            (1920, 1080),
+            false,
+            Timebase::default(),
+        );
         let filters = build_render_filters(
             &clips,
             &indices,
@@ -13515,6 +14076,7 @@ mod tests {
             &[],
             0.0,
             false,
+            Timebase::default(),
             None,
         )
         .unwrap();
@@ -13585,6 +14147,9 @@ mod tests {
                 in_seconds: 0.0,
                 out_seconds: 10.0,
                 source_duration_seconds: Some(10.0),
+                source_timebase: None,
+                source_vfr: false,
+                source_pts: None,
                 has_video: true,
                 has_audio: true,
                 speed: 1.0,
@@ -13628,6 +14193,9 @@ mod tests {
                 in_seconds: 0.0,
                 out_seconds: 2.0,
                 source_duration_seconds: Some(2.0),
+                source_timebase: None,
+                source_vfr: false,
+                source_pts: None,
                 has_video: true,
                 has_audio: false,
                 speed: 1.0,
@@ -14206,9 +14774,142 @@ mod tests {
         assert_eq!(timecode(1.0, 25.0), "00:00:01:00");
         assert_eq!(timecode(1.04, 25.0), "00:00:01:01");
         assert_eq!(timecode(3661.0, 30.0), "01:01:01:00");
+        assert_eq!(
+            timecode(Timebase::NTSC30.seconds(1_800), 29.97),
+            "00:01:00;02"
+        );
         // Un fps inválido cae al valor por defecto en vez de dividir por cero.
         assert_eq!(timecode(2.0, 0.0), "00:00:02:00");
         assert_eq!(timecode(-5.0, 30.0), "00:00:00:00");
+    }
+
+    #[test]
+    fn legacy_project_fps_migrates_to_rational_timebase() {
+        let mut project = RoughProject {
+            fps: 23.976,
+            timebase: None,
+            ..RoughProject::default()
+        };
+        project.normalize();
+        assert_eq!(project.timebase, Some(Timebase::P23_976));
+        assert_eq!(project.fps, Timebase::P23_976.fps());
+    }
+
+    #[test]
+    fn media_probe_rate_and_vfr_helpers_keep_real_metadata() {
+        assert_eq!(
+            parse_frame_rate(Some("30000/1001")),
+            Some(Timebase::new(30_000, 1_001, false).unwrap())
+        );
+        let regular: Vec<f64> = (0..=20).map(|index| index as f64 / 30.0).collect();
+        assert!(!is_variable_frame_rate(&regular));
+        let vfr: Vec<f64> = (0..=20)
+            .map(|index| index as f64 / 30.0 + if index >= 10 { 0.1 } else { 0.0 })
+            .collect();
+        assert!(is_variable_frame_rate(&vfr));
+        let jitter: Vec<f64> = (0..=40)
+            .scan(0.0, |time, index| {
+                let delta = [1.0 / 30.0, 1.0 / 28.0, 1.0 / 32.0][index % 3];
+                let current = *time;
+                *time += delta;
+                Some(current)
+            })
+            .collect();
+        let summary = summarize_video_pts(&jitter).expect("jitter summary");
+        assert!(summary.is_variable());
+        assert_eq!(summary.frame_count, 41);
+    }
+
+    #[test]
+    fn project_paths_round_trip_relative_to_project_folder() {
+        let directory = std::env::temp_dir().join("novacut-portable-project");
+        let project_path = directory.join("montaje.ncrough");
+        let source = directory.join("media").join("plano.mp4");
+        let proxy = directory.join("NovaCut Proxies").join("plano-proxy.mp4");
+        let lut = directory.join("looks").join("look.cube");
+        let nested_source = directory.join("media").join("detalle.mp4");
+        let external = std::env::temp_dir().join("fuera-del-proyecto.mp4");
+        let project = RoughProject {
+            clips: vec![
+                RoughClip {
+                    path: source.clone(),
+                    proxy: Some(proxy.clone()),
+                    lut: Some(lut.clone()),
+                    nested: Some(vec![RoughClip {
+                        path: nested_source.clone(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                RoughClip {
+                    path: external.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..RoughProject::default()
+        };
+        let mut stored = project_for_storage(&project, &project_path);
+        assert_eq!(stored.clips[0].path, PathBuf::from("media/plano.mp4"));
+        assert_eq!(
+            stored.clips[0].proxy,
+            Some(PathBuf::from("NovaCut Proxies/plano-proxy.mp4"))
+        );
+        assert_eq!(stored.clips[0].lut, Some(PathBuf::from("looks/look.cube")));
+        assert_eq!(
+            stored.clips[0].nested.as_ref().unwrap()[0].path,
+            PathBuf::from("media/detalle.mp4")
+        );
+        assert_eq!(stored.clips[1].path, external);
+
+        resolve_project_paths(&mut stored, project_path.parent());
+        assert_eq!(stored.clips[0].path, source);
+        assert_eq!(stored.clips[0].proxy, Some(proxy));
+        assert_eq!(stored.clips[0].lut, Some(lut));
+        assert_eq!(
+            stored.clips[0].nested.as_ref().unwrap()[0].path,
+            nested_source
+        );
+    }
+
+    #[test]
+    fn render_filters_use_the_requested_rational_rate() {
+        let clips = vec![RoughClip {
+            path: PathBuf::from("plan.mp4"),
+            out_seconds: 2.0,
+            ..Default::default()
+        }];
+        let rate = Timebase::P23_976;
+        let mut command = Command::new("ffmpeg");
+        let (indices, titles) = push_render_inputs(&mut command, &clips, (1920, 1080), false, rate);
+        let filters = build_render_filters(
+            &clips,
+            &indices,
+            &titles,
+            (1920, 1080),
+            true,
+            false,
+            &[],
+            0.0,
+            false,
+            rate,
+            None,
+        )
+        .unwrap();
+        let joined = filters.join(";");
+        assert!(joined.contains("r=24000/1001"));
+        assert!(joined.contains("fps=24000/1001"));
+
+        let mut vfr = RoughClip::default();
+        vfr.source_vfr = true;
+        assert_eq!(
+            conform_video_filter(&vfr, &rate.ffmpeg_rate()),
+            ",fps=fps=24000/1001:start_time=0:round=near"
+        );
+        vfr.source_vfr = false;
+        assert_eq!(
+            conform_video_filter(&vfr, &rate.ffmpeg_rate()),
+            ",fps=fps=24000/1001:round=near"
+        );
     }
 
     #[test]
@@ -14460,13 +15161,18 @@ mod tests {
 
     #[test]
     fn timecode_parsing_accepts_common_formats() {
-        assert_eq!(parse_timecode("12.5", 25.0), Some(12.5));
-        assert_eq!(parse_timecode("01:30", 25.0), Some(90.0));
-        assert_eq!(parse_timecode("00:01:23", 25.0), Some(83.0));
-        let with_frames = parse_timecode("00:01:23:12", 25.0).unwrap();
+        assert_eq!(parse_timecode("12.5", Timebase::P25), Some(12.5));
+        assert_eq!(parse_timecode("01:30", Timebase::P25), Some(90.0));
+        assert_eq!(parse_timecode("00:01:23", Timebase::P25), Some(83.0));
+        let with_frames = parse_timecode("00:01:23:12", Timebase::P25).unwrap();
         assert!((with_frames - 83.48).abs() < 1e-9);
-        assert_eq!(parse_timecode("no es tiempo", 25.0), None);
-        assert_eq!(parse_timecode("-5", 25.0), Some(0.0));
+        assert_eq!(parse_timecode("no es tiempo", Timebase::P25), None);
+        assert_eq!(parse_timecode("-5", Timebase::P25), Some(0.0));
+        assert_eq!(parse_timecode("00:01:00;00", Timebase::NTSC30), None);
+        assert_eq!(
+            parse_timecode("00:01:00;02", Timebase::NTSC30),
+            Some(Timebase::NTSC30.seconds(1_800))
+        );
     }
 
     #[test]

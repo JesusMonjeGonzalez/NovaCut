@@ -32,6 +32,13 @@ struct MedioResuelto {
     let transformacionPreferida: CGAffineTransform
     let fps: Double
     let esVFR: Bool
+    /// Intermediario CFR opcional para el montaje. El asset original se conserva
+    /// arriba para el monitor de origen, relink e intercambio.
+    let assetDeMontaje: AVURLAsset?
+    let pistaDeVideoDeMontaje: AVAssetTrack?
+    let pistaDeAudioDeMontaje: AVAssetTrack?
+    let duracionDeMontaje: CMTime?
+    let timebaseDeMontaje: Timebase?
 
     init(
         id: UUID,
@@ -43,7 +50,12 @@ struct MedioResuelto {
         tamanoNatural: CGSize,
         transformacionPreferida: CGAffineTransform,
         fps: Double,
-        esVFR: Bool = false
+        esVFR: Bool = false,
+        assetDeMontaje: AVURLAsset? = nil,
+        pistaDeVideoDeMontaje: AVAssetTrack? = nil,
+        pistaDeAudioDeMontaje: AVAssetTrack? = nil,
+        duracionDeMontaje: CMTime? = nil,
+        timebaseDeMontaje: Timebase? = nil
     ) {
         self.id = id
         self.url = url
@@ -55,10 +67,22 @@ struct MedioResuelto {
         self.transformacionPreferida = transformacionPreferida
         self.fps = fps
         self.esVFR = esVFR
+        self.assetDeMontaje = assetDeMontaje
+        self.pistaDeVideoDeMontaje = pistaDeVideoDeMontaje
+        self.pistaDeAudioDeMontaje = pistaDeAudioDeMontaje
+        self.duracionDeMontaje = duracionDeMontaje
+        self.timebaseDeMontaje = timebaseDeMontaje
     }
 
     var tieneVideo: Bool { pistaDeVideo != nil }
     var tieneAudio: Bool { pistaDeAudio != nil }
+    var estaConformado: Bool {
+        assetDeMontaje != nil && pistaDeVideoDeMontaje != nil && timebaseDeMontaje != nil
+    }
+    var assetParaMontaje: AVURLAsset { assetDeMontaje ?? asset }
+    var pistaDeVideoParaMontaje: AVAssetTrack? { pistaDeVideoDeMontaje ?? pistaDeVideo }
+    var pistaDeAudioParaMontaje: AVAssetTrack? { pistaDeAudioDeMontaje ?? pistaDeAudio }
+    var duracionParaMontaje: CMTime { duracionDeMontaje ?? duracion }
 
     /// Tamaño ya orientado, que es el que ve el espectador.
     var tamanoVisible: CGSize {
@@ -95,9 +119,9 @@ struct MedioResuelto {
     /// grabaciones con caídas de frames (Screen Recording de macOS graba a 60
     /// y suelta fotogramas bajo carga: la duración mínima sigue siendo 1/60 y
     /// nadie nota nada). Aquí se leen los tiempos de presentación de una
-    /// ventana inicial —solo demultiplexa, no decodifica— y se cuenta cuántos
-    /// saltos superan 1,5× la cadencia mediana: más de un 2 % es material que
-    /// un conformado ingenuo desfasaría.
+    /// ventana inicial —solo demultiplexa, no decodifica— y se mide la variación
+    /// de los deltas: tanto un jitter sostenido como un salto de 1,5× son VFR,
+    /// aunque el primero no llegue a parecer un hueco.
     static func esCadenciaVFR(pista: AVAssetTrack) async -> Bool {
         let minimo = (try? await pista.load(.minFrameDuration)) ?? .invalid
         if !minimo.isNumeric || minimo.value <= 0 { return true }
@@ -127,7 +151,10 @@ struct MedioResuelto {
         guard mediana > 0 else { return false }
         var huecos = 0
         for d in deltas where d > mediana * 1.5 { huecos += 1 }
-        return Double(huecos) / Double(deltas.count) > 0.02
+        let variaciones = deltas.filter { abs($0 - mediana) > mediana * 0.02 }.count
+        let proporcionDeHuecos = Double(huecos) / Double(deltas.count)
+        let proporcionVariable = Double(variaciones) / Double(deltas.count)
+        return proporcionDeHuecos > 0.02 || proporcionVariable > 0.05
     }
 
     /// Captura una imagen pequeña para identificar el medio sin decodificarlo en
@@ -998,8 +1025,8 @@ enum ConstructorDeMontaje {
         // el riesgo debe aparecer antes de que el usuario confíe en la sincronía.
         var vfrAdvertidos: Set<UUID> = []
         for (_, clip) in linea.todosLosClips where !clip.esAjuste && !clip.esTitulo {
-            guard let medio = medios[clip.mediaID], medio.esVFR,
-                  vfrAdvertidos.insert(clip.mediaID).inserted else { continue }
+            guard let medio = medios[clip.mediaID], medio.esVFR, !medio.estaConformado,
+                   vfrAdvertidos.insert(clip.mediaID).inserted else { continue }
             avisos.append(AvisoDeMontaje(
                 "«\(clip.nombre)» tiene cadencia variable: la sincronía exacta requiere conformar sus PTS antes de entregar",
                 critico: true
@@ -1356,7 +1383,7 @@ enum ConstructorDeMontaje {
         timebase: Timebase,
         avisos: inout [AvisoDeMontaje]
     ) -> Bool {
-        guard let origen = (tipo == .video ? medio.pistaDeVideo : medio.pistaDeAudio) else { return false }
+        guard let origen = (tipo == .video ? medio.pistaDeVideoParaMontaje : medio.pistaDeAudioParaMontaje) else { return false }
 
         let grupoT = clip.inicio + segmento.desde
         let entradaOrigen = grupoT - desfase
@@ -1366,7 +1393,7 @@ enum ConstructorDeMontaje {
         }
         let entrada = timebase.tiempo(entradaOrigen)
         var duracionDeOrigen = timebase.tiempo(segmento.hasta - segmento.desde)
-        let disponible = CMTimeSubtract(medio.duracion, entrada)
+        let disponible = CMTimeSubtract(medio.duracionParaMontaje, entrada)
         if CMTimeCompare(duracionDeOrigen, disponible) > 0 {
             duracionDeOrigen = disponible
             avisos.append(AvisoDeMontaje("«\(clip.nombre)» pedía más metraje del que tiene el ángulo", critico: false))
@@ -1391,7 +1418,7 @@ enum ConstructorDeMontaje {
         timebase: Timebase,
         avisos: inout [AvisoDeMontaje]
     ) -> Bool {
-        guard let origen = (tipo == .video ? medio.pistaDeVideo : medio.pistaDeAudio) else { return false }
+        guard let origen = (tipo == .video ? medio.pistaDeVideoParaMontaje : medio.pistaDeAudioParaMontaje) else { return false }
 
         if clip.velocidad < 0 {
             avisos.append(AvisoDeMontaje("«\(clip.nombre)» va marcha atrás y eso todavía necesita renderizado previo", critico: true))
@@ -1432,7 +1459,7 @@ enum ConstructorDeMontaje {
         let framesDeOrigen: Int64 = pieza.consumo == 0 ? 1 : pieza.consumo
         let entrada = timebase.tiempo(posicionDeOrigen)
         var duracionDeOrigen = timebase.tiempo(framesDeOrigen)
-        let disponible = CMTimeSubtract(medio.duracion, entrada)
+        let disponible = CMTimeSubtract(medio.duracionParaMontaje, entrada)
         if CMTimeCompare(duracionDeOrigen, disponible) > 0 {
             duracionDeOrigen = disponible
             avisos.append(AvisoDeMontaje("«\(clip.nombre)» pedía más metraje del que tiene el archivo", critico: false))

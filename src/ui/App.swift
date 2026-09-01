@@ -211,6 +211,11 @@ final class EditorState: ObservableObject {
     @Published private(set) var colaDeTranscripcion: [UUID] = []
     /// La tarea que está transcribiendo ahora mismo, para poder cancelarla.
     private var tareaDeTranscripcion: Task<Void, Never>?
+    /// Conformado VFR en segundo plano. El montaje puede seguir respondiendo con
+    /// el aviso crítico mientras se prepara el intermediario correcto.
+    private var tareaDeConformado: Task<Void, Never>?
+    private var firmaDeConformadoEnCurso: String?
+    private var firmaDeConformadoFallida: String?
     /// Palabras marcadas en el panel de texto, por índice en `palabrasDelMontaje`.
     /// Se vacía tras cada edición porque la lista se reconstruye y los índices
     /// dejarían de señalar lo que el usuario había marcado.
@@ -310,6 +315,7 @@ final class EditorState: ObservableObject {
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         exportTimer?.invalidate()
         autosaveTask?.cancel()
+        tareaDeConformado?.cancel()
     }
 
     // MARK: Lectura del montaje
@@ -370,6 +376,74 @@ final class EditorState: ObservableObject {
     func mediaItem(for clip: Clip) -> MediaItem? { media.first { $0.id == clip.mediaID } }
 
     func medioResuelto(_ id: UUID) -> MedioResuelto? { medios[id] }
+
+    /// Identifica el conjunto de archivos VFR y la base de tiempo que lo necesita.
+    /// La ruta y los metadatos evitan aplicar el resultado de una tarea vieja tras
+    /// revincular o activar proxies.
+    private func firmaDeConformado(_ medios: [UUID: MedioResuelto], timebase: Timebase) -> String {
+        let partes = medios.values
+            .filter(\.esVFR)
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+            .map { medio in
+                let valores = try? medio.url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                return [
+                    medio.id.uuidString,
+                    medio.url.standardizedFileURL.path,
+                    String(describing: valores?.fileSize),
+                    String(describing: valores?.contentModificationDate),
+                    String(format: "%.9f", medio.duracion.seconds),
+                    String(format: "%.9f", medio.fps)
+                ].joined(separator: "|")
+            }
+        guard !partes.isEmpty else { return "" }
+        return partes.joined(separator: ";")
+            + "@\(timebase.numerador)/\(timebase.denominador)/\(timebase.dropFrame ? 1 : 0)"
+    }
+
+    /// Prepara los intermediarios CFR sin bloquear la reconstrucción síncrona del
+    /// montaje. Si un archivo falla, el montaje conserva el aviso crítico y no
+    /// reintenta en cada pequeño cambio de interfaz.
+    private func prepararConformadoSiHaceFalta() {
+        let timebase = montaje.timebase
+        let snapshot = medios
+        let pendiente = snapshot.values.contains {
+            $0.esVFR && $0.timebaseDeMontaje != timebase
+        }
+        guard pendiente else {
+            tareaDeConformado?.cancel()
+            tareaDeConformado = nil
+            firmaDeConformadoEnCurso = nil
+            return
+        }
+
+        let firma = firmaDeConformado(snapshot, timebase: timebase)
+        if firmaDeConformadoEnCurso != nil, firmaDeConformadoEnCurso != firma {
+            tareaDeConformado?.cancel()
+            tareaDeConformado = nil
+            firmaDeConformadoEnCurso = nil
+        }
+        guard tareaDeConformado == nil, firmaDeConformadoFallida != firma else { return }
+
+        firmaDeConformadoEnCurso = firma
+        status = "Conformando VFR a \(timebase.nombre)…"
+        tareaDeConformado = Task { [weak self] in
+            let resultado = await ConformadorVFR.preparar(medios: snapshot, para: timebase)
+            guard let self, !Task.isCancelled,
+                  self.firmaDeConformadoEnCurso == firma else { return }
+
+            self.firmaDeConformadoEnCurso = nil
+            self.tareaDeConformado = nil
+            self.firmaDeConformadoFallida = resultado.fallos.isEmpty ? nil : firma
+            self.medios = resultado.medios
+            self.ultimoRender = nil
+            self.rebuildPreview(keepPosition: true)
+            if resultado.fallos.isEmpty {
+                self.status = "VFR conformado · \(resultado.conformados) intermediario\(resultado.conformados == 1 ? "" : "s") listo\(resultado.conformados == 1 ? "" : "s")"
+            } else {
+                self.status = "Conformado VFR incompleto · \(resultado.fallos.joined(separator: " · "))"
+            }
+        }
+    }
 
     func fijarProxies(_ activar: Bool) {
         guard !generandoProxies else { return }
@@ -1244,9 +1318,14 @@ final class EditorState: ObservableObject {
         status = "Midiendo el audio para encontrar los silencios…"
         Task {
             do {
+                let mediosDeTrabajo = mediosOriginales.isEmpty ? medios : mediosOriginales
+                let preparados = await ConformadorVFR.preparar(
+                    medios: mediosDeTrabajo,
+                    para: montaje.timebase
+                )
                 let render = ConstructorDeMontaje.construir(
                     montaje,
-                    medios: mediosOriginales.isEmpty ? medios : mediosOriginales,
+                    medios: preparados.medios,
                     tamanoDeSalida: CGSize(width: 1920, height: 1080)
                 )
                 // La lectura del audio entero puede durar minutos; va a una tarea
@@ -3290,6 +3369,7 @@ final class EditorState: ObservableObject {
     func rebuildPreview(keepPosition: Bool) {
         let previous = keepPosition ? min(playhead, timelineDuration) : 0
         previewGeneration += 1
+        prepararConformadoSiHaceFalta()
         player.pause()
         if let visor = visorMulticam() {
             if grupoDelVisor != visor.grupo.id {
@@ -3388,9 +3468,13 @@ final class EditorState: ObservableObject {
         status = "Midiendo sonoridad…"
         Task {
             do {
+                let preparados = await ConformadorVFR.preparar(
+                    medios: mediosDeTrabajo,
+                    para: montajeDeTrabajo.timebase
+                )
                 let render = ConstructorDeMontaje.construir(
                     montajeDeTrabajo,
-                    medios: mediosDeTrabajo,
+                    medios: preparados.medios,
                     tamanoDeSalida: preset.tamano
                 )
                 let rango: CMTimeRange?
@@ -3404,7 +3488,7 @@ final class EditorState: ObservableObject {
                 let medida = try await enSegundoPlano {
                     try SonoridadMedia.medir(composicion: composicion, mezcla: mezcla, timeRange: rango)
                 }
-                presentarPlan(objetivo.plan(para: medida), preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: mediosDeTrabajo)
+                presentarPlan(objetivo.plan(para: medida), preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: preparados.medios)
             } catch {
                 status = "No se pudo medir el audio (\(error.localizedDescription)); se exporta sin tocar"
                 encolar(preset: preset, url: outputURL, montaje: montajeDeTrabajo, medios: mediosDeTrabajo, ganancia: nil)
@@ -3483,9 +3567,13 @@ final class EditorState: ObservableObject {
                         paraExportar.pistas[i].volumen = (paraExportar.pistas[i].volumen ?? 0) + ganancia
                     }
                 }
+                let preparados = await ConformadorVFR.preparar(
+                    medios: trabajo.medios,
+                    para: paraExportar.timebase
+                )
                 let render = ConstructorDeMontaje.construir(
                     paraExportar,
-                    medios: trabajo.medios,
+                    medios: preparados.medios,
                     tamanoDeSalida: trabajo.preset.tamano
                 )
                 // Los avisos críticos cambian el resultado respecto al montaje: un

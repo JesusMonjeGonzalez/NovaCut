@@ -32,7 +32,8 @@ enum ServicioDeNidos {
         medios: [UUID: MedioResuelto],
         id: UUID
     ) async throws -> URL {
-        let render = ConstructorDeMontaje.construir(linea, medios: medios)
+        let preparados = await ConformadorVFR.preparar(medios: medios, para: linea.timebase)
+        let render = ConstructorDeMontaje.construir(linea, medios: preparados.medios)
         guard !render.estaVacio else { throw EditorError.exportFailed }
         let url = try carpetaDeNidos()
             .appendingPathComponent("nido-\(id.uuidString)")

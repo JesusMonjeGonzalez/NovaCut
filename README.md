@@ -32,6 +32,7 @@ timeline model and uses native media frameworks from interaction through export.
 | Engineering focus | What is implemented |
 |---|---|
 | Frame correctness | Integer-frame timeline over rational timebases, NTSC fractions and drop-frame timecode |
+| Variable-frame media | PTS-based VFR detection, cached CFR conforming on macOS, and rational CFR render filters on Windows |
 | Text as an edit surface | On-device transcription, word-level timing, search, filler review and selected-text removal |
 | Native composition | AVFoundation playback/export, custom Core Image compositor, masks, blend modes, LUTs and scopes |
 | Multicam | Audio-onset sync, manual frame offsets, live switching and flattening into normal clips |
@@ -47,6 +48,9 @@ timeline model and uses native media frameworks from interaction through export.
 - Titles, captions, masks, 14 blend modes and adjustment layers.
 - RGB curves, `.cube` LUTs, color wheels, chroma key, waveform, vectorscope and histogram.
 - H.264, HEVC, vertical MP4, ProRes 422, audio-only and master export presets.
+- VFR sources are detected from presentation timestamps; macOS conforms them to a
+  cached CFR intermediary before composition, while Windows quantizes render
+  filters to the project `Timebase`.
 - **Interchange**: EDL (CMX 3600) and FCPXML 1.11 export with exact timecodes,
   A/V links and constant speeds. External-editor compatibility remains a release
   validation gate, not a claim of full NLE parity.
@@ -135,6 +139,9 @@ feathered masks, `.cube` LUTs, 540p proxies, track/master mixing with stereo
 balance per clip, two-pass LUFS normalization, silence and scene-cut
 detection, magnetic timeline snapping and adjustment layers that grade
 everything beneath them are also available.
+VFR media is identified from a bounded PTS scan and rendered through the
+project's rational CFR cadence; Windows runtime validation remains part of the
+release gate.
 Whisper is optional: place `whisper-cli.exe` and a `ggml-*.bin` model in a
 `whisper` directory beside the Windows executable.
 
@@ -145,15 +152,19 @@ Whisper is optional: place `whisper-cli.exe` and a `ggml-*.bin` model in a
 ./probar.sh /path/to/a/redistributable-test-video.mp4
 ./generar-corpus.sh
 ./probar-corpus.sh build/corpus
+./generar-corpus.sh build/corpus-vfr
+./probar-corpus.sh build/corpus-vfr
+./probar.sh build/corpus-vfr/vfr-clap-h264.mov
 ./probar-sonoridad.sh
 ./probar-sonoridad-media.sh
 ```
 
 The harness exercises timeline behavior, transcript editing, silence detection,
 LUT parsing, scopes, color composition, audio DSP, generated multicam media,
-retimed frame progression and EDL/FCPXML model interchange. The optional media
-argument adds composition checks against a real file. The golden-media corpus
-must contain measurable clap material before its synchronization gate can pass.
+retimed frame progression, VFR conforming and EDL/FCPXML model interchange. The
+optional media argument adds composition and VFR-conforming checks against a
+real file. The golden-media corpus must contain measurable clap material before
+its synchronization gate can pass.
 The GitHub workflow builds the native application and runs the native harness;
 it does not replace UI or heterogeneous-media validation.
 
@@ -181,8 +192,9 @@ remote provider.
 
 - Engineering alpha, not a production NLE replacement.
 - Apple Silicon and Spanish-first UI only.
-- VFR with dropped frames is detected (PTS scan) and warned, but PTS conforming
-  is not implemented yet: the real-VFR corpus gate remains open.
+- VFR with dropped frames is detected from PTS. macOS uses a cached CFR
+  intermediary before composition; Windows has the PTS scan and rational CFR
+  filter path, but Windows-host runtime validation remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
 - Proxy cleanup, storage limits and packaged releases remain unfinished.

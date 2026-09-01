@@ -161,8 +161,21 @@ swiftc -O -enforce-exclusivity=checked -target arm64-apple-macos14.0 \
 # algo que AVFoundation decodifica de verdad, con sus capas y su cadencia exacta.
 if [ $# -ge 1 ]; then
     swiftc -O -target arm64-apple-macos14.0 \
-        "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" "$RAIZ/src/ui/Composicion.swift" "$RAIZ/src/ui/LUTs.swift" \
+        -framework AVFoundation -framework AppKit -framework CoreGraphics -framework CoreImage \
+        "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" "$RAIZ/src/ui/Transcript.swift" \
+        "$RAIZ/src/ui/Composicion.swift" "$RAIZ/src/ui/ConformadoVFR.swift" "$RAIZ/src/ui/LUTs.swift" \
         "$RAIZ/tests/composicion/main.swift" \
         -o "$SALIDA/pruebaComposicion"
     "$SALIDA/pruebaComposicion" "$1"
+
+    # Conformado VFR: PTS constantes, duración A/V alineada y reutilización de la
+    # caché. Se ejecuta solo con un archivo explícito para no convertir el arnés
+    # general en una operación que necesite medios grandes.
+    swiftc -O -target arm64-apple-macos14.0 \
+        -framework AVFoundation -framework AppKit -framework CoreGraphics -framework CoreImage \
+        "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" "$RAIZ/src/ui/Transcript.swift" \
+        "$RAIZ/src/ui/Composicion.swift" "$RAIZ/src/ui/ConformadoVFR.swift" "$RAIZ/src/ui/LUTs.swift" \
+        "$RAIZ/tests/vfr/main.swift" \
+        -o "$SALIDA/pruebaVFR"
+    "$SALIDA/pruebaVFR" "$1"
 fi
