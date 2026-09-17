@@ -46,6 +46,15 @@ timeline model and uses native media frameworks from interaction through export.
 - Linked video/audio synchronization across edits and retiming.
 - Constant speed, speed ramps and freeze frames.
 - Titles, captions, masks, 14 blend modes and adjustment layers.
+- Proxy cache budget: a configurable disk limit evicts the least recently used
+  proxies first and stops as soon as the cache fits. Proxies the open project links
+  are never evicted; if they alone exceed the limit the app says so instead of
+  deleting work the preview is about to request again. A limit of zero disables the trim.
+- Proxies are named after the media and a fingerprint of its size and modification date,
+  not after the clip index. Two clips of the same file share one proxy instead of
+  re-encoding, reordering clips never reassigns a proxy to another video, and replacing
+  the source on disk invalidates the old proxy, which macOS retires. Export always uses
+  the original either way.
 - RGB curves, `.cube` LUTs, color wheels, chroma key, waveform, vectorscope and histogram.
 - H.264, HEVC, vertical MP4, ProRes 422, audio-only and master export presets.
 - VFR sources are detected from presentation timestamps; macOS conforms them to a
@@ -197,7 +206,7 @@ remote provider.
   filter path, but Windows-host runtime validation remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
-- Proxy cleanup, storage limits and packaged releases remain unfinished.
+- Proxy cleanup and storage limits are implemented on macOS; Windows wiring and packaged releases remain unfinished.
 - No automated UI suite for recovery, relinking or export cancellation.
 - Premiere, Resolve and Final Cut opening have not been verified in this repository.
 - Swift concurrency and deprecated AVFoundation warnings remain migration work.
