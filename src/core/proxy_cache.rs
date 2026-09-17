@@ -415,11 +415,13 @@ mod tests {
     #[test]
     fn awkward_media_names_still_produce_a_usable_file_name() {
         let hash = 0x0123_4567_89ab_cdef;
+        // El dos puntos es prefijo de unidad en Windows, así que `file_stem` se
+        // queda con lo que sigue; en Unix forma parte del nombre. Aquí se
+        // comprueba el saneado de los caracteres que NTFS no admite.
+        let esperado = if cfg!(windows) { "b_c_" } else { "a_b_c_" };
         assert_eq!(
-            // El separador de Windows lo resuelve `file_stem` en su sistema; aquí
-            // se comprueba el saneado de caracteres que NTFS no admite.
             proxy_file_name(Path::new("a:b*c?.mov"), hash),
-            format!("a_b_c_-0123456789abcdef{PROXY_SUFFIX}")
+            format!("{esperado}-0123456789abcdef{PROXY_SUFFIX}")
         );
         let largo = proxy_file_name(Path::new(&format!("{}.mov", "n".repeat(200))), hash);
         assert_eq!(largo.len(), 48 + 1 + 16 + PROXY_SUFFIX.len());
