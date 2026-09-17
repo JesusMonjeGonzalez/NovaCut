@@ -221,6 +221,7 @@ final class EditorState: ObservableObject {
     /// dejarían de señalar lo que el usuario había marcado.
     @Published var seleccionDeTexto: Set<Int> = []
     @Published var mostrarTranscript = false
+    @Published var mostrarSubtitulos = false
     /// Lo que se busca en el panel de texto. Con algo escrito, el panel enseña
     /// coincidencias en vez del transcript del montaje.
     @Published var busquedaDeTexto = ""
@@ -1394,10 +1395,38 @@ final class EditorState: ObservableObject {
     }
 
     func editarSubtitulo(_ id: UUID, texto: String) {
-        guard let indice = montaje.subtitulos?.firstIndex(where: { $0.id == id }) else { return }
-        montaje.subtitulos?[indice].texto = texto
-        objectWillChange.send()
-        scheduleAutosave()
+        guard let indice = montaje.subtitulos?.firstIndex(where: { $0.id == id }),
+              montaje.subtitulos?[indice].texto != texto else { return }
+        performEdit(keepPosition: true) { montaje.subtitulos?[indice].texto = texto }
+    }
+
+    func eliminarSubtitulo(_ id: UUID) {
+        guard montaje.subtitulos?.contains(where: { $0.id == id }) == true else { return }
+        performEdit(keepPosition: true) { montaje.subtitulos?.removeAll { $0.id == id } }
+    }
+
+    func agregarSubtitulo() {
+        let inicio = cabezal
+        let (fin, desborde) = inicio.addingReportingOverflow(timebase.frames(segundos: 3))
+        guard inicio >= 0, !desborde else { return }
+        performEdit(keepPosition: true) {
+            if montaje.subtitulos == nil { montaje.subtitulos = [] }
+            montaje.subtitulos?.append(Subtitulo(inicio: inicio, fin: fin, texto: "Nuevo subtítulo"))
+        }
+    }
+
+    @discardableResult
+    func desplazarSubtitulos(frames: Int64) -> Bool {
+        guard let actuales = montaje.subtitulos, !actuales.isEmpty, frames != 0 else { return false }
+        do {
+            let nuevos = try SubtitulosService.desplazar(actuales, frames: frames)
+            performEdit(keepPosition: true) { montaje.subtitulos = nuevos }
+            status = "\(nuevos.count) subtítulos desplazados \(frames) frames"
+            return true
+        } catch {
+            status = error.localizedDescription
+            return false
+        }
     }
 
     /// Aplica un estilo a un subtítulo. El «default» es el que está por omisión.
@@ -4277,6 +4306,7 @@ struct ContentView: View {
             return true
         }
         .onOpenURL { editor.importURLs([$0]) }
+        .sheet(isPresented: $editor.mostrarSubtitulos) { PanelDeSubtitulos(editor: editor) }
         .alert(item: $editor.recuperacionPendiente) { pendiente in
             Alert(
                 title: Text("Recuperación disponible"),
@@ -4434,6 +4464,8 @@ struct ContentView: View {
             .disabled(editor.isImporting)
             .help("Importar vídeo o audio a la biblioteca (⌘I)")
             Menu("Subtítulos", systemImage: "captions.bubble") {
+                Button("Buscar y sincronizar…") { editor.mostrarSubtitulos = true }
+                Divider()
                 Button("Importar SRT…") { editor.importarSubtitulos() }
                 Button(editor.transcribing ? "Transcribiendo…" : "Transcribir medio seleccionado") {
                     editor.transcribirMedioSeleccionado()
@@ -5609,7 +5641,9 @@ extension Double {
 }
 
 
+#if !PRUEBAS_ESTADO
 @main
+#endif
 struct EditorcitoApp: App {
 
     /// El estado vive en la escena, no en la vista, porque la barra de menús del

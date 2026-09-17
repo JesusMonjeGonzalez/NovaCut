@@ -19,6 +19,22 @@ swiftc -O -enforce-exclusivity=checked -target arm64-apple-macos14.0 \
     -o "$SALIDA/pruebaTimeline"
 "$SALIDA/pruebaTimeline"
 
+# SRT: importación tolerante, tiempos válidos y redondeo de exportación NTSC.
+swiftc -O -target arm64-apple-macos14.0 \
+    "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" \
+    "$RAIZ/src/ui/Transcript.swift" "$RAIZ/src/ui/Subtitulos.swift" "$RAIZ/tests/subtitulos/main.swift" \
+    -o "$SALIDA/pruebaSubtitulos"
+"$SALIDA/pruebaSubtitulos"
+
+# Panel de subtítulos: alta, edición, borrado y sincronización global sobre el
+# documento real, comprobando que cada operación entra una sola vez en el
+# historial y que un ajuste rechazado no deja cambios parciales. `PRUEBAS_ESTADO`
+# desactiva el `@main` de la app para poder enlazar la UI como biblioteca.
+swiftc -D PRUEBAS_ESTADO -target arm64-apple-macos14.0 \
+    "$RAIZ"/src/ui/*.swift "$RAIZ/tests/estado-subtitulos/main.swift" \
+    -o "$SALIDA/pruebaEstadoSubtitulos"
+"$SALIDA/pruebaEstadoSubtitulos"
+
 # Edición por transcript: el mapa entre lo que se dice (tiempo del medio) y lo que
 # se oye (frames de montaje), y el borrado de varios tramos, que hay que aplicar de
 # atrás hacia delante o se come material que nadie seleccionó.
