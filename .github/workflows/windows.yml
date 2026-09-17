@@ -5,16 +5,41 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: 'Optional: publish a NEW release; run on this tag (v<Cargo.toml version>)'
+        type: string
+        required: false
+        default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  secrets:
+    uses: ./.github/workflows/secrets.yml
+
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Validate explicit release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.publish_tag }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF_NAME -cne $env:RELEASE_TAG) {
+            throw 'Publication requires running on the explicitly requested tag'
+          }
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read package version' }
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'editorcito-core' }).version
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Tag does not match Cargo.toml version' }
+      - name: Set up Rust
+        run: rustup update stable --no-self-update
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
@@ -22,27 +47,39 @@ jobs:
         shell: pwsh
         run: ./build-windows.ps1 -Installer
       - name: Upload portable Windows application
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: novacut-windows-x64
           path: build/NovaCut-Windows
           if-no-files-found: error
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: novacut-windows-installer-x64
           path: build/installer/NovaCut-Windows-Setup.exe
           if-no-files-found: error
-      - name: Refresh alpha release assets
-        shell: pwsh
+  publish:
+    needs: [build, secrets]
+    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' && inputs.publish_tag != '' && inputs.publish_tag == github.ref_name
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: novacut-windows-x64
+          path: NovaCut-Windows
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: novacut-windows-installer-x64
+          path: installer
+      - name: Create new alpha release without replacing existing assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.publish_tag }}
         run: |
-          if (gh release view v0.1.0 --json tagName 2>$null) {
-            Compress-Archive -Path build\NovaCut-Windows -DestinationPath build\NovaCut-Windows-x64.zip -Force
-            gh release upload v0.1.0 build/installer/NovaCut-Windows-Setup.exe `
-              build/NovaCut-Windows-x64.zip --clobber
-            Write-Host "Release v0.1.0 refreshed with CI artifacts"
-          } else {
-            Write-Host "Release v0.1.0 does not exist yet; skipping release refresh"
-          }
+          zip -r NovaCut-Windows-x64.zip NovaCut-Windows
+          gh release create "$RELEASE_TAG" --verify-tag --prerelease \
+            --title "NovaCut $RELEASE_TAG" --notes "Windows engineering alpha." \
+            installer/NovaCut-Windows-Setup.exe NovaCut-Windows-x64.zip
