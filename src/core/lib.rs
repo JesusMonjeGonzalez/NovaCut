@@ -14,4 +14,5 @@ pub use decode::{Decoder, DecoderConfig, FrameInfo};
 pub use encoder::{Encoder, EncoderPreset, ExportFormat};
 pub use timebase::Timebase;
 
+pub mod proxy_cache;
 pub mod subtitles;

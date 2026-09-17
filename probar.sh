@@ -35,6 +35,16 @@ swiftc -D PRUEBAS_ESTADO -target arm64-apple-macos14.0 \
     -o "$SALIDA/pruebaEstadoSubtitulos"
 "$SALIDA/pruebaEstadoSubtitulos"
 
+# Caché de preview: limpieza de huérfanos y presupuesto de disco con desalojo
+# LRU, sin tocar archivos ajenos ni los proxies del proyecto abierto.
+swiftc -O -target arm64-apple-macos14.0 \
+    -framework AVFoundation -framework AppKit -framework CoreGraphics \
+    "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" \
+    "$RAIZ/src/ui/Transcript.swift" "$RAIZ/src/ui/Composicion.swift" "$RAIZ/src/ui/LUTs.swift" \
+    "$RAIZ/src/ui/Exportacion.swift" "$RAIZ/src/ui/Proxies.swift" "$RAIZ/tests/proxies/main.swift" \
+    -o "$SALIDA/pruebaProxies"
+"$SALIDA/pruebaProxies"
+
 # Edición por transcript: el mapa entre lo que se dice (tiempo del medio) y lo que
 # se oye (frames de montaje), y el borrado de varios tramos, que hay que aplicar de
 # atrás hacia delante o se come material que nadie seleccionó.

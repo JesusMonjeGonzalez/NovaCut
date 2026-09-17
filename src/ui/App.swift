@@ -146,6 +146,9 @@ final class EditorState: ObservableObject {
     /// usuario: el reconocimiento on-device consume CPU y el Mac puede estar
     /// ocupado montando.
     @AppStorage("editorcito.transcribirAlImportar") var transcribirAlImportar = false
+    /// Presupuesto de disco para la caché de proxies, en gigabytes. Cero desactiva
+    /// el recorte automático y deja la caché al cuidado de `Limpiar proxies`.
+    @AppStorage("editorcito.limiteDeProxiesGB") var limiteDeProxiesGB = 20.0
     @Published private(set) var media: [MediaItem] = []
     /// El montaje. Multipista, en frames enteros y con historial por instantánea.
     @Published private(set) var montaje = LineaDeTiempo.nueva()
@@ -214,6 +217,9 @@ final class EditorState: ObservableObject {
     /// Conformado VFR en segundo plano. El montaje puede seguir respondiendo con
     /// el aviso crítico mientras se prepara el intermediario correcto.
     private var tareaDeConformado: Task<Void, Never>?
+    /// Generación de proxies cancelable desde el menú de preview.
+    private var tareaDeProxies: Task<Void, Never>?
+    private var generacionDeProxies = 0
     private var firmaDeConformadoEnCurso: String?
     private var firmaDeConformadoFallida: String?
     /// Palabras marcadas en el panel de texto, por índice en `palabrasDelMontaje`.
@@ -317,6 +323,7 @@ final class EditorState: ObservableObject {
         exportTimer?.invalidate()
         autosaveTask?.cancel()
         tareaDeConformado?.cancel()
+        tareaDeProxies?.cancel()
     }
 
     // MARK: Lectura del montaje
@@ -471,26 +478,99 @@ final class EditorState: ObservableObject {
         generandoProxies = true
         proxyProgress = 0
         proxiesActivos = true
-        Task {
+        generacionDeProxies += 1
+        let generacion = generacionDeProxies
+        tareaDeProxies = Task { @MainActor [weak self] in
+            guard let self else { return }
             var creados = 0
+            var cancelado = false
             for medio in candidatos {
                 do {
-                    let url = try await ProxyService.crear(id: medio.id, asset: medio.asset)
-                    proxyURLs[medio.id] = url
+                    try Task.checkCancellation()
+                    let url = try await ProxyService.crear(id: medio.id, origen: medio.url, asset: medio.asset)
                     let proxy = try await MedioResuelto.cargar(id: medio.id, url: url)
-                    medios[medio.id] = proxy
+                    try Task.checkCancellation()
+                    self.proxyURLs[medio.id] = url
+                    self.medios[medio.id] = proxy
                     creados += 1
+                } catch is CancellationError {
+                    cancelado = true
+                    break
                 } catch {
-                    status = "Proxy fallido: \(medio.url.lastPathComponent)"
+                    if Task.isCancelled {
+                        cancelado = true
+                        break
+                    }
+                    self.status = "Proxy fallido: \(medio.url.lastPathComponent)"
                 }
-                proxyProgress = Double(creados) / Double(candidatos.count)
+                self.proxyProgress = Double(creados) / Double(candidatos.count)
             }
-            generandoProxies = false
-            ultimoRender = nil
-            cargarMedioEnOrigen(selectedMediaID)
-            rebuildPreview(keepPosition: true)
-            status = "\(creados) proxy\(creados == 1 ? "" : "s") listo\(creados == 1 ? "" : "s")"
+            guard self.generacionDeProxies == generacion else { return }
+            self.generandoProxies = false
+            self.tareaDeProxies = nil
+            let recorte = self.ajustarCacheDeProxiesAlLimite()
+            self.ultimoRender = nil
+            self.cargarMedioEnOrigen(self.selectedMediaID)
+            self.rebuildPreview(keepPosition: true)
+            if cancelado || Task.isCancelled {
+                self.status = creados == 0
+                    ? "Generación de proxies cancelada"
+                    : "Generación de proxies cancelada · \(creados) listo\(creados == 1 ? "" : "s")"
+            } else {
+                self.status = "\(creados) proxy\(creados == 1 ? "" : "s") listo\(creados == 1 ? "" : "s")"
+            }
+            if let recorte { self.status += " · \(recorte)" }
         }
+    }
+
+    func cancelarGeneracionDeProxies() {
+        guard generandoProxies else { return }
+        tareaDeProxies?.cancel()
+        status = "Cancelando generación de proxies…"
+    }
+
+    private func invalidarGeneracionDeProxies() {
+        generacionDeProxies += 1
+        tareaDeProxies?.cancel()
+        tareaDeProxies = nil
+        generandoProxies = false
+    }
+
+    func limpiarProxies() {
+        guard !generandoProxies else { return }
+        let idsEnUso = Set(media.map(\.id))
+        let resultado = ProxyService.limpiar(conservando: idsEnUso)
+        proxyURLs = proxyURLs.filter { FileManager.default.fileExists(atPath: $0.value.path) }
+        guard resultado.archivosEliminados > 0 else {
+            status = "La caché de proxies ya está limpia"
+            return
+        }
+        let megabytes = Double(resultado.bytesLiberados) / 1_000_000
+        status = "Caché de proxies limpiada · \(resultado.archivosEliminados) archivo\(resultado.archivosEliminados == 1 ? "" : "s") · \(String(format: "%.1f MB", megabytes)) liberados"
+    }
+
+    /// Recorta la caché al presupuesto tras generar proxies. Se avisa cuando el
+    /// proyecto abierto no cabe, porque ahí el límite no puede cumplirse sin
+    /// borrar material que la preview va a volver a pedir de inmediato.
+    @discardableResult
+    func ajustarCacheDeProxiesAlLimite() -> String? {
+        let bytes = Int64((max(0, limiteDeProxiesGB) * 1_000_000_000).rounded())
+        guard bytes > 0 else { return nil }
+        let resultado = ProxyService.aplicarLimite(bytes: bytes, conservando: Set(media.map(\.id)))
+        proxyURLs = proxyURLs.filter { FileManager.default.fileExists(atPath: $0.value.path) }
+        if resultado.excedeElLimite {
+            return "Los proxies de este proyecto ocupan \(ProxyService.enGigabytes(resultado.bytesRestantes)) y el límite es \(ProxyService.enGigabytes(bytes)). No se ha borrado ninguno en uso."
+        }
+        guard resultado.archivosEliminados > 0 else { return nil }
+        let plural = resultado.archivosEliminados == 1 ? "" : "s"
+        return "caché recortada · \(resultado.archivosEliminados) antiguo\(plural) desalojado\(plural) · \(ProxyService.enGigabytes(resultado.bytesLiberados)) liberados"
+    }
+
+    /// Texto para el menú: qué ocupa la caché y cuánto es desalojable ahora mismo.
+    func resumenDeCacheDeProxies() -> String {
+        let uso = ProxyService.uso(conservando: Set(media.map(\.id)))
+        guard uso.archivos > 0 else { return "Caché vacía" }
+        return "\(uso.archivos) archivo\(uso.archivos == 1 ? "" : "s") · \(ProxyService.enGigabytes(uso.bytesTotales)) · \(ProxyService.enGigabytes(uso.bytesDesalojables)) desalojables"
     }
 
     private func cargarProxiesEnPreview() {
@@ -1834,6 +1914,7 @@ final class EditorState: ObservableObject {
         nombre: String,
         recuperado: Bool
     ) async {
+        invalidarGeneracionDeProxies()
         var cargados: [MediaItem] = []
         var resueltos: [UUID: MedioResuelto] = [:]
         var perdidos: [String] = []
@@ -4477,13 +4558,37 @@ struct ContentView: View {
             Menu("Proxies", systemImage: "gauge.with.dots.needle.67percent") {
                 Button("Generar proxies") { editor.generarProxies() }
                     .disabled(editor.generandoProxies || editor.media.isEmpty)
+                Button("Cancelar generación") { editor.cancelarGeneracionDeProxies() }
+                    .disabled(!editor.generandoProxies)
+                Button("Limpiar proxies no usados") { editor.limpiarProxies() }
+                    .disabled(editor.generandoProxies)
                 Toggle("Usar proxies en preview", isOn: Binding(
                     get: { editor.proxiesActivos },
                     set: { editor.fijarProxies($0) }
                 ))
+                .disabled(editor.generandoProxies)
                 if editor.generandoProxies {
                     ProgressView(value: editor.proxyProgress)
                 }
+                Divider()
+                Text(editor.resumenDeCacheDeProxies())
+                Menu("Límite de la caché") {
+                    Picker("Límite de la caché", selection: $editor.limiteDeProxiesGB) {
+                        Text("Sin límite").tag(0.0)
+                        ForEach([5.0, 10.0, 20.0, 50.0, 100.0], id: \.self) { gb in
+                            Text("\(Int(gb)) GB").tag(gb)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                }
+                Button("Recortar caché al límite ahora") {
+                    if let aviso = editor.ajustarCacheDeProxiesAlLimite() {
+                        editor.status = aviso
+                    } else {
+                        editor.status = "La caché de proxies está dentro del límite"
+                    }
+                }
+                .disabled(editor.generandoProxies || editor.limiteDeProxiesGB <= 0)
             }
             Button("Añadir al timeline", systemImage: "rectangle.stack.badge.plus") { editor.addSelectedMedia() }
                 .disabled(editor.selectedMedia == nil)
