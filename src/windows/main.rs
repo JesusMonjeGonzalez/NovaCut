@@ -14545,8 +14545,8 @@ mod tests {
             ..Default::default()
         };
         let filter = curves_filter(Some(&lifted));
-        assert!(filter.contains("master='0.0000/0.0500 1.0000/1.0000'"));
-        assert!(!filter.contains("r='"));
+        // Solo la curva maestra: los canales identidad no aportan partes.
+        assert_eq!(filter, ",curves=master='0.0000/0.0500 1.0000/1.0000'");
     }
 
     #[test]
@@ -15067,9 +15067,12 @@ mod tests {
 
     #[test]
     fn overwrite_detects_complex_collisions_before_mutating() {
+        // La duración de una secuencia anidada la marcan sus hijos.
         let clips = vec![RoughClip {
-            out_seconds: 5.0,
-            nested: Some(vec![RoughClip::default()]),
+            nested: Some(vec![RoughClip {
+                out_seconds: 5.0,
+                ..Default::default()
+            }]),
             ..Default::default()
         }];
         assert!(span_hits_complex_clip(&clips, 0, true, 1.0, 3.0, &[]));
@@ -15182,8 +15185,11 @@ mod tests {
             source_duration_seconds: source,
             ..Default::default()
         };
+        // El clip entrante dura lo suficiente: la transición se limita a la
+        // mitad de la duración de cada clip implicado.
         let incoming = |timeline_start: f64| RoughClip {
             timeline_start,
+            out_seconds: 4.0,
             transition: Some("dissolve".to_owned()),
             transition_duration: 1.0,
             ..Default::default()
