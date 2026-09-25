@@ -120,6 +120,83 @@ comprobar(xmlApilado.contains("duration=\"10/25s\""), "el tramo libre posterior 
 comprobar(xmlApilado.contains("se recorta") || xmlApilado.contains("recorta"), "la nota documenta el recorte")
 comprobar(xmlApilado.contains("Título «Titulo» omitido") || xmlApilado.contains("Título") , "el título se anota en la nota")
 
+print("— importación de EDL —")
+// Ida y vuelta contra el exportador: lo que sale de un montaje debe volver a
+// entrar con los mismos cortes. Es la única comprobación que no depende de que
+// el formato esté escrito como yo creo que se escribe.
+let edlIda = EDLDeEditorcito.exportar(montaje: montaje, medios: medios, titulo: "Ida y vuelta")
+let vuelta = EDLDeEditorcito.importar(edlIda, timebase: .p25)
+igual(vuelta.titulo, "Ida y vuelta", "recupera el título de la cabecera")
+igual(vuelta.avisos.count, 0, "un EDL propio entra sin avisos")
+let videoVuelta = vuelta.montaje.pistasDeVideo.flatMap(\.clips).sorted { $0.inicio < $1.inicio }
+let audioVuelta = vuelta.montaje.pistasDeAudio.flatMap(\.clips).sorted { $0.inicio < $1.inicio }
+igual(videoVuelta.map(\.inicio), [0, 120, 200], "los cortes de vídeo caen donde estaban")
+igual(videoVuelta.map(\.duracion), [120, 80, 100], "con sus duraciones")
+igual(videoVuelta.map(\.entradaEnOrigen), [0, 0, 10], "y con la entrada en el medio de origen")
+igual(videoVuelta.map(\.nombre), ["Entrevista", "B-roll", "Rampa"], "los nombres viajan en FROM CLIP NAME")
+igual(videoVuelta.last?.velocidad, 2, "la velocidad constante vuelve del comentario de EDL")
+igual(audioVuelta.map(\.inicio), [0, 120, 200, 300], "el audio también, incluido el clip suelto")
+igual(audioVuelta.map(\.duracion), [120, 80, 100, 60], "con sus duraciones")
+igual(audioVuelta.last?.entradaEnOrigen, 40, "y con su entrada en origen")
+comprobar(vuelta.mediosPorReel.count == 3, "un medio por reel, no uno por evento")
+comprobar(Set(vuelta.montaje.pistasDeVideo.flatMap(\.clips).map(\.mediaID)).count == 3, "cada reel conserva su medio")
+let reelDeEntrevista = vuelta.nombresPorReel.first { $0.value == "Entrevista" }?.key
+comprobar(reelDeEntrevista != nil, "cada reel recuerda el nombre con el que llegó")
+
+// Un EDL de otra sala: columnas distintas, M2 real, disolución y canal B.
+let ajeno = """
+TITLE: MONTAJE AJENO
+FCM: NON-DROP FRAME
+
+001  CINTA01 V     C        01:00:00:00 01:00:04:00 00:00:00:00 00:00:04:00
+* FROM CLIP NAME: Plano general
+002  CINTA02 B     D    025 02:00:00:00 02:00:02:00 00:00:04:00 00:00:06:00
+* FROM CLIP NAME: Contraplano
+003  CINTA01 A2    C        01:00:10:00 01:00:12:00 00:00:04:00 00:00:06:00
+M2   CINTA01       050.0    01:00:10:00
+004  CINTA03 V     C        00:00:00:00 00:00:00:00 00:00:06:00 00:00:06:00
+ESTO NO ES UN EVENTO
+"""
+let leido = EDLDeEditorcito.importar(ajeno, timebase: .p25)
+igual(leido.titulo, "MONTAJE AJENO", "lee la cabecera de un EDL ajeno")
+igual(leido.eventos.count, 4, "lee los cuatro eventos pese al espaciado distinto")
+let videoAjeno = leido.montaje.pistasDeVideo.flatMap(\.clips).sorted { $0.inicio < $1.inicio }
+igual(videoAjeno.map(\.inicio), [0, 100], "el canal B deja vídeo en la pista de vídeo")
+igual(videoAjeno.first?.entradaEnOrigen, 90_000, "el timecode de origen a la hora se convierte a frames")
+let a1Ajeno = leido.montaje.pistas.first { $0.nombre == "A1" }?.clips ?? []
+let a2Ajeno = leido.montaje.pistas.first { $0.nombre == "A2" }?.clips ?? []
+igual(a1Ajeno.map(\.inicio), [100], "el canal B deja también audio en A1")
+igual(a2Ajeno.map(\.inicio), [100], "y el canal A2 va a su pista")
+igual(a2Ajeno.first?.velocidad, 2, "M2 a 50 fps sobre 25 fps es el doble de velocidad")
+comprobar(videoAjeno.first?.enlace == nil, "un evento de un solo canal no inventa enlaces")
+comprobar(a1Ajeno.first?.enlace != nil && a1Ajeno.first?.enlace == videoAjeno.last?.enlace,
+          "el canal B enlaza su vídeo con su audio")
+comprobar(leido.avisos.contains { $0.contains("«D»") }, "la disolución entra como corte y se avisa")
+comprobar(leido.avisos.contains { $0.contains("duración no positiva") }, "un evento de duración cero se omite con aviso")
+comprobar(leido.avisos.allSatisfy { !$0.contains("ESTO NO ES UN EVENTO") }, "una línea que no empieza por número se ignora en silencio")
+
+// Solapes en el mismo canal: se reparten en pistas, nunca se pisan.
+let solapado = EDLDeEditorcito.importar("""
+TITLE: SOLAPE
+001  CINTA01 V     C        00:00:00:00 00:00:04:00 00:00:00:00 00:00:04:00
+002  CINTA02 V     C        00:00:00:00 00:00:04:00 00:00:02:00 00:00:06:00
+003  CINTA03 V     C        00:00:00:00 00:00:04:00 00:00:03:00 00:00:07:00
+""", timebase: .p25)
+let pistasConClips = solapado.montaje.pistasDeVideo.filter { !$0.clips.isEmpty }
+igual(pistasConClips.count, 3, "tres eventos solapados ocupan tres pistas")
+comprobar(pistasConClips.allSatisfy { $0.clips.count == 1 }, "ninguna pista queda con clips que se pisan")
+
+// Drop frame y timebase: la cabecera manda sobre la del proyecto.
+let df = EDLDeEditorcito.importar("FCM: DROP FRAME\n001  A V C 00:00:00;00 00:00:01;00 00:00:00;00 00:00:01;00", timebase: .ntsc30)
+comprobar(df.montaje.timebase.dropFrame, "FCM DROP FRAME activa el drop frame en NTSC")
+let dfImposible = EDLDeEditorcito.importar("FCM: DROP FRAME\n001  A V C 00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00", timebase: .p25)
+comprobar(!dfImposible.montaje.timebase.dropFrame, "a 25 fps no hay drop frame")
+comprobar(dfImposible.avisos.contains { $0.contains("DROP FRAME") }, "y se dice en vez de fingirlo")
+
+let vacio = EDLDeEditorcito.importar("", timebase: .p25)
+comprobar(vacio.montaje.pistas.allSatisfy { $0.clips.isEmpty } && vacio.avisos.isEmpty, "un archivo vacío no rompe nada")
+comprobar(EDLDeEditorcito.importar("basura sin formato", timebase: .p25).eventos.isEmpty, "un archivo que no es EDL no produce eventos")
+
 if fallos == 0 {
     print("INTERCAMBIO CORRECTO")
 } else {

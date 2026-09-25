@@ -11,6 +11,35 @@ import QuartzCore
 private let kCIInputNeutral = "inputNeutral"
 private let kCIInputTargetNeutral = "inputTargetNeutral"
 
+/// Resumen del reloj de presentación de una pista de vídeo.
+///
+/// Los PTS pueden llegar desordenados por los B-frames, por eso el análisis se
+/// hace después de ordenar y deduplicar. Un solo hueco ya es suficiente para
+/// tratar el medio como VFR: dejarlo pasar acumula un frame de deriva respecto
+/// al audio aunque el porcentaje total de huecos sea insignificante.
+struct ResumenDePTS: Equatable {
+    let cantidadDeFrames: Int
+    let deltaMediano: Double
+    let desvioMaximo: Double
+    let huecos: Int
+    let variaciones: Int
+
+    var esVFR: Bool {
+        guard cantidadDeFrames > 1, deltaMediano > 0 else { return false }
+        let cantidadDeDeltas = Double(max(1, cantidadDeFrames - 1))
+        return huecos > 0 || Double(variaciones) / cantidadDeDeltas > 0.05
+    }
+
+    func esCFR(para timebase: Timebase) -> Bool {
+        guard cantidadDeFrames > 1, deltaMediano > 0 else { return false }
+        let esperado = timebase.tiempo(1).seconds
+        let tolerancia = esperado * 0.05
+        return abs(deltaMediano - esperado) <= tolerancia
+            && huecos == 0
+            && desvioMaximo <= tolerancia
+    }
+}
+
 /// Un medio con todo lo que hace falta saber de él ya resuelto.
 ///
 /// Se prepara una sola vez al importar porque en AVFoundation moderno leer una
@@ -77,7 +106,10 @@ struct MedioResuelto {
     var tieneVideo: Bool { pistaDeVideo != nil }
     var tieneAudio: Bool { pistaDeAudio != nil }
     var estaConformado: Bool {
-        assetDeMontaje != nil && pistaDeVideoDeMontaje != nil && timebaseDeMontaje != nil
+        assetDeMontaje != nil
+            && pistaDeVideoDeMontaje != nil
+            && (!tieneAudio || pistaDeAudioDeMontaje != nil)
+            && timebaseDeMontaje != nil
     }
     var assetParaMontaje: AVURLAsset { assetDeMontaje ?? asset }
     var pistaDeVideoParaMontaje: AVAssetTrack? { pistaDeVideoDeMontaje ?? pistaDeVideo }
@@ -118,43 +150,76 @@ struct MedioResuelto {
     /// comparar la duración mínima de frame contra la nominal no ve las
     /// grabaciones con caídas de frames (Screen Recording de macOS graba a 60
     /// y suelta fotogramas bajo carga: la duración mínima sigue siendo 1/60 y
-    /// nadie nota nada). Aquí se leen los tiempos de presentación de una
-    /// ventana inicial —solo demultiplexa, no decodifica— y se mide la variación
-    /// de los deltas: tanto un jitter sostenido como un salto de 1,5× son VFR,
-    /// aunque el primero no llegue a parecer un hueco.
+    /// nadie nota nada). Se leen todos los tiempos de presentación —solo
+    /// demultiplexa, no decodifica— para no perder un hueco que esté después de
+    /// la ventana inicial.
     static func esCadenciaVFR(pista: AVAssetTrack) async -> Bool {
-        let minimo = (try? await pista.load(.minFrameDuration)) ?? .invalid
-        if !minimo.isNumeric || minimo.value <= 0 { return true }
-        guard let asset = pista.asset, let lector = try? AVAssetReader(asset: asset) else { return false }
+        guard let marcas = await marcasDePresentacion(pista: pista),
+              marcas.count > 30,
+              let resumen = resumenDePTS(marcas) else {
+            // Si no se puede inspeccionar el reloj, no se debe convertir esa
+            // falta de evidencia en una falsa garantía de sincronía. Un clip muy
+            // corto tampoco aporta suficientes muestras para declararlo CFR.
+            return true
+        }
+        return resumen.esVFR
+    }
+
+    /// Lee los PTS sin decodificar imágenes. El resultado se ordena porque los
+    /// samples comprimidos pueden entregarse en orden de decode y no de
+    /// presentación.
+    static func marcasDePresentacion(pista: AVAssetTrack) async -> [Double]? {
+        guard let asset = pista.asset,
+              let lector = try? AVAssetReader(asset: asset) else { return nil }
         let salida = AVAssetReaderTrackOutput(track: pista, outputSettings: nil)
+        guard lector.canAdd(salida) else { return nil }
         lector.add(salida)
-        guard lector.startReading() else { return false }
+        guard lector.startReading() else { return nil }
 
         var pts = [Double]()
-        let tope = 400
-        while lector.status == .reading, let sb = salida.copyNextSampleBuffer(), pts.count < tope {
-            let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
-            if t.isFinite { pts.append(t) }
+        while lector.status == .reading, let buffer = salida.copyNextSampleBuffer() {
+            let tiempo = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(buffer))
+            if tiempo.isFinite { pts.append(tiempo) }
         }
+        let lecturaCompleta = lector.status == .completed
         lector.cancelReading()
-        guard pts.count > 30 else { return false }
+        return lecturaCompleta ? pts : nil
+    }
 
-        pts.sort()
+    /// Resume una lista de PTS para que la detección y la validación del
+    /// intermediario compartan exactamente las mismas reglas.
+    static func resumenDePTS(_ pts: [Double]) -> ResumenDePTS? {
+        let ordenados = pts.filter(\.isFinite).sorted()
+        guard ordenados.count > 1 else { return nil }
+
         var unicos = [Double]()
-        for t in pts where unicos.last.map({ t - $0 > 1e-6 }) ?? true { unicos.append(t) }
-        guard unicos.count > 10 else { return false }
+        unicos.reserveCapacity(ordenados.count)
+        for tiempo in ordenados {
+            if let ultimo = unicos.last, tiempo - ultimo <= 1e-6 { continue }
+            unicos.append(tiempo)
+        }
+        guard unicos.count > 1 else { return nil }
 
         var deltas = [Double]()
-        for i in 1..<unicos.count { deltas.append(unicos[i] - unicos[i - 1]) }
-        let ordenados = deltas.sorted()
-        let mediana = ordenados[ordenados.count / 2]
-        guard mediana > 0 else { return false }
-        var huecos = 0
-        for d in deltas where d > mediana * 1.5 { huecos += 1 }
-        let variaciones = deltas.filter { abs($0 - mediana) > mediana * 0.02 }.count
-        let proporcionDeHuecos = Double(huecos) / Double(deltas.count)
-        let proporcionVariable = Double(variaciones) / Double(deltas.count)
-        return proporcionDeHuecos > 0.02 || proporcionVariable > 0.05
+        deltas.reserveCapacity(unicos.count - 1)
+        for indice in 1..<unicos.count {
+            let delta = unicos[indice] - unicos[indice - 1]
+            if delta > 0, delta.isFinite { deltas.append(delta) }
+        }
+        guard !deltas.isEmpty else { return nil }
+
+        let mediana = deltas.sorted()[deltas.count / 2]
+        guard mediana > 0, mediana.isFinite else { return nil }
+        let huecos = deltas.count(where: { $0 > mediana * 1.5 })
+        let variaciones = deltas.count(where: { abs($0 - mediana) > mediana * 0.02 })
+        let desvioMaximo = deltas.map { abs($0 - mediana) }.max() ?? .infinity
+        return ResumenDePTS(
+            cantidadDeFrames: unicos.count,
+            deltaMediano: mediana,
+            desvioMaximo: desvioMaximo,
+            huecos: huecos,
+            variaciones: variaciones
+        )
     }
 
     /// Captura una imagen pequeña para identificar el medio sin decodificarlo en

@@ -156,6 +156,52 @@ cuantiza cada fuente a la base racional del proyecto.
 - Ejecutar el binario Windows en CI/host Windows y validar filtros FFmpeg con
   archivos VFR reales, incluido un caso de claqueta post-exportación.
 
+## Tanda 2026-09-04 - cierre del writer CFR macOS
+
+### Objetivo
+
+Eliminar la dependencia del exportador de alto nivel para el conformado VFR:
+materializar cada frame objetivo con PTS CFR explícito, conservar el audio original
+y detener cualquier entrega cuya caché no sea íntegra.
+
+### Cambios
+
+- `src/ui/Composicion.swift`: el análisis de PTS recorre toda la pista, ordena y
+  deduplica las marcas, detecta huecos aislados y valida la cadencia del
+  intermediario contra el `Timebase` racional.
+- `src/ui/ConformadoVFR.swift`: writer H.264 con frames CFR explícitos, passthrough
+  de audio, validación de duración/rangos/PTS A/V e invalidación mediante la clave
+  `cfr-writer-v3`.
+- `src/ui/App.swift` y `src/ui/Nidos.swift`: exportación y nidos fallan cerrados
+  si algún medio VFR no termina de conformarse.
+- `tests/vfr/main.swift` y `probar-corpus.sh`: hueco posterior al frame 400,
+  selección del timebase más cercano y continuidad de muestras PCM.
+- `tests/proyecto/main.swift` y `probar.sh`: migración v1, round-trip JSON,
+  rutas relativas, fallback por nombre y medios offline.
+- `src/ui/Proxies.swift` y `src/ui/App.swift`: cancelación de generación y limpieza
+  manual de proxies huérfanos, sin tocar los del proyecto actual.
+
+### Evidencia
+
+- `./build-mac.sh`: correcto; genera `build/Editorcito.app` con warnings Swift
+  conocidos.
+- `./probar-corpus.sh build/corpus`: `SINCRONÍA CORRECTA` y `CADENCIA CORRECTA`.
+- `./probar.sh build/corpus/vfr-clap-h264.mov`: todas las suites correctas;
+  VFR a 29.970 fps DF con audio conservado y alineado.
+- `./probar.sh "tests/corpus/Grabación de pantalla 2026-07-29 a las 17.29.27.mov"`:
+  todas las suites correctas; VFR real a 50 fps conformado y decodificable.
+- `./build/pruebas/pruebaProyecto`: `PROYECTO CORRECTO`; migración, persistencia y
+  resolución de medios portables correctas.
+- `./build/pruebas/pruebaProxies`: `PROXIES CORRECTO`; limpieza segura y cálculo de
+  bytes liberados correctos.
+- `git diff --check`: correcto.
+
+### Límite
+
+La evidencia cubre el corpus golden y grabaciones reales locales. La validación
+profesional con un corpus legal y heterogéneo de móviles, OBS, grabadoras externas,
+codecs y archivos dañados sigue abierta.
+
 ## Formato de cada actualizacion
 
 Cada entrada nueva debe incluir:

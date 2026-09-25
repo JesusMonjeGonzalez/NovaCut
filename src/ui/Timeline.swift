@@ -21,8 +21,10 @@ struct Timebase: Codable, Hashable, Sendable {
         self.numerador = max(1, numerador)
         self.denominador = max(1, denominador)
         // El drop frame solo tiene sentido —y solo está definido— en las cadencias
-        // NTSC, donde el denominador es 1001.
-        self.dropFrame = dropFrame ?? (denominador == 1001)
+        // NTSC, donde el denominador es 1001. Pedirlo fuera de ahí no se acepta:
+        // un timecode con «;» a 25 fps no describe ningún reloj real. El NTSC sin
+        // drop frame sí existe, así que ese sí se respeta.
+        self.dropFrame = self.denominador == 1001 ? (dropFrame ?? true) : false
     }
 
     static let p24 = Timebase(numerador: 24, denominador: 1)

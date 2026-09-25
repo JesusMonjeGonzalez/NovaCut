@@ -37,6 +37,17 @@ guard argumentos.count == 2 else {
 
 let url = URL(fileURLWithPath: argumentos[1])
 let id = UUID()
+
+let ptsCFR = (0..<480).map { Double($0) / 30.0 }
+var ptsConHueco = ptsCFR
+ptsConHueco.remove(at: 420)
+let resumenCFR = MedioResuelto.resumenDePTS(ptsCFR)
+let resumenConHueco = MedioResuelto.resumenDePTS(ptsConHueco)
+comprobar(resumenCFR?.esVFR == false, "una cadencia constante no se marca como VFR")
+comprobar(resumenCFR?.esCFR(para: .p30) == true, "la cadencia constante coincide con el timebase objetivo")
+comprobar(resumenConHueco?.huecos == 1, "se detecta un hueco aislado de PTS")
+comprobar(resumenConHueco?.esVFR == true, "un hueco posterior a los primeros 400 frames no se pierde")
+
 let medio: MedioResuelto
 do {
     medio = try await MedioResuelto.cargar(id: id, url: url)
@@ -51,7 +62,7 @@ guard medio.esVFR else {
     exit(1)
 }
 
-let timebase = Timebase.p30
+let timebase = Timebase.habituales.min { abs($0.fps - medio.fps) < abs($1.fps - medio.fps) } ?? .p25
 let primera = await ConformadorVFR.preparar(medios: [id: medio], para: timebase)
 comprobar(primera.fallos.isEmpty, "el conformado termina sin fallos")
 comprobar(primera.conformados == 1, "se crea un intermediario CFR")
@@ -81,7 +92,9 @@ do {
     let videoDuration = try await video?.load(.timeRange).duration.seconds ?? 0
     let audioDuration = try await audio?.load(.timeRange).duration.seconds ?? 0
     comprobar(videoDuration > 0, "la salida tiene duración de vídeo válida")
-    if audio != nil {
+    if medio.tieneAudio {
+        comprobar(audio != nil, "la salida conserva la pista de audio original")
+        comprobar(audioDuration > 0, "la salida tiene duración de audio válida")
         comprobar(abs(videoDuration - audioDuration) <= esperado, "audio y vídeo quedan alineados dentro de un frame")
     } else {
         print("  -  sin audio: no se mide duración A/V")

@@ -13,3 +13,8 @@ pub use render_graph::{RenderGraph, Node, NodeType};
 pub use decode::{Decoder, DecoderConfig, FrameInfo};
 pub use encoder::{Encoder, EncoderPreset, ExportFormat};
 pub use timebase::Timebase;
+
+pub mod edl;
+pub mod proxy_cache;
+pub mod relink;
+pub mod subtitles;

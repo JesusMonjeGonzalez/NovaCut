@@ -98,6 +98,72 @@ pendiente en documentación competitiva.
   capas, `<note>` con limitaciones), con «Exportar EDL…» y «Exportar FCPXML…»
   en Archivo. 28 comprobaciones nuevas; `probar.sh` pasa 502.
 
+## Hecho el 4 de septiembre de 2026
+
+- **Conformado VFR macOS** (`src/ui/ConformadoVFR.swift`): writer H.264 con PTS
+  CFR explícitos, audio original conservado, validación de caché y bloqueo cerrado
+  de exportación/nidos si el intermediario no es íntegro. Verificado con el corpus
+  golden y grabaciones reales locales.
+- **Proyecto portable** (`src/ui/Proyecto.swift`): el arnés cubre migración v1,
+  round-trip v2, rutas relativas, fallback por nombre y medios offline; `probar.sh`
+  lo ejecuta y CI incluye el conformado VFR con audio.
+- **Proxies cancelables** (`src/ui/Proxies.swift` y `src/ui/App.swift`): la
+  generación se cancela de forma cooperativa y el menú limpia proxies huérfanos
+  sin tocar los del proyecto actual.
+
+## Hecho el 7 de septiembre de 2026
+
+- **Banco de subtítulos en los dos hosts** (`src/ui/PanelDeSubtitulos.swift`,
+  `src/core/subtitles.rs`): búsqueda literal sobre el texto de los cues y
+  sincronización global por milisegundos o alineando el primero al cabezal. El
+  desplazamiento se valida entero antes de aplicarse, así que un ajuste que dejaría
+  cues antes del inicio se rechaza sin dejar el documento a medio resincronizar.
+  macOS añade alta, edición, borrado y salto al cue, cada uno un solo paso de deshacer.
+- **Presupuesto de la caché de proxies** (`src/ui/Proxies.swift`,
+  `src/core/proxy_cache.rs`): límite de disco configurable con desalojo del menos
+  usado recientemente, que se detiene en cuanto la caché cabe. Los proxies del
+  proyecto abierto nunca se desalojan y el exceso se avisa. En Windows el barrido se
+  limita al sufijo `-proxy.mp4`, para no tocar material del usuario en esa carpeta.
+  Cierra el pendiente de límite automático de espacio.
+- **Identidad del proxy atada al medio, no al clip**: en Windows el nombre era
+  `{medio}-{índice}-proxy.mp4`, así que reordenar o borrar clips podía enlazar un
+  proxy con otro vídeo. Ahora el nombre lleva la huella del medio (ruta, tamaño y
+  fecha), dos clips del mismo archivo comparten proxy sin recodificar, y un medio
+  sustituido en disco se marca `PROXY DESACTUALIZADO` en vez de mostrar contenido
+  caducado. macOS cacheaba por UUID persistido en el proyecto y tenía el mismo
+  defecto: el nombre lleva ahora la huella y la versión anterior se retira al
+  regenerar. Los nombres antiguos se siguen leyendo, así que ningún proyecto
+  guardado pierde su proxy.
+- **Revinculación en lote** (`src/ui/Revinculacion.swift`, `src/core/relink.rs`): una
+  carpeta y una sola pasada resuelven todos los medios offline. El desempate es
+  determinista —tamaño, luego profundidad, luego orden alfabético— para que dos
+  búsquedas sobre la misma carpeta no elijan archivos distintos. El recorrido tiene
+  tope y lo avisa en vez de colgarse recorriendo un disco entero, y no sigue enlaces
+  simbólicos. Avanza el pendiente de «media offline/relink» de la sección Ahora.
+- **Importación de EDL** (`src/ui/Intercambio.swift`): el intercambio deja de ser de
+  ida. Se leen cortes, timecodes de origen y montaje, canales V/A/B/AA, nombres y
+  velocidad constante por `M2` o comentario. La verificación es la ida y vuelta contra
+  el exportador, que es lo único que no depende de que yo haya entendido bien el
+  formato. Los eventos solapados se reparten en pistas y los medios entran offline
+  para resolverlos con la revinculación en lote. Falta el mismo trabajo en Windows.
+- **Drop frame imposible corregido en el modelo**: `Timebase` aceptaba
+  `dropFrame: true` a 25 fps y producía timecodes con `;` que no describen ningún
+  reloj. Ahora solo se admite donde está definido, en las cadencias NTSC.
+- **EDL en Windows, sobre el núcleo compartido** (`src/core/edl.rs`): el host de
+  Windows exporta e importa CMX 3600. El formato vive en el core en frames, sin saber
+  nada del modelo de cada host, así que la ida y vuelta se ejecuta en `cargo test --lib`
+  en cualquier sistema; el mapeo proyecto↔EDL se prueba aparte en el host. Los cortes
+  importados se reparten en pistas para no solaparse y lo que el formato no lleva se
+  enumera al exportar.
+- **CI que ejecutaba menos de lo que parecía**: el flujo solo compilaba en macOS. Ni las
+  pruebas del núcleo en Rust ni las del host de Windows se ejecutaban en ningún sitio.
+  Añadidos `cargo test --lib` al trabajo de macOS y un trabajo de Windows que compila y
+  pasa las pruebas del host.
+- **Drop frame imposible, también en el núcleo**: `Timebase::new` aceptaba drop frame
+  fuera de NTSC, igual que el modelo de macOS. Corregido en los dos.
+- `./probar.sh` pasa 653 comprobaciones; `cargo test --lib`, 52; el host de Windows suma
+  tres pruebas propias que ahora sí se ejecutan en CI.
+
 ## Ahora
 
 - Validar VFR, PTS y sincronización A/V con material legal y heterogéneo.

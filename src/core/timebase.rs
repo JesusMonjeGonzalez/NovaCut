@@ -79,10 +79,15 @@ impl Timebase {
             return Err("Timebase numerator and denominator must be greater than zero".to_owned());
         }
         let divisor = gcd(numerator, denominator);
+        let denominator = denominator / divisor;
         Ok(Self {
             numerator: numerator / divisor,
-            denominator: denominator / divisor,
-            drop_frame,
+            denominator,
+            // El drop frame solo esta definido en las cadencias NTSC, donde el
+            // denominador es 1001. Un timecode con ';' a 25 fps no describe
+            // ningun reloj real, asi que no se acepta. El NTSC sin drop frame
+            // si existe y se respeta.
+            drop_frame: drop_frame && denominator == 1001,
         })
     }
 
