@@ -25,7 +25,7 @@ parking_lot = "0.12"
 # El host se distribuye para Windows, pero compila también en macOS/Linux
 # para poder ejecutar sus pruebas y abrirlo durante el desarrollo.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] , optional = true }
-rfd = { version = "0.15", optional = true }
+rfd = { version = "0.17", optional = true }
 rodio = { version = "0.20", optional = true, default-features = false }
 # Mide el texto de los subtítulos animados con la misma fuente que drawtext.
 # Ya lo trae egui: no añade descargas.
