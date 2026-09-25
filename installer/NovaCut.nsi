@@ -3,6 +3,7 @@ Unicode True
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+!include "Sections.nsh"
 
 !define APP_NAME "NovaCut"
 ; build-windows.ps1 pasa la version de Cargo.toml con /DAPP_VERSION=x.y.z
@@ -50,6 +51,9 @@ Section "NovaCut (obligatorio)" SEC_APP
     SetOutPath "$INSTDIR"
     File "..\build\NovaCut-Windows\novacut-windows.exe"
     File /oname=LEEME-WINDOWS.md "..\docs\GUIA-WINDOWS.md"
+    File "..\LICENSE"
+    File "..\THIRD_PARTY_NOTICES.md"
+    File "..\docs\licenses\THIRD_PARTY_LICENSES-Windows.html"
     File "ffmpeg-install.ps1"
     WriteUninstaller "$INSTDIR\Desinstalar-NovaCut.exe"
     WriteRegStr HKCU "Software\NovaCut" "InstallDir" "$INSTDIR"
@@ -85,7 +89,13 @@ Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
     nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR"'
     Pop $0
     ${If} $0 <> 0
+        IfSilent ffmpeg_silent_failure
         MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo descargar FFmpeg (revisa la conexion). NovaCut se ha instalado igualmente: al abrirlo te ofrecera instalar FFmpeg con un boton."
+        Goto ffmpeg_failure_done
+        ffmpeg_silent_failure:
+        DetailPrint "No se pudo instalar FFmpeg."
+        SetErrorLevel 1
+        ffmpeg_failure_done:
     ${EndIf}
 SectionEnd
 
@@ -102,8 +112,12 @@ Function ${un}ExigirNovaCutCerrado
     reintentar:
     nsExec::ExecToStack 'cmd /c tasklist /FI "IMAGENAME eq ${APP_EXE}" /NH | find /I "${APP_EXE}"'
     Pop $0
+    Pop $1
     ${If} $0 == 0
+        IfSilent app_abierta_silent
         MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "NovaCut esta abierto. Cierralo (guardando tu trabajo) y pulsa Reintentar." IDRETRY reintentar
+        app_abierta_silent:
+        SetErrorLevel 1
         Abort
     ${EndIf}
 FunctionEnd
@@ -113,6 +127,12 @@ FunctionEnd
 
 Function .onInit
     Call ExigirNovaCutCerrado
+    ${GetParameters} $0
+    ClearErrors
+    ${GetOptions} $0 "/NOFFMPEG" $1
+    ${IfNot} ${Errors}
+        !insertmacro UnselectSection ${SEC_FFMPEG}
+    ${EndIf}
 FunctionEnd
 
 Function un.onInit
@@ -128,6 +148,9 @@ Section "Uninstall"
     DeleteRegKey HKCU "Software\NovaCut"
     Delete "$INSTDIR\${APP_EXE}"
     Delete "$INSTDIR\LEEME-WINDOWS.md"
+    Delete "$INSTDIR\LICENSE"
+    Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
+    Delete "$INSTDIR\THIRD_PARTY_LICENSES-Windows.html"
     Delete "$INSTDIR\ffmpeg-install.ps1"
     Delete "$INSTDIR\ffmpeg.exe"
     Delete "$INSTDIR\ffprobe.exe"

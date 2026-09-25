@@ -21,6 +21,7 @@ New-Item $output -ItemType Directory | Out-Null
 Copy-Item "target\release\novacut-windows.exe" $output
 Copy-Item "target\release\editorcito.dll" $output -ErrorAction SilentlyContinue
 Copy-Item "docs\GUIA-WINDOWS.md" (Join-Path $output "LEEME-WINDOWS.md")
+Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md", "docs\licenses\THIRD_PARTY_LICENSES-Windows.html" $output
 
 Write-Host "NovaCut Windows ready: $output"
 

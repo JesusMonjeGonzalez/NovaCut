@@ -19,6 +19,10 @@ jobs:
   secrets:
     uses: ./.github/workflows/secrets.yml
 
+  verify-macos:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
+    uses: ./.github/workflows/build.yml
+
   build:
     runs-on: windows-latest
     steps:
@@ -43,6 +47,11 @@ jobs:
       - name: Verify packaging failure gates
         shell: pwsh
         run: ./tests/build-windows.ps1
+      # El instalador de FFmpeg se prueba con el PowerShell 5.1 real y sin red:
+      # hash incorrecto, archivos ausentes y rollback de sustituciones.
+      - name: Verify FFmpeg installer gates
+        shell: powershell
+        run: ./tests/ffmpeg-install.ps1
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
@@ -65,6 +74,10 @@ jobs:
           $env:PATH = "$env:RUNNER_TEMP\ffmpeg;$env:PATH"
           cargo test --locked --features windows-host --bin novacut-windows render_real -- --skip text_based_editing
           if ($LASTEXITCODE -ne 0) { throw "Real render tests failed" }
+      # Solo en la VM desechable de Actions: toca HKCU y accesos directos.
+      - name: Verify package install, launch and uninstall
+        shell: pwsh
+        run: ./tests/package-windows.ps1 -DisposableVM
       - name: Upload portable Windows application
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -86,6 +99,8 @@ jobs:
           persist-credentials: false
       - name: Package universal macOS application
         run: ./package-mac.sh
+      - name: Verify macOS package
+        run: ./tests/package-mac.sh
       - name: Upload macOS application
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -94,7 +109,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [build, macos, secrets]
+    needs: [build, macos, secrets, verify-macos]
     if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' && inputs.publish_tag != '' && inputs.publish_tag == github.ref_name
     runs-on: ubuntu-24.04
     permissions:

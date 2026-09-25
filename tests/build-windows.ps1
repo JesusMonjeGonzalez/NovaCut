@@ -9,11 +9,14 @@ try {
     foreach ($failAt in 1, 2, 3, 0) {
         $case = Join-Path $sandbox "case-$failAt"
         New-Item (Join-Path $case "target/release") -ItemType Directory -Force | Out-Null
-        New-Item (Join-Path $case "docs") -ItemType Directory -Force | Out-Null
+        New-Item (Join-Path $case "docs/licenses") -ItemType Directory -Force | Out-Null
         New-Item (Join-Path $case "build/NovaCut-Windows") -ItemType Directory -Force | Out-Null
         Copy-Item $source (Join-Path $case "build-windows.ps1")
         Set-Content (Join-Path $case "target/release/novacut-windows.exe") "stale executable"
         Set-Content (Join-Path $case "docs/GUIA-WINDOWS.md") "test guide"
+        Set-Content (Join-Path $case "docs/licenses/THIRD_PARTY_LICENSES-Windows.html") "test license report"
+        Set-Content (Join-Path $case "LICENSE") "test license"
+        Set-Content (Join-Path $case "THIRD_PARTY_NOTICES.md") "test notices"
         $sentinel = Join-Path $case "build/NovaCut-Windows/previous-package.txt"
         Set-Content $sentinel "keep previous package"
 
@@ -56,6 +59,11 @@ try {
             }
             if (-not (Test-Path (Join-Path $case "build/NovaCut-Windows/LEEME-WINDOWS.md"))) {
                 throw "Successful package is missing its guide"
+            }
+            foreach ($notice in "LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES-Windows.html") {
+                if (-not (Test-Path (Join-Path $case "build/NovaCut-Windows/$notice"))) {
+                    throw "Successful package is missing $notice"
+                }
             }
         }
         Write-Host "PASS: Cargo failure stage $failAt (0 = successful build)"

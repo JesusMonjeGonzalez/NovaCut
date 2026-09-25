@@ -5,6 +5,11 @@ Descarga siempre desde la página de **Releases** del repositorio:
 
 NovaCut es una alpha de ingeniería: guarda copia de tus originales.
 
+La última prerelease publicada es **v0.1.1**: su paquete macOS se llama
+`NovaCut-macOS-arm64.zip`, solo admite Apple Silicon y no incluye
+`SHA256SUMS.txt`. Las instrucciones del paquete universal y las sumas de
+comprobación siguientes corresponden a **0.2.0, todavía no publicada**.
+
 ## Windows 10 / 11 (64 bits)
 
 **Requisitos:** Windows 10 u 11 de 64 bits, un controlador de tarjeta gráfica
@@ -14,8 +19,9 @@ actualizado (OpenGL 2.0 o superior; cualquier Intel, AMD o NVIDIA de los
 
 1. Descarga **`NovaCut-Windows-Setup.exe`**.
 2. Ábrelo. Windows mostrará **«Windows protegió tu PC»**: el instalador no está
-   firmado con un certificado de pago, no porque tenga nada raro. Pulsa
-   **«Más información» → «Ejecutar de todas formas»**.
+   firmado con un certificado de editor. Esto impide verificar su identidad;
+   no es una garantía de seguridad. Solo si has verificado la procedencia y
+   aceptas ese riesgo, pulsa **«Más información» → «Ejecutar de todas formas»**.
 3. Sigue el asistente. No pide permisos de administrador: se instala solo para
    tu usuario. Deja marcada la casilla **«Motor multimedia FFmpeg»**: la
    descarga, comprueba su suma SHA-256 y la deja junto a NovaCut.
@@ -60,14 +66,18 @@ No viene incluido por el tamaño de los modelos:
    - **macOS 14 Sonoma:** clic derecho sobre NovaCut → **Abrir** → **Abrir**.
    - **macOS 15 o posterior:** intenta abrirla, luego ve a **Ajustes del
      Sistema → Privacidad y seguridad** y pulsa **«Abrir igualmente»**.
-   - Alternativa en Terminal: `xattr -dr com.apple.quarantine /Applications/NovaCut.app`
+
+La firma local no autentica al editor. No elimines la cuarentena desde Terminal;
+comprueba la procedencia antes de autorizar la apertura en los ajustes de macOS.
 
 La app de macOS no necesita FFmpeg: usa AVFoundation. Solo pide permiso de
 reconocimiento de voz si usas la transcripción.
 
 ## Comprobar la descarga
 
-Cada release incluye `SHA256SUMS.txt`. En Windows (PowerShell):
+La candidata 0.2.0 genera `SHA256SUMS.txt`; las releases anteriores no lo
+incluyen. Una suma verifica integridad, no la identidad del editor.
+Si la release incluye el manifiesto, en Windows (PowerShell):
 
 ```powershell
 Get-FileHash .\NovaCut-Windows-Setup.exe -Algorithm SHA256

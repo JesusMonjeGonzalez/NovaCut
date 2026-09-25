@@ -28,6 +28,11 @@
 
 Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
 
+The latest published prerelease is **v0.1.1**. Its macOS download is
+`NovaCut-macOS-arm64.zip` (Apple Silicon only), and it does not include
+`SHA256SUMS.txt`. Version **0.2.0 is an unpublished candidate**; the universal
+macOS package and checksum manifest below describe that candidate, not v0.1.1.
+
 | System | File | First launch |
 |---|---|---|
 | Windows 10/11 x64 | `NovaCut-Windows-Setup.exe` (or the portable `NovaCut-Windows-x64.zip`) | SmartScreen: *More info → Run anyway*. The installer fetches FFmpeg and verifies its SHA-256. |
@@ -234,13 +239,15 @@ remote provider.
 ## Current Limits
 
 - Engineering alpha, not a production NLE replacement.
-- Apple Silicon and Spanish-first UI only.
+- Published macOS builds are Apple Silicon only; the 0.2.0 candidate packages
+  a universal binary, but Intel runtime validation remains pending. Spanish-first UI.
 - VFR with dropped frames is detected from PTS. macOS uses a cached CFR
   intermediary before composition; Windows has the PTS scan and rational CFR
   filter path, but Windows-host runtime validation remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
-- Proxy cleanup and storage limits are implemented on macOS; Windows wiring and packaged releases remain unfinished.
+- Proxy cleanup and storage limits are implemented on both hosts; distribution
+  of the 0.2.0 candidate remains pending release validation.
 - No automated UI suite for recovery, relinking or export cancellation.
 - Premiere, Resolve and Final Cut opening have not been verified in this repository.
 - Swift concurrency and deprecated AVFoundation warnings remain migration work.

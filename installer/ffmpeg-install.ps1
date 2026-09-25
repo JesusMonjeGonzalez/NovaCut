@@ -17,10 +17,17 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = `
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$source = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+$release = '9.0.2'
+$source = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$release-essentials_build.zip"
+# SHA256 upstream consultado el 2026-09-25:
+# https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256
+# No descargar el hash durante la instalacion: forma parte de la version revisada.
+$expected = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
 $work = Join-Path $env:TEMP ('novacut-ffmpeg-' + [guid]::NewGuid())
-New-Item $work -ItemType Directory -Force | Out-Null
-New-Item $InstallDir -ItemType Directory -Force | Out-Null
+$backup = $null
+$keepBackup = $false
+$touched = @()
+$originals = @{}
 
 function Get-WithRetry([string]$Uri, [string]$OutFile) {
     for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -38,37 +45,77 @@ function Get-WithRetry([string]$Uri, [string]$OutFile) {
 }
 
 try {
+    New-Item $work -ItemType Directory | Out-Null
     $zip = Join-Path $work 'ffmpeg.zip'
     Write-Host 'Descargando FFmpeg (~100 MB)...'
     Get-WithRetry $source $zip | Out-Null
 
-    # Integridad: gyan.dev publica el SHA-256 de cada paquete. Detecta
-    # descargas cortadas o corruptas antes de instalar nada.
-    $published = (Get-WithRetry "$source.sha256" $null).Content
-    if ($published -is [byte[]]) { $published = [Text.Encoding]::ASCII.GetString($published) }
-    $expected = ($published.Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($expected -notmatch '^[0-9a-f]{64}$') { throw 'La suma SHA-256 publicada no es valida' }
     if ($actual -ne $expected) { throw 'La descarga de FFmpeg esta corrupta (SHA-256 distinto); vuelve a intentarlo' }
 
     $unzip = Join-Path $work 'x'
     Expand-Archive -Path $zip -DestinationPath $unzip -Force
-    $bin = Get-ChildItem $unzip -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
-    if (-not $bin) { throw 'El paquete descargado no contiene ffmpeg.exe' }
-
-    foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe') {
-        Copy-Item (Join-Path $bin.DirectoryName $name) $InstallDir -Force
+    $root = Join-Path $unzip "ffmpeg-$release-essentials_build"
+    $names = @('ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt')
+    $staged = @{}
+    foreach ($name in $names) {
+        $relative = if ($name -eq 'FFmpeg-LICENSE.txt') { 'LICENSE' } else { "bin/$name" }
+        $path = Join-Path $root $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-Item -LiteralPath $path).Length -eq 0) {
+            throw "El paquete descargado no contiene un archivo valido: $relative"
+        }
+        $staged[$name] = $path
     }
-    # FFmpeg es GPL: su licencia viaja con los binarios.
-    $license = Get-ChildItem $unzip -Recurse -Filter 'LICENSE*' | Select-Object -First 1
-    if ($license) { Copy-Item $license.FullName (Join-Path $InstallDir 'FFmpeg-LICENSE.txt') -Force }
+    foreach ($name in $names[0..2]) {
+        $process = Start-Process -FilePath $staged[$name] -ArgumentList '-hide_banner', '-version' -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -ne 0) { throw "$name no arranca en staging" }
+    }
 
-    # Se recoge la salida entera: cortar la tuberia (Select-Object -First)
-    # mata el proceso y deja un codigo de salida de error aunque funcione.
-    $version = & (Join-Path $InstallDir 'ffmpeg.exe') -hide_banner -version
-    if ($LASTEXITCODE -ne 0) { throw 'FFmpeg se copio pero no arranca' }
-    Write-Host ($version | Select-Object -First 1)
+    New-Item $InstallDir -ItemType Directory -Force | Out-Null
+    # En el destino, no en TEMP: una restauracion fallida debe ser recuperable.
+    $backup = Join-Path $InstallDir ('ffmpeg-backup-' + [guid]::NewGuid())
+    New-Item $backup -ItemType Directory | Out-Null
+    foreach ($name in $names) {
+        $destination = Join-Path $InstallDir $name
+        $originals[$name] = Test-Path -LiteralPath $destination
+        if ($originals[$name]) {
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                throw "El destino no es un archivo: $destination"
+            }
+            Copy-Item -LiteralPath $destination -Destination (Join-Path $backup $name) -Force
+        }
+    }
+    foreach ($name in $names) {
+        # Registrar ANTES: Copy-Item puede truncar el destino antes de fallar.
+        $touched += $name
+        Copy-Item -LiteralPath $staged[$name] -Destination (Join-Path $InstallDir $name) -Force
+    }
+    $process = Start-Process -FilePath (Join-Path $InstallDir 'ffmpeg.exe') -ArgumentList '-hide_banner', '-version' -Wait -PassThru -NoNewWindow
+    if ($process.ExitCode -ne 0) { throw 'FFmpeg se copio pero no arranca' }
     Write-Host "FFmpeg instalado en $InstallDir"
+} catch {
+    $failure = $_
+    foreach ($name in $touched) {
+        try {
+            $destination = Join-Path $InstallDir $name
+            if ($originals[$name]) {
+                Copy-Item -LiteralPath (Join-Path $backup $name) -Destination $destination -Force
+            } elseif (Test-Path -LiteralPath $destination) {
+                Remove-Item -LiteralPath $destination -Force
+            }
+        } catch {
+            $keepBackup = $true
+            Write-Warning "No se pudo restaurar ${name}: $($_.Exception.Message)" -WarningAction Continue
+        }
+    }
+    if ($keepBackup) {
+        throw "Instalacion fallida: $($failure.Exception.Message). Rollback incompleto; backups conservados en: $backup"
+    }
+    throw $failure
 } finally {
-    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    if ($backup -and -not $keepBackup) {
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }

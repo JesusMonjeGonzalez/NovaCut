@@ -1,0 +1,50 @@
+[
+  {
+    "crates": ["ecolor@0.31.1", "eframe@0.31.1", "egui@0.31.1", "egui-winit@0.31.1", "egui_glow@0.31.1", "emath@0.31.1", "epaint@0.31.1", "epaint_default_fonts@0.31.1"],
+    "license": "MIT",
+    "file": "egui-MIT.txt",
+    "commit": "1669e52a7ccfc3489c1b0999b9ed48894a0b3887",
+    "url": "https://raw.githubusercontent.com/emilk/egui/1669e52a7ccfc3489c1b0999b9ed48894a0b3887/LICENSE-MIT",
+    "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c"
+  },
+  {
+    "crates": ["clipboard-win@5.4.1"],
+    "license": "BSL-1.0",
+    "file": "clipboard-win-BSL.txt",
+    "commit": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342",
+    "url": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342/LICENSE",
+    "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+  },
+  {
+    "crates": ["dasp_sample@0.11.0"],
+    "license": "MIT",
+    "file": "dasp_sample-MIT.txt",
+    "commit": "97c3bb9b2363c0b46ac1633858bf1054fd02a980",
+    "url": "https://raw.githubusercontent.com/rustaudio/sample/97c3bb9b2363c0b46ac1633858bf1054fd02a980/LICENSE-MIT",
+    "sha256": "b1d6df41ed3aa96806e74c729444d7c121d90e6660a6aed01d298e03fde475a0"
+  },
+  {
+    "crates": ["gl_generator@0.14.0"],
+    "license": "Apache-2.0",
+    "file": "gl_generator-Apache.txt",
+    "commit": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e",
+    "url": "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "crates": ["khronos_api@3.1.0"],
+    "license": "Apache-2.0",
+    "file": "khronos_api-Apache.txt",
+    "commit": "f150967b1c44ae888e6676f93f639ebc82771bdc",
+    "url": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "crates": ["profiling@1.0.18"],
+    "license": "MIT",
+    "file": "profiling-MIT.txt",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+    "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+  }
+]
