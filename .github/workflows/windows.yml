@@ -1,4 +1,4 @@
-name: Windows build
+name: Build and release
 
 on:
   push:
@@ -18,6 +18,10 @@ permissions:
 jobs:
   secrets:
     uses: ./.github/workflows/secrets.yml
+
+  verify-macos:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
+    uses: ./.github/workflows/build.yml
 
   build:
     runs-on: windows-latest
@@ -40,12 +44,40 @@ jobs:
           if ($env:RELEASE_TAG -cne "v$version") { throw 'Tag does not match Cargo.toml version' }
       - name: Set up Rust
         run: rustup update stable --no-self-update
+      - name: Verify packaging failure gates
+        shell: pwsh
+        run: ./tests/build-windows.ps1
+      # El instalador de FFmpeg se prueba con el PowerShell 5.1 real y sin red:
+      # hash incorrecto, archivos ausentes y rollback de sustituciones.
+      - name: Verify FFmpeg installer gates
+        shell: powershell
+        run: ./tests/ffmpeg-install.ps1
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
       - name: Test and package Windows application
         shell: pwsh
         run: ./build-windows.ps1 -Installer
+      # El mismo script que ejecutan el instalador y el botón de la app, en
+      # el PowerShell 5.1 que trae Windows: descarga, SHA-256 y arranque.
+      - name: Install FFmpeg with the shipped script
+        shell: powershell
+        run: ./installer/ffmpeg-install.ps1 -InstallDir "$env:RUNNER_TEMP\ffmpeg"
+      # Con FFmpeg real, los renders de extremo a extremo (efectos, títulos,
+      # subtítulos animados, siete formatos, vuelta a CPU) corren en Windows.
+      # Solo se omite la prueba que necesita Whisper y la voz de macOS.
+      - name: Real renders on Windows
+        shell: pwsh
+        env:
+          NOVACUT_REQUIRE_REAL: '1'
+        run: |
+          $env:PATH = "$env:RUNNER_TEMP\ffmpeg;$env:PATH"
+          cargo test --locked --features windows-host --bin novacut-windows render_real -- --skip text_based_editing
+          if ($LASTEXITCODE -ne 0) { throw "Real render tests failed" }
+      # Solo en la VM desechable de Actions: toca HKCU y accesos directos.
+      - name: Verify package install, launch and uninstall
+        shell: pwsh
+        run: ./tests/package-windows.ps1 -DisposableVM
       - name: Upload portable Windows application
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -58,28 +90,58 @@ jobs:
           name: novacut-windows-installer-x64
           path: build/installer/NovaCut-Windows-Setup.exe
           if-no-files-found: error
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Package universal macOS application
+        run: ./package-mac.sh
+      - name: Verify macOS package
+        run: ./tests/package-mac.sh
+      - name: Upload macOS application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: novacut-macos-universal
+          path: build/release/NovaCut-macOS.zip
+          if-no-files-found: error
+
   publish:
-    needs: [build, secrets]
+    needs: [build, macos, secrets, verify-macos]
     if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' && inputs.publish_tag != '' && inputs.publish_tag == github.ref_name
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: novacut-windows-x64
-          path: NovaCut-Windows
+          path: dist/NovaCut-Windows
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: novacut-windows-installer-x64
-          path: installer
+          path: dist/installer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: novacut-macos-universal
+          path: dist/macos
       - name: Create new alpha release without replacing existing assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.publish_tag }}
         run: |
-          zip -r NovaCut-Windows-x64.zip NovaCut-Windows
+          notes="docs/releases/$RELEASE_TAG.md"
+          if [ ! -f "$notes" ]; then echo "Missing release notes: $notes" >&2; exit 1; fi
+          (cd dist && zip -r NovaCut-Windows-x64.zip NovaCut-Windows)
+          (cd dist && sha256sum installer/NovaCut-Windows-Setup.exe NovaCut-Windows-x64.zip macos/NovaCut-macOS.zip \
+            | sed 's#  .*/#  #' > SHA256SUMS.txt)
           gh release create "$RELEASE_TAG" --verify-tag --prerelease \
-            --title "NovaCut $RELEASE_TAG" --notes "Windows engineering alpha." \
-            installer/NovaCut-Windows-Setup.exe NovaCut-Windows-x64.zip
+            --title "NovaCut $RELEASE_TAG" --notes-file "$notes" \
+            dist/installer/NovaCut-Windows-Setup.exe dist/NovaCut-Windows-x64.zip \
+            dist/macos/NovaCut-macOS.zip dist/SHA256SUMS.txt

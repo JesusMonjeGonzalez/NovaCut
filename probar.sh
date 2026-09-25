@@ -35,6 +35,14 @@ swiftc -D PRUEBAS_ESTADO -target arm64-apple-macos14.0 \
     -o "$SALIDA/pruebaEstadoSubtitulos"
 "$SALIDA/pruebaEstadoSubtitulos"
 
+# Persistencia portable: migración v1, round-trip del proyecto multipista y
+# resolución de rutas relativas, absolutas, vecinas y medios offline.
+swiftc -O -enforce-exclusivity=checked -target arm64-apple-macos14.0 \
+    -framework AVFoundation \
+    "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" "$RAIZ/src/ui/Proyecto.swift" "$RAIZ/tests/proyecto/main.swift" \
+    -o "$SALIDA/pruebaProyecto"
+"$SALIDA/pruebaProyecto"
+
 # Caché de preview: limpieza de huérfanos y presupuesto de disco con desalojo
 # LRU, sin tocar archivos ajenos ni los proxies del proyecto abierto.
 swiftc -O -target arm64-apple-macos14.0 \
@@ -44,6 +52,13 @@ swiftc -O -target arm64-apple-macos14.0 \
     "$RAIZ/src/ui/Exportacion.swift" "$RAIZ/src/ui/Proxies.swift" "$RAIZ/tests/proxies/main.swift" \
     -o "$SALIDA/pruebaProxies"
 "$SALIDA/pruebaProxies"
+
+# Revinculación en lote: un rodaje movido de sitio se localiza en una pasada,
+# con desempate estable y tope de recorrido.
+swiftc -O -target arm64-apple-macos14.0 \
+    "$RAIZ/src/ui/Revinculacion.swift" "$RAIZ/tests/revinculacion/main.swift" \
+    -o "$SALIDA/pruebaRevinculacion"
+"$SALIDA/pruebaRevinculacion"
 
 # Edición por transcript: el mapa entre lo que se dice (tiempo del medio) y lo que
 # se oye (frames de montaje), y el borrado de varios tramos, que hay que aplicar de
@@ -66,6 +81,14 @@ swiftc -O -target arm64-apple-macos14.0 \
     "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" "$RAIZ/tests/atributos/main.swift" \
     -o "$SALIDA/pruebaAtributos"
 "$SALIDA/pruebaAtributos"
+
+# Edición por lotes: solo se escriben los campos elegidos y las pistas bloqueadas
+# se quedan intactas.
+swiftc -O -target arm64-apple-macos14.0 \
+    "$RAIZ/src/ui/Timeline.swift" "$RAIZ/src/ui/Mezclador.swift" "$RAIZ/src/ui/Sonoridad.swift" \
+    "$RAIZ/src/ui/EdicionLote.swift" "$RAIZ/tests/lote/main.swift" \
+    -o "$SALIDA/pruebaLote"
+"$SALIDA/pruebaLote"
 
 # Corrección de color: la cadena de filtros del compositor es lógica pura de
 # Core Image y se prueba sin abrir la aplicación.

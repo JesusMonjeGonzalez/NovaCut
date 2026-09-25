@@ -24,6 +24,24 @@
 
 <p align="center"><sub>The current application bundle still uses its working name, <code>Editorcito.app</code>.</sub></p>
 
+## Download And Install
+
+Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
+
+The latest published prerelease is **v0.1.1**. Its macOS download is
+`NovaCut-macOS-arm64.zip` (Apple Silicon only), and it does not include
+`SHA256SUMS.txt`. Version **0.2.0 is an unpublished candidate**; the universal
+macOS package and checksum manifest below describe that candidate, not v0.1.1.
+
+| System | File | First launch |
+|---|---|---|
+| Windows 10/11 x64 | `NovaCut-Windows-Setup.exe` (or the portable `NovaCut-Windows-x64.zip`) | SmartScreen: *More info → Run anyway*. The installer fetches FFmpeg and verifies its SHA-256. |
+| macOS 14+ (Apple Silicon and Intel) | `NovaCut-macOS.zip` | Move to Applications, then right-click → *Open* (Sonoma) or *System Settings → Privacy & Security → Open Anyway* (Sequoia and later). |
+
+Builds are not code-signed with a paid certificate nor notarized, hence the
+one-time warnings. Step-by-step instructions (in Spanish), optional Whisper
+setup and checksum verification: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
+
 ## Why It Is Interesting
 
 NovaCut is not a web UI around FFmpeg. The working macOS application owns its
@@ -46,15 +64,33 @@ timeline model and uses native media frameworks from interaction through export.
 - Linked video/audio synchronization across edits and retiming.
 - Constant speed, speed ramps and freeze frames.
 - Titles, captions, masks, 14 blend modes and adjustment layers.
-- Proxy cache budget: a configurable disk limit evicts the least recently used
-  proxies first and stops as soon as the cache fits. Proxies the open project links
-  are never evicted; if they alone exceed the limit the app says so instead of
-  deleting work the preview is about to request again. A limit of zero disables the trim.
+- SRT import on both hosts accepts UTF-8 BOMs, whitespace-only cue separators,
+  multiline text and timestamps with comma or dot milliseconds. Invalid timestamps
+  are rejected; macOS export carries millisecond rounding across second/minute boundaries.
+- Subtitle workbench on both hosts: case-insensitive literal search over cue text, and a
+  global sync that shifts every cue by a millisecond offset or aligns the first cue to the
+  playhead. A shift that would push any cue before the project start is refused whole, so
+  the document is never left partially resynced. macOS also lists cues to add, edit, delete
+  and jump to, and every change is a single undo step.
+- Proxy cache budget on both hosts: a configurable disk limit evicts the least recently
+  used proxies first and stops as soon as the cache fits. Proxies the open project links
+  are never evicted; if they alone exceed the limit the app says so instead of deleting
+  work the preview is about to request again. A limit of zero disables the trim.
 - Proxies are named after the media and a fingerprint of its size and modification date,
   not after the clip index. Two clips of the same file share one proxy instead of
   re-encoding, reordering clips never reassigns a proxy to another video, and replacing
-  the source on disk invalidates the old proxy, which macOS retires. Export always uses
-  the original either way.
+  the source on disk invalidates the old proxy: Windows flags it as out of date and macOS
+  retires the superseded copy. Export always uses the original either way.
+- EDL (CMX 3600) import and export on both hosts, each verified by a round trip: cuts,
+  source and record timecodes, V/A channels, linked A/V from `B` events, clip names and
+  constant speed from `M2`. Dissolves arrive as cuts with a warning, because an EDL does
+  not carry the shape of a transition; titles, adjustment layers, nests and speed ramps
+  are listed as what could not travel; and each reel becomes an offline medium to relink.
+  Imported cuts are spread across tracks so they never overlap.
+- Batch relink on both hosts: point at a folder and every offline medium is located in a
+  single walk. Same-named candidates are decided by file size first, then by the shallowest
+  path, so two runs over the same folder always agree. Files found but unreadable are
+  reported separately from files not found at all, and a walk that hits its cap says so.
 - RGB curves, `.cube` LUTs, color wheels, chroma key, waveform, vectorscope and histogram.
 - H.264, HEVC, vertical MP4, ProRes 422, audio-only and master export presets.
 - VFR sources are detected from presentation timestamps; macOS conforms them to a
@@ -107,16 +143,19 @@ Install the ad-hoc-signed development build into `/Applications`:
 ./build-mac.sh instalar
 ```
 
-There is currently no notarized binary release or installer.
+Release packages (universal macOS app and Windows installer) are produced by
+`package-mac.sh` and `build-windows.ps1 -Installer`, and published by CI; they
+are ad-hoc signed, not notarized.
 
 ### Windows rough-cut build
 
 NovaCut now has a native Windows host for multipista editing, composition,
-audio mixing, subtitles and H.264/audio delivery. Install FFmpeg
+audio mixing, subtitles and multi-format delivery. Install FFmpeg
 (`winget install Gyan.FFmpeg`) and run
 `./build-windows.ps1` on Windows; the package is written to
 `build/NovaCut-Windows`. GitHub Actions publishes the same package as
-`novacut-windows-x64`.
+`novacut-windows-x64`. The host also builds on macOS and Linux for development
+(`cargo test --features windows-host --bin novacut-windows`).
 
 `./build-windows.ps1 -Installer` also creates a one-click NSIS installer
 with Start menu shortcuts, uninstall support, optional desktop shortcut,
@@ -200,13 +239,15 @@ remote provider.
 ## Current Limits
 
 - Engineering alpha, not a production NLE replacement.
-- Apple Silicon and Spanish-first UI only.
+- Published macOS builds are Apple Silicon only; the 0.2.0 candidate packages
+  a universal binary, but Intel runtime validation remains pending. Spanish-first UI.
 - VFR with dropped frames is detected from PTS. macOS uses a cached CFR
   intermediary before composition; Windows has the PTS scan and rational CFR
   filter path, but Windows-host runtime validation remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
-- Proxy cleanup and storage limits are implemented on macOS; Windows wiring and packaged releases remain unfinished.
+- Proxy cleanup and storage limits are implemented on both hosts; distribution
+  of the 0.2.0 candidate remains pending release validation.
 - No automated UI suite for recovery, relinking or export cancellation.
 - Premiere, Resolve and Final Cut opening have not been verified in this repository.
 - Swift concurrency and deprecated AVFoundation warnings remain migration work.

@@ -7,6 +7,10 @@ ACCION="${1:-}"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/build/Editorcito.app"
+# La versión sale de Cargo.toml, igual que en el instalador de Windows.
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
+# UNIVERSAL=1 compila también para Intel y une ambos binarios (releases).
+UNIVERSAL="${UNIVERSAL:-0}"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -29,8 +33,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key><string>Editorcito</string>
     <key>CFBundleIdentifier</key><string>studio.editorcito.mac</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+    <key>CFBundleVersion</key><string>__VERSION__</string>
     <key>CFBundleIconFile</key><string>Editorcito.icns</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
@@ -44,17 +48,30 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     </dict></array>
 </dict></plist>
 PLIST
+sed -i '' "s/__VERSION__/$VERSION/g" "$APP/Contents/Info.plist"
 
-swiftc -O \
-    -target arm64-apple-macos14.0 \
-    -parse-as-library \
-    -framework AppKit \
-    -framework AVFoundation \
-    -framework AVKit \
-    -framework Speech \
-    -framework SwiftUI \
-    -o "$APP/Contents/MacOS/Editorcito" \
-    "$ROOT"/src/ui/*.swift
+compilar() {
+    swiftc -O \
+        -target "$1-apple-macos14.0" \
+        -parse-as-library \
+        -framework AppKit \
+        -framework AVFoundation \
+        -framework AVKit \
+        -framework Speech \
+        -framework SwiftUI \
+        -o "$2" \
+        "$ROOT"/src/ui/*.swift
+}
+
+if [ "$UNIVERSAL" = "1" ]; then
+    compilar arm64 "$ROOT/build/Editorcito-arm64"
+    compilar x86_64 "$ROOT/build/Editorcito-x86_64"
+    lipo -create "$ROOT/build/Editorcito-arm64" "$ROOT/build/Editorcito-x86_64" \
+        -output "$APP/Contents/MacOS/Editorcito"
+    rm -f "$ROOT/build/Editorcito-arm64" "$ROOT/build/Editorcito-x86_64"
+else
+    compilar arm64 "$APP/Contents/MacOS/Editorcito"
+fi
 
 codesign --force --sign - "$APP" 2>/dev/null || true
 echo "Editorcito listo: $APP"

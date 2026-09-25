@@ -46,6 +46,15 @@
 - Activa `Usar proxies en preview` para editar con esos archivos.
 - Los proxies viven en `~/Library/Caches/Editorcito/Proxies` y no sustituyen los
   originales al exportar.
+- `Proxies > Límite de la caché` fija el presupuesto de disco. Tras generar proxies,
+  la caché se recorta desalojando primero los que hace más tiempo que no se abren, y
+  se detiene en cuanto cabe. Los del proyecto abierto nunca se desalojan: si solo con
+  ellos se pasa del límite, la app lo dice en vez de borrar material que la preview va
+  a volver a pedir. `Sin límite` deja la caché al cuidado de `Limpiar proxies no usados`.
+- El menú muestra cuánto ocupa la caché y cuánto es desalojable ahora mismo.
+- Cada proxy lleva la huella del medio (tamaño y fecha). Si sustituyes el archivo
+  original por otra versión, el proxy anterior se retira al regenerar en vez de seguir
+  enseñando lo que ya no está. Dos clips del mismo archivo comparten proxy.
 
 ## Captions y transcripción
 
@@ -53,6 +62,12 @@
 - `Transcribir medio seleccionado` usa Speech on-device de macOS cuando el idioma y
   el dispositivo lo permiten.
 - El cue bajo el cabezal se puede editar desde el inspector.
+- `Subtítulos > Buscar y sincronizar…` abre el panel: busca por texto, salta al cue con
+  `Ir`, y añade, edita o elimina cues. Cada cambio ocupa un solo paso de deshacer.
+- La sincronización global desplaza **todos** los cues, aunque haya una búsqueda activa:
+  escribe los milisegundos (negativo adelanta, positivo retrasa) o usa `Alinear primero al
+  cabezal`. Si el ajuste dejaría algún cue antes del inicio del proyecto se rechaza entero
+  y no se mueve ninguno.
 - El export de vídeo quema los captions y `Exportar SRT` conserva también el sidecar.
 
 ## Atajos
@@ -121,13 +136,23 @@ la escritura en búsqueda, campos de texto o subtítulos.
   o descartarla. Una recuperación aceptada queda marcada como pendiente de guardar.
 - Los medios que no aparecen al abrir un proyecto quedan visibles como `offline`; usa
   `Revincular medio…` desde el menú contextual del clip.
+- Si se movió el rodaje entero, `Archivo > Revincular medios offline desde una carpeta…`
+  los busca todos de una vez. Entre archivos con el mismo nombre gana el que coincide en
+  tamaño con el original; si no hay tamaño de referencia, el que está menos hundido en el
+  árbol. La barra de estado distingue lo revinculado, lo que no apareció y lo que se
+  encontró pero no se pudo abrir.
 
 ## Limitaciones actuales
 
-- Un medio VFR genera un aviso crítico antes de exportar; el conformado PTS aún requiere
-  validación con corpus real.
-- La caché de proxies se escribe de forma segura, pero todavía no tiene limpieza
-  automática ni cancelación avanzada.
+- Los medios VFR se conforman a la base de tiempo del proyecto en un intermediario CFR
+  cacheado antes del montaje, la sonoridad y la exportación; la referencia documental
+  sigue apuntando al archivo original.
+- Si el conformado no puede validar vídeo, duración, PTS o audio, la exportación y el
+  render de nidos se detienen en vez de entregar un resultado potencialmente desfasado.
+- El conformado está verificado con el corpus golden y grabaciones reales locales; la
+  compatibilidad profesional con un corpus heterogéneo amplio sigue pendiente.
+- La generación de proxies se puede cancelar y el menú permite limpiar los proxies
+  huérfanos; todavía no hay limpieza automática ni límite de espacio configurable.
 - El retime multicámara (velocidad distinta de 1 en un clip multicámara) está
   declarado no soportado: el constructor avisa antes de exportar.
 - Marcha atrás (velocidad negativa) necesita renderizado previo y sigue

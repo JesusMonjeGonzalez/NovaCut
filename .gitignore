@@ -10,3 +10,14 @@
 
 # Python caches del generador de iconos
 __pycache__/
+
+# Local credentials and user projects must not become public fixtures.
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.editorcito
+*.ncrough
+*.ncrough.bak
+NovaCut-Backups/

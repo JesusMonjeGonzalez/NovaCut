@@ -663,7 +663,12 @@ struct VistaDeClip: View {
         .onTapGesture {
             // Con la Mano, el clic panea y no debe cambiar la selección.
             guard editor.herramienta != .mano else { return }
-            editor.seleccionarClip(clip.id, extender: NSEvent.modifierFlags.contains(.shift))
+            let modifiers = NSEvent.modifierFlags
+            editor.seleccionarClip(
+                clip.id,
+                extender: modifiers.contains(.shift),
+                alternar: modifiers.contains(.command)
+            )
         }
         .gesture(gestoDelCuerpo)
         .onHover { dentro in
@@ -934,14 +939,29 @@ struct VistaDeClip: View {
 
     @ViewBuilder
     private var menu: some View {
-        Button("Cortar aquí") { editor.cortar(en: editor.cabezal, pista: pista.id) }
-        Button(clip.habilitado ? "Desactivar" : "Activar") { editor.alternarHabilitado(clip.id) }
-        Button("Fundido de 1 s") { editor.fundidoRapido(clip.id) }
+        Button("Cortar aquí") {
+            editor.asegurarSeleccionContextual(clip.id)
+            editor.cortar(en: editor.cabezal, pista: pista.id)
+        }
+        Button(editor.seleccionados().count > 1 ? "Desactivar selección" : (clip.habilitado ? "Desactivar" : "Activar")) {
+            editor.asegurarSeleccionContextual(clip.id)
+            editor.alternarHabilitadoSeleccion()
+        }
+        Button("Fundido de 1 s en selección") {
+            editor.asegurarSeleccionContextual(clip.id)
+            editor.fundidoRapidoSeleccion()
+        }
         Divider()
-        Button("Copiar atributos") { editor.copiarAtributos() }
-            .disabled(editor.selectedClipID != clip.id)
-        Button("Pegar atributos") { editor.pegarAtributos() }
-            .disabled(editor.atributosCopiados == nil || editor.selectedClipID != clip.id)
+        Button("Copiar atributos") {
+            editor.asegurarSeleccionContextual(clip.id)
+            editor.copiarAtributos()
+        }
+        .disabled(editor.selectedClipID != clip.id && !editor.selectedClipIDs.contains(clip.id))
+        Button("Pegar atributos") {
+            editor.asegurarSeleccionContextual(clip.id)
+            editor.pegarAtributos()
+        }
+        .disabled(editor.atributosCopiados == nil)
         Button("Match frame") { editor.matchFrame() }
         Button("Extend edit hasta el cabezal") { editor.extendEdit() }
         if pista.tipo == .video {
@@ -968,7 +988,10 @@ struct VistaDeClip: View {
         Divider()
         Menu("Etiqueta") {
             ForEach(EtiquetaDeColor.allCases, id: \.self) { etiqueta in
-                Button(etiqueta.nombre) { editor.etiquetar(clip.id, etiqueta) }
+                Button(etiqueta.nombre) {
+                    editor.asegurarSeleccionContextual(clip.id)
+                    editor.etiquetarSeleccion(etiqueta)
+                }
             }
         }
         Menu("Velocidad") {
@@ -985,11 +1008,11 @@ struct VistaDeClip: View {
             Button("Revincular medio…") { editor.revincular(clip.mediaID) }
         }
         Button("Quitar dejando hueco") {
-            editor.selectedClipID = clip.id
+            editor.asegurarSeleccionContextual(clip.id)
             editor.removeSelectedClip()
         }
         Button("Quitar y cerrar hueco", role: .destructive) {
-            editor.selectedClipID = clip.id
+            editor.asegurarSeleccionContextual(clip.id)
             editor.borrarConArrastre()
         }
     }

@@ -1,0 +1,12 @@
+# Preference order for alternatives; AND obligations are retained.
+accepted = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "Unicode-3.0", "OFL-1.1", "Ubuntu-font-1.0", "BSL-1.0"]
+ignore-dev-dependencies = true
+# Keep build dependencies conservatively, including generated-code producers.
+ignore-build-dependencies = false
+
+# First-party metadata is absent in Cargo.toml; use the actual project LICENSE.
+[editorcito-core.clarify]
+license = "MIT"
+[[editorcito-core.clarify.files]]
+path = "LICENSE"
+checksum = "12238030fcc5cf47c21bc91a56e980acd615066720e216b46516f310b5c16f95"

@@ -21,6 +21,7 @@ New-Item $output -ItemType Directory | Out-Null
 Copy-Item "target\release\novacut-windows.exe" $output
 Copy-Item "target\release\editorcito.dll" $output -ErrorAction SilentlyContinue
 Copy-Item "docs\GUIA-WINDOWS.md" (Join-Path $output "LEEME-WINDOWS.md")
+Copy-Item "LICENSE", "THIRD_PARTY_NOTICES.md", "docs\licenses\THIRD_PARTY_LICENSES-Windows.html" $output
 
 Write-Host "NovaCut Windows ready: $output"
 
@@ -51,7 +52,13 @@ if ($Installer) {
     # no existe en un checkout limpio de CI porque build/ está en .gitignore).
     $installerDir = Join-Path $root "build\installer"
     New-Item $installerDir -ItemType Directory -Force | Out-Null
-    & $nsisPath -WX "installer\NovaCut.nsi"
+    # La version del instalador sale de Cargo.toml: una sola fuente de verdad.
+    $cargoToml = Get-Content (Join-Path $root "Cargo.toml") -Raw
+    if ($cargoToml -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+        throw "No se pudo leer la version de Cargo.toml"
+    }
+    $appVersion = $Matches[1]
+    & $nsisPath -WX "/DAPP_VERSION=$appVersion" "installer\NovaCut.nsi"
     if ($LASTEXITCODE -ne 0) {
         throw "NSIS failed with exit code $LASTEXITCODE"
     }

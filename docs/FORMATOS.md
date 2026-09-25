@@ -65,8 +65,9 @@ proyecto en:
 ```
 
 Se usan únicamente para preview. La cola de exportación vuelve a los medios
-originales para no degradar el resultado. La limpieza automática, cancelación de
-generación y límite de espacio de la caché siguen pendientes.
+originales para no degradar el resultado. La generación se puede cancelar y el
+menú permite limpiar proxies huérfanos; la limpieza automática y el límite de
+espacio de la caché siguen pendientes.
 
 ## Exportación
 
@@ -84,10 +85,25 @@ captions se queman en el vídeo y pueden exportarse además como SRT.
 
 ## VFR
 
-Editorcito marca medios cuya pista no declara una duración mínima de frame estable
-como `VFR` en la biblioteca. El timeline y `CMTime` trabajan con tiempos racionales,
-pero todavía falta validar conformado y sincronización PTS con un corpus amplio de
-grabaciones VFR de móviles, OBS y grabadoras externas.
+Editorcito analiza los PTS de toda la pista de vídeo, ordena y deduplica las marcas
+de presentación, y marca como `VFR` los saltos o variaciones que no corresponden a
+una cadencia constante. El timeline y `CMTime` trabajan con tiempos racionales.
+
+Antes de montar, reproducir, medir sonoridad o exportar, un medio VFR se conforma a
+la base de tiempo del proyecto en un intermediario CFR cacheado en:
+
+```text
+~/Library/Caches/Editorcito/VFR/<hash>.mov
+```
+
+La caché se valida por duración, rango, PTS CFR y, cuando existe, presencia y
+duración del audio. El archivo original permanece como referencia documental. Si
+la caché no es reproducible o queda incompleta, la exportación y los nidos se
+detienen.
+
+Este flujo está verificado con el corpus golden y grabaciones reales locales. La
+validación profesional con un corpus amplio de móviles, OBS, grabadoras externas,
+codecs y archivos dañados sigue siendo el próximo gate.
 
 ## Próximo gate
 
@@ -107,7 +123,8 @@ sincronizados en cinco puntos) y `probar-corpus.sh` lo mide:
 - **Cadencia**: huecos reales sobre la cadencia mediana (los B-frames no son
   huecos; un paquete PCM largo del muxer tampoco). El golden pasa sin huecos.
 - Las grabaciones reales con caídas de frames (p. ej. Screen Recording de
-  macOS) fallan la cadencia con razón y se detectan como VFR al importar.
+  macOS) fallan la cadencia con razón, se detectan como VFR al importar y se
+  conforman a una cadencia CFR antes de montar.
 
 ## Intercambio con otros editores
 
@@ -123,3 +140,40 @@ El montaje sale hacia la industria por dos formatos desde Archivo:
 
 Ambos son funciones puras verificadas en `tests/intercambio`. La exportación
 no degrada los medios: los archivos originales se referencian por ruta.
+
+### Importación de EDL
+
+`Archivo > Importar EDL…` lee un CMX 3600 y monta sus cortes. Lo que entra:
+
+- Timecodes de origen y montaje, con `FCM` respetado. Un `FCM: DROP FRAME`
+  sobre una cadencia que no es NTSC se rechaza con aviso, porque un timecode
+  con `;` a 25 fps no describe ningún reloj.
+- Canales `V`, `A1`…`A16`, `A` (=A1), `AA` (A1+A2) y `B` (vídeo + audio, que
+  entran enlazados como el plano que eran).
+- `FROM CLIP NAME` como nombre del clip y velocidad constante, sea por `M2`
+  (en fps del origen) o por `* SPEED CHANGE RATE`.
+- Eventos que se solapan en el mismo canal se reparten en pistas, creando las
+  que hagan falta: dos clips pisándose en una pista corromperían el montaje.
+
+Lo que no entra, y se dice en la barra de estado en lugar de fingirse:
+
+- La **forma** de una disolución o cortinilla. Un EDL no la lleva: el evento
+  entra como corte y se avisa por número de evento.
+- Los **medios**. Un EDL describe cintas y timecodes, no archivos: cada reel
+  genera un medio offline con el nombre que traía, y se localizan después con
+  `Revincular medios offline desde una carpeta…`.
+- Eventos de duración cero o negativa en el montaje, que se omiten con aviso.
+
+La verificación principal es la ida y vuelta contra el exportador: lo que sale
+de un montaje vuelve a entrar con los mismos cortes, duraciones, entradas en
+origen y velocidades.
+
+El host de Windows lee y escribe el mismo formato desde el menú `EDL` de la
+barra superior, sobre `src/core/edl.rs`. Allí la ida y vuelta se comprueba dos
+veces: a nivel de formato en el núcleo (`cargo test --lib`) y a nivel de
+proyecto en el propio host (`cargo test --features windows-host`), que solo se
+ejecuta en Windows. Al exportar se enumera lo que no cabe en un EDL —títulos,
+capas de ajuste, anidados y rampas de velocidad—; una rampa avisa pero el corte
+viaja igual, porque perder el plano entero sería peor. Al importar, los cortes
+que se solapan se reparten en pistas: dos clips pisándose no describen ningún
+montaje.

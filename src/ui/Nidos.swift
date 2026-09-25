@@ -33,6 +33,9 @@ enum ServicioDeNidos {
         id: UUID
     ) async throws -> URL {
         let preparados = await ConformadorVFR.preparar(medios: medios, para: linea.timebase)
+        guard preparados.fallos.isEmpty else {
+            throw ErrorDeConformadoVFR.incompleto(preparados.fallos)
+        }
         let render = ConstructorDeMontaje.construir(linea, medios: preparados.medios)
         guard !render.estaVacio else { throw EditorError.exportFailed }
         let url = try carpetaDeNidos()

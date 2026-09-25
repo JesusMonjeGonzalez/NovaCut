@@ -270,29 +270,54 @@ func huecosDeVideo(asset: AVURLAsset) async -> MarcasDeCadencia? {
 func huecosDeAudio(asset: AVURLAsset) async -> MarcasDeCadencia? {
     guard let track = try? await asset.loadTracks(withMediaType: .audio).first else { return nil }
     guard let lector = try? AVAssetReader(asset: asset) else { return nil }
-    let salida = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    // Se fuerza PCM para medir la línea de muestras, no los paquetes del
+    // contenedor. Un bloque de 4096 muestras no es un hueco y el primer paquete
+    // AAC puede incluir priming; lo único relevante es dónde empieza el bloque
+    // siguiente respecto al final real del anterior.
+    let frecuencia = 48_000.0
+    let ajustes: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: frecuencia,
+        AVNumberOfChannelsKey: 1,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+    ]
+    let salida = AVAssetReaderTrackOutput(track: track, outputSettings: ajustes)
+    guard lector.canAdd(salida) else { return nil }
     lector.add(salida)
     guard lector.startReading() else { return nil }
 
-    // Cadencia de paquetes: los PTS consecutivos deben avanzar a ritmo
-    // constante. El primer delta se descarta: el muxer coalesce el arranque en
-    // un paquete largo (2 s) y ese primer salto no es un hueco —las muestras lo
-    // llenan—. Un hueco real (un corte, un conformado roto) salta sobre la
-    // cadencia mediana del resto.
-    var pts = [Double]()
+    var bloques = [(inicio: Double, muestras: Int)]()
     while lector.status == .reading, let sb = salida.copyNextSampleBuffer() {
         let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
-        if t.isFinite && CMSampleBufferGetNumSamples(sb) > 0 { pts.append(t) }
+        let muestras = CMSampleBufferGetNumSamples(sb)
+        if t.isFinite && muestras > 0 { bloques.append((t, muestras)) }
     }
-    guard pts.count > 3 else { return nil }
-    var deltas = [Double]()
-    for i in 2..<pts.count { deltas.append(pts[i] - pts[i - 1]) }
-    let ordenados = deltas.sorted()
-    let mediana = ordenados[ordenados.count / 2]
+    guard bloques.count > 1 else { return nil }
+    bloques.sort { $0.inicio < $1.inicio }
+
     var huecos = 0
-    for d in deltas where d > mediana * 1.5 { huecos += 1 }
-    let fin = (pts.last ?? 0) + (deltas.first ?? 0)
-    return MarcasDeCadencia(huecos: huecos, total: pts.count, fps: 0, detalle: "paquetes a cadencia \(String(format: "%.3f", mediana)) s hasta \(String(format: "%.2f", fin)) s")
+    var mayorHueco = 0.0
+    for indice in 1..<bloques.count {
+        let anterior = bloques[indice - 1]
+        let esperado = anterior.inicio + Double(anterior.muestras) / frecuencia
+        let hueco = bloques[indice].inicio - esperado
+        if hueco > 0.002 {
+            huecos += 1
+            mayorHueco = max(mayorHueco, hueco)
+        }
+    }
+    let ultimo = bloques[bloques.count - 1]
+    let fin = ultimo.inicio + Double(ultimo.muestras) / frecuencia
+    return MarcasDeCadencia(
+        huecos: huecos,
+        total: bloques.count,
+        fps: 0,
+        detalle: "muestras PCM continuas hasta \(String(format: "%.2f", fin)) s"
+            + (mayorHueco > 0 ? " · mayor hueco \(String(format: "%.3f", mayorHueco)) s" : "")
+    )
 }
 
 var fallos = 0

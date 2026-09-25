@@ -54,7 +54,8 @@ Fuentes oficiales:
 ### Debilidades
 
 - El host Swift aún no usa el núcleo Rust como fuente de verdad.
-- VFR está detectado, pero aún no está validado con PTS y sincronización profesional.
+- VFR se detecta y se conforma con PTS en macOS; la validación profesional con un
+  corpus heterogéneo amplio todavía está pendiente.
 - Mixer sin EQ, compresor, limiter, paneo ni medición LUFS.
 - Multicámara sin visor de ángulos ni cambio en tiempo real.
 - Proxies sin cancelación, limpieza automática ni límite de espacio.

@@ -88,11 +88,76 @@ Este es el primer host Windows de NovaCut. Permite:
   control agrupa el gesto completo en un solo paso, no uno por tecla);
 - confirmar antes de perder cambios sin guardar al pulsar "Nuevo" o "Abrir";
 - decidir si se recupera o se descarta la ultima sesion encontrada;
-- exportar el montaje multipista a H.264 1080p con audio AAC.
+- exportar el montaje multipista a H.264 1080p con audio AAC;
+- exportar también en HEVC/H.265 (MP4), ProRes 422 (MOV máster), WebM VP9
+  con Opus para la web y GIF animado con paleta propia (15 fps, 720 px);
+- **Lumetri básico** por clip o capa de ajuste: temperatura, tinte, intensidad
+  (vibrance), sombras e iluminaciones;
+- **Detalle y textura**: enfocar, reducir ruido y grano de película;
+- **Transformar y recortar**: voltear horizontal/vertical y recortar cada borde
+  dejando transparente lo recortado (como el efecto Recortar de Premiere);
+- reproducir un clip **hacia atrás** (imagen y sonido) y **estabilizarlo**;
+- **transiciones**: pasar a negro, pasar a blanco, disolución cruzada,
+  deslizar desde los cuatro lados y empujar a izquierda o derecha. Las de
+  movimiento usan la reserva del medio saliente como la disolución;
+- **Sonido esencial**: marcar clips como Diálogo o Música, reducir ruido de
+  fondo de la voz, igualar nivel con compresor y **ducking automático** (la
+  música baja sola mientras suena el diálogo);
+- ecualizador de tres bandas (graves, medios, agudos) por clip;
+- **volumen animado** (banda elástica): puntos de volumen en el cabezal,
+  dibujados en amarillo sobre el clip en la timeline;
+- **gráficos esenciales** en títulos: caja de fondo, contorno, sombra y fondo a
+  pantalla completa; plantillas «Rótulo inferior» y «Mate de color» en
+  "+ Insertar". Los clips con efectos muestran «fx» en la timeline;
+- **editar por texto** (pestaña "Transcripción"): Whisper transcribe el montaje
+  palabra a palabra; clic en una palabra lleva el cabezal allí, Mayús+clic
+  extiende la selección y `Supr` (o "Borrar selección") quita ese tramo de
+  todas las pistas cerrando el hueco. Subtítulos, marcadores y transcripción
+  se desplazan con el corte y todo es un único paso de deshacer;
+- **quitar muletillas** (eh, em, mm, este, o sea…) con un clic, tras revisarlas
+  resaltadas en naranja;
+- **subtítulos animados** estilo TikTok/CapCut desde la transcripción: páginas
+  de pocas palabras con la palabra que suena resaltada, en cuatro estilos
+  (Clásico, Karaoke, Caja, Pop), mayúsculas y color a elegir. Se rehacen solos
+  al editar por texto;
+- **exportar con GPU** (NVIDIA NVENC, Intel Quick Sync o AMD AMF) en H.264 y
+  HEVC. NovaCut detecta al arrancar qué GPU codifica de verdad y activa el
+  botón "⚡ GPU"; si la exportación con GPU falla, se repite sola con CPU y
+  lo indica al terminar.
 - cancelar una exportacion sin destruir el archivo de destino anterior.
 
 Tambien se pueden arrastrar videos desde el Explorador directamente a la
 ventana. `Ctrl+S` guarda y la barra espaciadora previsualiza el recorte elegido.
+
+## Interfaz y accesibilidad
+
+La ventana está pensada para portátiles 1080p al 150 % (1280×720 útiles), la
+pantalla más apretada habitual en Windows, y crece bien hasta 1440p:
+
+- barra superior en una fila: menú **Archivo** (nuevo, abrir, guardar,
+  recientes, EDL, importar secuencia), deshacer/rehacer, importar, edición,
+  rango de trabajo, exportación y los botones **Aa**, **?** y búsqueda;
+- el **monitor** usa el alto que sobra y la **timeline** tiene sitio reservado
+  para sus pistas; las herramientas de edición son una tira de iconos en la
+  cabecera de la timeline (el nombre, el atajo y la ayuda salen al pasar el
+  ratón) y las opciones de pistas van en el menú **Pistas**;
+- la **columna derecha** tiene pestañas: Inspector, Transcripción, Subtítulos,
+  Marcadores, Mezclador y Planos. Al hacer clic en un clip se abre el
+  Inspector, ordenado como los Controles de efectos: tiempo, color y efectos,
+  transformación, audio, fundidos y acciones; ruta y proxy van plegados salvo
+  que haya un problema;
+- **tamaño de la interfaz** del 90 al 150 % en el botón **Aa** o con
+  `Ctrl+=`, `Ctrl+-` y `Ctrl+0`; se recuerda al cerrar;
+- textos de al menos 11 px, contraste AA en los textos secundarios y botones de
+  pista de 20×18 px;
+- se adapta a la pantalla: probada desde la ventana mínima (800×500) hasta 4K.
+  Las columnas laterales son proporcionales al ancho, y en ventanas estrechas el
+  transporte, la cabecera de la timeline y la barra superior pasan a dos filas
+  en vez de solaparse. En el primer arranque, si la pantalla es muy grande en
+  puntos (1440p o 4K al 100 %), la interfaz empieza al 125 % o al 150 %;
+- casi todos los botones y controles explican qué hacen al pasar el ratón,
+  con su atajo cuando lo tienen; los apartados del Inspector se separan con
+  una marca y una línea.
 
 ## Instalacion
 
@@ -108,7 +173,8 @@ Tambien se pueden colocar `ffmpeg.exe`, `ffprobe.exe` y `ffplay.exe` junto a
 
 Whisper es opcional y no se incluye por el tamaño de los modelos. Coloca el
 ejecutable y el modelo en `whisper` junto a `novacut-windows.exe`, o en
-`%LOCALAPPDATA%\NovaCut\Whisper`.
+`%LOCALAPPDATA%\NovaCut\Whisper`, o en la carpeta que indique la variable
+`NOVACUT_WHISPER_DIR`. Para español conviene al menos el modelo `base`.
 
 ## Limites actuales
 

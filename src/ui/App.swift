@@ -46,6 +46,54 @@ struct MediaItem: Identifiable, Hashable {
     }
 }
 
+enum FiltroDeMedio: String, CaseIterable, Identifiable {
+    case todos
+    case video
+    case audio
+
+    var id: String { rawValue }
+
+    var nombre: String {
+        switch self {
+        case .todos: "Todos"
+        case .video: "Vídeo"
+        case .audio: "Audio"
+        }
+    }
+}
+
+enum FiltroDeProxy: String, CaseIterable, Identifiable {
+    case todos
+    case disponible
+    case ausente
+
+    var id: String { rawValue }
+
+    var nombre: String {
+        switch self {
+        case .todos: "Proxy: todos"
+        case .disponible: "Con proxy"
+        case .ausente: "Sin proxy"
+        }
+    }
+}
+
+enum OrdenDeMedios: String, CaseIterable, Identifiable {
+    case nombre
+    case duracion
+    case uso
+
+    var id: String { rawValue }
+
+    var nombre: String {
+        switch self {
+        case .nombre: "Nombre"
+        case .duracion: "Duración"
+        case .uso: "Usos"
+        }
+    }
+}
+
 struct RecuperacionPendiente: Identifiable {
     let id = UUID()
     let nombre: String
@@ -164,6 +212,13 @@ final class EditorState: ObservableObject {
     @Published var selectedClipID: UUID?
     @Published var timelineHasFocus = false
     @Published var selectedClipIDs: Set<UUID> = []
+    @Published var ordenDeSeleccionClips: [UUID] = []
+    @Published var mostrarCentroDeComandos = false
+    @Published var filtroDeMedio: FiltroDeMedio = .todos
+    @Published var filtroDeProxy: FiltroDeProxy = .todos
+    @Published var ordenarMedios: OrdenDeMedios = .nombre
+    @Published var ordenDeMediosDescendente = false
+    @Published var soloMediosOffline = false
     /// Pista donde caen las inserciones y los cortes.
     @Published var pistaActiva: UUID?
     @Published var herramienta: Herramienta = .seleccion
@@ -342,23 +397,124 @@ final class EditorState: ObservableObject {
 
     var mediosVisibles: [MediaItem] {
         let termino = mediaSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Un bin inteligente filtra por su `filtro`; los bins normales por
-        // pertenencia manual.
+        let palabras = termino.split(whereSeparator: { $0 == " " }).map(String.init)
         let binInteligente = montaje.bins?.first { $0.nombre == selectedBin && $0.esInteligente }
-        return media.filter { item in
+        let filtrados = media.filter { item in
             let coincideBin: Bool
             if let inteligente = binInteligente {
                 coincideBin = inteligente.contiene((item.name, item.variableFrameRate, item.size == .zero))
             } else {
                 coincideBin = selectedBin == "Todos" || item.bin == selectedBin
             }
-            let coincideTexto = termino.isEmpty || item.name.lowercased().contains(termino)
-            return coincideBin && coincideTexto
+            let coincideTipo: Bool
+            switch filtroDeMedio {
+            case .todos: coincideTipo = true
+            case .video: coincideTipo = medios[item.id]?.tieneVideo == true || item.size != .zero
+            case .audio: coincideTipo = medios[item.id]?.tieneVideo != true && item.size == .zero
+            }
+            let coincideTexto = palabras.allSatisfy {
+                item.name.lowercased().contains($0) || item.url.path.lowercased().contains($0)
+            }
+            let coincideOffline = !soloMediosOffline || medios[item.id] == nil
+            let coincideProxy: Bool
+            switch filtroDeProxy {
+            case .todos: coincideProxy = true
+            case .disponible: coincideProxy = proxyURLs[item.id].map { FileManager.default.fileExists(atPath: $0.path) } == true
+            case .ausente: coincideProxy = proxyURLs[item.id].map { FileManager.default.fileExists(atPath: $0.path) } != true
+            }
+            return coincideBin && coincideTipo && coincideTexto && coincideOffline && coincideProxy
+        }
+        return filtrados.sorted { izquierda, derecha in
+            let comparacion: ComparisonResult
+            switch ordenarMedios {
+            case .nombre: comparacion = izquierda.name.localizedCaseInsensitiveCompare(derecha.name)
+            case .duracion: comparacion = izquierda.duration == derecha.duration ? .orderedSame : (izquierda.duration < derecha.duration ? .orderedAscending : .orderedDescending)
+            case .uso: comparacion = usosDelMedio(izquierda.id) == usosDelMedio(derecha.id) ? .orderedSame : (usosDelMedio(izquierda.id) < usosDelMedio(derecha.id) ? .orderedAscending : .orderedDescending)
+            }
+            if comparacion != .orderedSame { return ordenDeMediosDescendente ? comparacion == .orderedDescending : comparacion == .orderedAscending }
+            return izquierda.id.uuidString < derecha.id.uuidString
         }
     }
 
-    /// Cabezal en frames. Es la posición verdadera; `playhead` en segundos existe
-    /// solo porque el reproductor habla en segundos.
+    func usosDelMedio(_ id: UUID) -> Int {
+        montaje.todosLosClips.reduce(into: 0) { total, entrada in
+            if entrada.clip.mediaID == id { total += 1 }
+        }
+    }
+
+    func seleccionarTodosLosClips() {
+        let ids = montaje.todosLosClips.map { $0.clip.id }
+        selectedClipIDs = Set(ids)
+        ordenDeSeleccionClips = ids
+        selectedClipID = ids.first
+    }
+
+    func invertirSeleccion() {
+        let actuales = Set(selectedClipIDs)
+        let ids = montaje.todosLosClips.map { $0.clip.id }.filter { !actuales.contains($0) }
+        selectedClipIDs = Set(ids)
+        ordenDeSeleccionClips = ids
+        selectedClipID = ids.first
+    }
+
+    func seleccionarClipsDesactivados() {
+        let ids = montaje.todosLosClips.filter { !$0.clip.habilitado }.map { $0.clip.id }
+        selectedClipIDs = Set(ids)
+        ordenDeSeleccionClips = ids
+        selectedClipID = ids.first
+        status = ids.isEmpty ? "No hay clips desactivados" : "\(ids.count) clips desactivados seleccionados"
+    }
+
+    func seleccionarUsosDelMedio(_ id: UUID) {
+        let ids = montaje.todosLosClips.filter { $0.clip.mediaID == id }.map { $0.clip.id }
+        selectedClipIDs = Set(ids)
+        ordenDeSeleccionClips = ids
+        selectedClipID = ids.first
+        selectedMediaID = id
+        status = "\(ids.count) uso(s) del medio seleccionados"
+    }
+
+    func moverAlUso(_ mediaID: UUID, haciaDelante: Bool) {
+        let usos = montaje.todosLosClips.filter { $0.clip.mediaID == mediaID }.sorted {
+            if $0.clip.inicio == $1.clip.inicio { return $0.clip.id.uuidString < $1.clip.id.uuidString }
+            return $0.clip.inicio < $1.clip.inicio
+        }
+        guard !usos.isEmpty else { return }
+        let actual = selectedClipID.flatMap { id in usos.firstIndex(where: { $0.clip.id == id }) }
+        let siguiente: Int
+        if let actual {
+            siguiente = haciaDelante ? (actual + 1) % usos.count : (actual - 1 + usos.count) % usos.count
+        } else {
+            siguiente = haciaDelante ? 0 : usos.count - 1
+        }
+        let destino = usos[siguiente].clip
+        seleccionarClip(destino.id)
+        seek(toFrame: destino.inicio)
+    }
+
+    func ajustarVistaASeleccion() {
+        let ids = seleccionados()
+        let clips = ids.compactMap { montaje.clip($0) }
+        guard let primero = clips.map(\.inicio).min(), let ultimo = clips.map(\.fin).max() else { return }
+        let duracion = max(1, ultimo - primero)
+        let visible = max(180, anchoVisibleDelMontaje - 24)
+        timelineScale = min(max(Double(visible) / (Double(duracion) / max(timebase.fps, 1)) * 0.82, 8), 240)
+        status = "Vista ajustada a la selección"
+    }
+
+    func aplicarEdicionLote(_ ajustes: AjustesLote, ids: [UUID]? = nil) {
+        let objetivos = ids ?? seleccionados()
+        let before = snapshot()
+        let informe = aplicarLote(objetivos, ajustes: ajustes, en: &montaje)
+        guard informe.changed > 0 else {
+            status = "No hubo cambios: \(informe.unchanged) sin cambios, \(informe.locked) bloqueados"
+            return
+        }
+        commit(before: before)
+        rebuildPreview(keepPosition: true)
+        status = "Lote: \(informe.changed) cambiados, \(informe.unchanged) sin cambios, \(informe.locked) bloqueados"
+    }
+
     var cabezal: Int64 { timebase.frames(segundos: playhead) }
 
     var duracionEnFrames: Int64 { montaje.duracion }
@@ -1797,6 +1953,57 @@ final class EditorState: ObservableObject {
     /// montadas por separado se unen en una sola línea de tiempo sin copiar
     /// archivos. Los medios que ya están (mismo archivo) no se duplican; sus
     /// clips se remapean al medio existente.
+    /// Lee un EDL y monta sus cortes. Los medios entran offline: un EDL describe
+    /// cintas y timecodes, no archivos. Se resuelven después con la
+    /// revinculación en lote, que es exactamente el flujo de una sala de máster.
+    func importarEDL() {
+        let panel = NSOpenPanel()
+        panel.title = "Importar EDL (CMX 3600)"
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "edl") ?? .plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let datos = try? Data(contentsOf: url),
+              let texto = String(data: datos, encoding: .utf8) ?? String(data: datos, encoding: .isoLatin1) else {
+            status = "No se pudo leer «\(url.lastPathComponent)»"
+            return
+        }
+        let leido = EDLDeEditorcito.importar(texto, timebase: timebase)
+        guard leido.montaje.duracion > 0 else {
+            status = "«\(url.lastPathComponent)» no trae eventos que montar"
+            return
+        }
+        // Un medio offline por reel, con el nombre que traía el EDL: así la
+        // búsqueda en carpeta puede localizarlos por nombre de archivo.
+        var nuevos: [MediaItem] = []
+        for (reel, id) in leido.mediosPorReel {
+            let nombre = leido.nombresPorReel[reel] ?? reel
+            nuevos.append(
+                MediaItem(
+                    id: id,
+                    url: URL(fileURLWithPath: nombre),
+                    duration: 0, size: .zero, fileSize: 0, frameRate: 0,
+                    variableFrameRate: false, bin: "EDL: \(leido.titulo ?? url.deletingPathExtension().lastPathComponent)",
+                    subclipDe: nil
+                )
+            )
+        }
+        invalidarGeneracionDeProxies()
+        performEdit(keepPosition: false) {
+            montaje = leido.montaje
+            media.append(contentsOf: nuevos.sorted { $0.name < $1.name })
+        }
+        selectedMediaID = nuevos.first?.id
+        selectedClipID = montaje.todosLosClips.first?.clip.id
+        pistaActiva = montaje.pistas.first { $0.tipo == .video }?.id
+        let cortes = montaje.todosLosClips.count
+        var texto2 = "EDL importado · \(cortes) corte\(cortes == 1 ? "" : "s") · \(nuevos.count) medio(s) offline"
+        texto2 += " · Archivo > Revincular medios offline desde una carpeta…"
+        if !leido.avisos.isEmpty {
+            texto2 += " · \(leido.avisos.count) aviso(s): \(leido.avisos.prefix(2).joined(separator: " · "))"
+        }
+        status = texto2
+    }
+
     func importarOtroProyecto() {
         let panel = NSOpenPanel()
         panel.title = "Importar proyecto Editorcito"
@@ -1968,6 +2175,7 @@ final class EditorState: ObservableObject {
         let avisoMedios = perdidos.isEmpty
             ? ""
             : " · \(perdidos.count) medio(s) offline: \(perdidos.prefix(3).joined(separator: ", "))"
+                + " · Archivo > Revincular medios offline desde una carpeta…"
         status = recuperado
             ? "Montaje recuperado; guárdalo para conservarlo\(avisoMedios)"
             : "Proyecto abierto\(avisoMedios)"
@@ -1981,39 +2189,94 @@ final class EditorState: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.audiovisualContent]
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        invalidarGeneracionDeProxies()
         Task {
-            guard let medio = try? await MedioResuelto.cargar(id: id, url: url) else {
-                status = "Ese archivo no se puede usar"
-                return
-            }
-            medios[id] = medio
-            mediosOriginales[id] = medio
-            proxyURLs[id] = nil
-            if proxiesActivos { proxiesActivos = false }
-            miniaturas[id] = await MedioResuelto.miniatura(medio)
-            prepararFormaDeOnda(medio)
-            if let i = media.firstIndex(where: { $0.id == id }) {
-                let anterior = media[i]
-                let valores = try? url.resourceValues(forKeys: [.fileSizeKey])
-                let bytes = Int64(valores?.fileSize ?? Int(anterior.fileSize))
-                media[i] = MediaItem(
-                    id: id, url: url,
-                    duration: anterior.subclipDe.map { timebase.segundos($0.duracion) } ?? medio.duracion.seconds,
-                    size: medio.tamanoVisible, fileSize: bytes, frameRate: medio.fps,
-                    variableFrameRate: medio.esVFR, bin: anterior.bin,
-                    subclipDe: anterior.subclipDe
-                )
-            }
-            if sourceMediaID == id { cargarMedioEnOrigen(id) }
-            ultimoRender = nil
-            rebuildPreview(keepPosition: true)
-            scheduleAutosave()
-            status = "Medio revinculado"
+            status = await aplicarRevinculacion(id, a: url) ? "Medio revinculado" : "Ese archivo no se puede usar"
         }
+    }
+
+    /// Localiza de golpe todos los medios offline dentro de una carpeta. Mover
+    /// un rodaje entero es la forma habitual de romper un proyecto, y hacerlo
+    /// archivo por archivo no es una respuesta cuando son doscientos.
+    func revincularDesdeCarpeta() {
+        let offline = media.filter { medios[$0.id] == nil }
+        guard !offline.isEmpty else {
+            status = "No hay medios offline que revincular"
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Elegir la carpeta donde buscar los medios"
+        panel.prompt = "Buscar aquí"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let carpeta = panel.url else { return }
+        invalidarGeneracionDeProxies()
+        let pendientes = offline.map {
+            MedioPendiente(id: $0.id, nombre: $0.url.lastPathComponent, bytes: $0.fileSize)
+        }
+        status = "Buscando \(pendientes.count) medio(s) en \(carpeta.lastPathComponent)…"
+        Task {
+            // El recorrido puede tocar miles de archivos: fuera del hilo principal.
+            let resultado = await Task.detached(priority: .userInitiated) {
+                Revinculacion.buscar(pendientes, en: carpeta)
+            }.value
+            var aplicados = 0
+            var rechazados: [String] = []
+            for pendiente in pendientes {
+                guard let url = resultado.encontrados[pendiente.id] else { continue }
+                if await aplicarRevinculacion(pendiente.id, a: url) {
+                    aplicados += 1
+                } else {
+                    rechazados.append(pendiente.nombre)
+                }
+            }
+            var texto = Revinculacion.resumen(resultado)
+            if !rechazados.isEmpty {
+                // Encontrado por nombre pero ilegible: un archivo corrupto o de
+                // un códec que este Mac no abre. Decirlo, no contarlo como éxito.
+                texto = texto.replacingOccurrences(
+                    of: "\(resultado.encontrados.count) medio",
+                    with: "\(aplicados) medio"
+                ) + " · \(rechazados.count) no se pudieron abrir: \(rechazados.prefix(3).joined(separator: ", "))"
+            }
+            status = texto
+        }
+    }
+
+    /// Apunta un medio a otro archivo conservando el montaje. `false` si el
+    /// archivo elegido no se puede usar.
+    private func aplicarRevinculacion(_ id: UUID, a url: URL) async -> Bool {
+        guard let medio = try? await MedioResuelto.cargar(id: id, url: url) else { return false }
+        medios[id] = medio
+        mediosOriginales[id] = medio
+        proxyURLs[id] = nil
+        if proxiesActivos { proxiesActivos = false }
+        miniaturas[id] = await MedioResuelto.miniatura(medio)
+        prepararFormaDeOnda(medio)
+        if let i = media.firstIndex(where: { $0.id == id }) {
+            let anterior = media[i]
+            let valores = try? url.resourceValues(forKeys: [.fileSizeKey])
+            let bytes = Int64(valores?.fileSize ?? Int(anterior.fileSize))
+            media[i] = MediaItem(
+                id: id, url: url,
+                duration: anterior.subclipDe.map { timebase.segundos($0.duracion) } ?? medio.duracion.seconds,
+                size: medio.tamanoVisible, fileSize: bytes, frameRate: medio.fps,
+                variableFrameRate: medio.esVFR, bin: anterior.bin,
+                subclipDe: anterior.subclipDe
+            )
+        }
+        if sourceMediaID == id { cargarMedioEnOrigen(id) }
+        ultimoRender = nil
+        rebuildPreview(keepPosition: true)
+        scheduleAutosave()
+        return true
     }
 
     /// `true` si el clip apunta a un medio que ahora mismo no está disponible.
     func estaOffline(_ clip: Clip) -> Bool { medios[clip.mediaID] == nil }
+
+    var hayMediosOffline: Bool { media.contains { medios[$0.id] == nil } }
 
     static func timebaseMasCercana(a fps: Double) -> Timebase {
         ProyectoEditorcito.timebaseMasCercana(a: fps)
@@ -2216,17 +2479,32 @@ final class EditorState: ObservableObject {
         addToTimeline(selectedMedia)
     }
 
-    func seleccionarClip(_ id: UUID, extender: Bool = false) {
+    func seleccionarClip(_ id: UUID, extender: Bool = false, alternar: Bool = false) {
         timelineHasFocus = true
         if extender {
             if selectedClipIDs.contains(id) {
                 selectedClipIDs.remove(id)
+                ordenDeSeleccionClips.removeAll { $0 == id }
             } else {
                 selectedClipIDs.insert(id)
+                ordenDeSeleccionClips.removeAll { $0 == id }
+                ordenDeSeleccionClips.append(id)
             }
-            selectedClipID = selectedClipIDs.first ?? id
+            selectedClipID = ordenDeSeleccionClips.last ?? id
+        } else if alternar {
+            if selectedClipIDs.contains(id) {
+                selectedClipIDs.remove(id)
+                ordenDeSeleccionClips.removeAll { $0 == id }
+                selectedClipID = ordenDeSeleccionClips.last
+            } else {
+                selectedClipIDs.insert(id)
+                ordenDeSeleccionClips.removeAll { $0 == id }
+                ordenDeSeleccionClips.append(id)
+                selectedClipID = id
+            }
         } else {
             selectedClipIDs = [id]
+            ordenDeSeleccionClips = [id]
             selectedClipID = id
         }
     }
@@ -2502,6 +2780,7 @@ final class EditorState: ObservableObject {
     /// pegar velocidad cambiaría la duración del clip, que no es un atributo.
     struct AtributosCopiados {
         var transformacion: TransformacionDeClip
+        var color: ColorDeClip
         var ganancia: Double
         var entradaFundido: Int64
         var salidaFundido: Int64
@@ -2518,6 +2797,7 @@ final class EditorState: ObservableObject {
         guard let id = selectedClipID, let clip = montaje.clip(id) else { return }
         atributosCopiados = AtributosCopiados(
             transformacion: clip.transformacion,
+            color: clip.color,
             ganancia: clip.ganancia,
             entradaFundido: clip.entradaFundido,
             salidaFundido: clip.salidaFundido
@@ -2532,17 +2812,26 @@ final class EditorState: ObservableObject {
     func pegarAtributos() {
         guard let copiados = atributosCopiados else { return }
         let objetivos = seleccionados()
-        guard !objetivos.isEmpty else { return }
-        for id in objetivos {
-            modificarClip(id) { clip in
-                clip.transformacion = copiados.transformacion
-                clip.ganancia = copiados.ganancia
-                clip.entradaFundido = copiados.entradaFundido
-                clip.salidaFundido = copiados.salidaFundido
+        let aplicables = objetivos.filter { id in
+            guard let clip = montaje.clip(id), let pistaID = montaje.pistaDe(clip: id),
+                  let pista = montaje.pista(pistaID) else { return false }
+            return !pista.bloqueada && clip.nido == nil
+        }
+        guard !aplicables.isEmpty else {
+            status = "La selección está en pistas bloqueadas o nidos"
+            return
+        }
+        performEdit(keepPosition: true) {
+            for id in aplicables {
+                guard let (p, c) = self.montaje.indiceDeClip(id) else { continue }
+                self.montaje.pistas[p].clips[c].transformacion = copiados.transformacion
+                self.montaje.pistas[p].clips[c].color = copiados.color
+                self.montaje.pistas[p].clips[c].ganancia = copiados.ganancia
+                self.montaje.pistas[p].clips[c].entradaFundido = min(copiados.entradaFundido, self.montaje.pistas[p].clips[c].duracion / 2)
+                self.montaje.pistas[p].clips[c].salidaFundido = min(copiados.salidaFundido, self.montaje.pistas[p].clips[c].duracion / 2)
             }
         }
-        scheduleAutosave()
-        status = "Atributos pegados en \(objetivos.count) \(objetivos.count == 1 ? "clip" : "clips")"
+        status = "Atributos pegados en \(aplicables.count) \(aplicables.count == 1 ? "clip" : "clips")"
     }
 
     /// Refresca el instrumento del monitor (forma de onda o vectorscopio).
@@ -2646,8 +2935,12 @@ final class EditorState: ObservableObject {
     }
 
     /// Los clips seleccionados, o el clip seleccionado suelto si no hay conjunto.
-    private func seleccionados() -> [UUID] {
-        if !selectedClipIDs.isEmpty { return Array(selectedClipIDs) }
+    func seleccionados() -> [UUID] {
+        if !selectedClipIDs.isEmpty {
+            let orden = ordenDeSeleccionClips.filter { selectedClipIDs.contains($0) }
+            let faltan = montaje.todosLosClips.map { $0.clip.id }.filter { selectedClipIDs.contains($0) && !orden.contains($0) }
+            return orden + faltan
+        }
         if let id = selectedClipID { return [id] }
         return []
     }
@@ -2958,9 +3251,55 @@ final class EditorState: ObservableObject {
         modificarClip(id) { $0.habilitado.toggle() }
     }
 
+    func asegurarSeleccionContextual(_ id: UUID) {
+        if !selectedClipIDs.contains(id) { seleccionarClip(id) }
+        if selectedClipID == nil { selectedClipID = id }
+    }
+
+    func alternarHabilitadoSeleccion() {
+        let ids = seleccionados()
+        guard !ids.isEmpty else { return }
+        let cambiarA = !ids.allSatisfy { montaje.clip($0)?.habilitado == true }
+        performEdit(keepPosition: true) {
+            for id in ids {
+                guard let (p, c) = self.montaje.indiceDeClip(id),
+                      !self.montaje.pistas[p].bloqueada else { continue }
+                self.montaje.pistas[p].clips[c].habilitado = cambiarA
+            }
+        }
+        status = cambiarA ? "Clips activados" : "Clips desactivados"
+    }
+
     func etiquetar(_ id: UUID, _ etiqueta: EtiquetaDeColor) {
         modificarClip(id, recompilar: false) { $0.etiqueta = etiqueta }
         scheduleAutosave()
+    }
+
+    func etiquetarSeleccion(_ etiqueta: EtiquetaDeColor) {
+        let ids = seleccionados()
+        guard !ids.isEmpty else { return }
+        performEdit(keepPosition: true) {
+            for id in ids {
+                guard let (p, c) = self.montaje.indiceDeClip(id),
+                      !self.montaje.pistas[p].bloqueada else { continue }
+                self.montaje.pistas[p].clips[c].etiqueta = etiqueta
+            }
+        }
+    }
+
+    func fundidoRapidoSeleccion() {
+        let ids = seleccionados()
+        guard !ids.isEmpty else { return }
+        let amount = Int64(timebase.fpsNominal)
+        performEdit(keepPosition: true) {
+            for id in ids {
+                guard let (p, c) = self.montaje.indiceDeClip(id),
+                      !self.montaje.pistas[p].bloqueada else { continue }
+                self.montaje.pistas[p].clips[c].entradaFundido = min(amount, self.montaje.pistas[p].clips[c].duracion / 2)
+                self.montaje.pistas[p].clips[c].salidaFundido = min(amount, self.montaje.pistas[p].clips[c].duracion / 2)
+            }
+        }
+        status = "Fundidos de 1 s en la selección"
     }
 
     /// Aplica un mando de la rueda primaria al clip.
@@ -3582,6 +3921,10 @@ final class EditorState: ObservableObject {
                     medios: mediosDeTrabajo,
                     para: montajeDeTrabajo.timebase
                 )
+                guard preparados.fallos.isEmpty else {
+                    status = ErrorDeConformadoVFR.incompleto(preparados.fallos).localizedDescription
+                    return
+                }
                 let render = ConstructorDeMontaje.construir(
                     montajeDeTrabajo,
                     medios: preparados.medios,
@@ -3681,6 +4024,10 @@ final class EditorState: ObservableObject {
                     medios: trabajo.medios,
                     para: paraExportar.timebase
                 )
+                guard preparados.fallos.isEmpty else {
+                    status = ErrorDeConformadoVFR.incompleto(preparados.fallos).localizedDescription
+                    return
+                }
                 let render = ConstructorDeMontaje.construir(
                     paraExportar,
                     medios: preparados.medios,
@@ -4088,7 +4435,9 @@ final class EditorState: ObservableObject {
     }
 
     private func snapshot() -> EditSnapshot {
-        EditSnapshot(media: media, montaje: montaje, selectedMediaID: selectedMediaID, selectedClipID: selectedClipID)
+        EditSnapshot(media: media, montaje: montaje, selectedMediaID: selectedMediaID,
+                     selectedClipID: selectedClipID, selectedClipIDs: selectedClipIDs,
+                     ordenDeSeleccionClips: ordenDeSeleccionClips)
     }
 
     private func performEdit(keepPosition: Bool = false, _ mutation: () -> Void) {
@@ -4101,6 +4450,11 @@ final class EditorState: ObservableObject {
     private func commit(before: EditSnapshot) {
         guard before.media != media || before.montaje != montaje else { return }
         selectedClipIDs = Set(selectedClipIDs.filter { montaje.clip($0) != nil })
+        ordenDeSeleccionClips.removeAll { !selectedClipIDs.contains($0) }
+        if let primary = selectedClipID, montaje.clip(primary) != nil, !selectedClipIDs.contains(primary) {
+            selectedClipIDs = [primary]
+            ordenDeSeleccionClips = [primary]
+        }
         isDirty = true
         // La entrada de la historia se describe comparando los dos montajes.
         var entrada = before
@@ -4119,7 +4473,8 @@ final class EditorState: ObservableObject {
         selectedMediaID = value.selectedMediaID
         selectedMediaIDs = value.selectedMediaID.map { Set<UUID>([$0]) } ?? Set<UUID>()
         selectedClipID = value.selectedClipID
-        selectedClipIDs = value.selectedClipID.map { [$0] } ?? []
+        selectedClipIDs = value.selectedClipIDs
+        ordenDeSeleccionClips = value.ordenDeSeleccionClips
         documentRevision += 1
         updateHistoryState()
         scheduleAutosave()
@@ -4225,6 +4580,8 @@ private struct EditSnapshot {
     let montaje: LineaDeTiempo
     let selectedMediaID: UUID?
     let selectedClipID: UUID?
+    let selectedClipIDs: Set<UUID>
+    let ordenDeSeleccionClips: [UUID]
     /// Descripción del cambio que representa, para el panel de historia.
     var descripcion: String = ""
 }
@@ -4357,6 +4714,7 @@ struct ContentView: View {
     @AppStorage("ui.escala") private var escalaDeInterfaz = 1.0
     @State private var iaExpandida = false
     @State private var historiaExpandida = false
+    @State private var borradorLote = AjustesLote.vacio
 
     var body: some View {
         GeometryReader { geo in
@@ -4387,7 +4745,10 @@ struct ContentView: View {
             return true
         }
         .onOpenURL { editor.importURLs([$0]) }
+        .onChange(of: editor.selectedClipIDs) { _, _ in prepararBorradorLote() }
+        .onAppear { prepararBorradorLote() }
         .sheet(isPresented: $editor.mostrarSubtitulos) { PanelDeSubtitulos(editor: editor) }
+        .sheet(isPresented: $editor.mostrarCentroDeComandos) { CentroDeComandos(editor: editor) }
         .alert(item: $editor.recuperacionPendiente) { pendiente in
             Alert(
                 title: Text("Recuperación disponible"),
@@ -4400,6 +4761,15 @@ struct ContentView: View {
                 }
             )
         }
+    }
+
+    private func prepararBorradorLote() {
+        let clips = editor.seleccionados().compactMap { editor.montaje.clip($0) }
+        guard !clips.isEmpty else {
+            borradorLote = .vacio
+            return
+        }
+        borradorLote = .vacio
     }
 
     /// Lo que necesita el lienzo para que ningún panel se salga de su sitio: la
@@ -4516,6 +4886,15 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .disabled(!editor.canRedo)
             .help("Rehacer lo deshecho (⇧⌘Z)")
+            Button {
+                editor.mostrarCentroDeComandos = true
+            } label: {
+                Label("Buscar", systemImage: "command")
+                    .labelStyle(.titleAndIcon)
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .help("Centro de comandos (⌘⇧P)")
             Button {
                 editor.openProject()
             } label: {
@@ -4644,6 +5023,43 @@ struct ContentView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
             .background(Color(nsColor: NSColor(calibratedWhite: 0.12, alpha: 1)))
+            HStack(spacing: 5) {
+                Picker("Tipo", selection: $editor.filtroDeMedio) {
+                    ForEach(FiltroDeMedio.allCases) { filtro in
+                        Text(filtro.nombre).tag(filtro)
+                    }
+                }
+                .labelsHidden()
+                .help("Filtrar por tipo de medio")
+                Picker("Proxy", selection: $editor.filtroDeProxy) {
+                    ForEach(FiltroDeProxy.allCases) { filtro in
+                        Text(filtro.nombre).tag(filtro)
+                    }
+                }
+                .labelsHidden()
+                .help("Filtrar por disponibilidad de proxy")
+                Toggle("Offline", isOn: $editor.soloMediosOffline)
+                    .toggleStyle(.checkbox)
+                    .help("Mostrar solo medios sin archivo disponible")
+                Spacer(minLength: 0)
+                Picker("Orden", selection: $editor.ordenarMedios) {
+                    ForEach(OrdenDeMedios.allCases) { orden in
+                        Text(orden.nombre).tag(orden)
+                    }
+                }
+                .labelsHidden()
+                .help("Ordenar biblioteca")
+                Button {
+                    editor.ordenDeMediosDescendente.toggle()
+                } label: {
+                    Image(systemName: editor.ordenDeMediosDescendente ? "arrow.down" : "arrow.up")
+                }
+                .buttonStyle(.borderless)
+                .help(editor.ordenDeMediosDescendente ? "Orden descendente" : "Orden ascendente")
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 5)
             Picker("Bin", selection: $editor.selectedBin) {
                 ForEach(editor.nombresDeBins, id: \.self) { nombre in
                     Text(nombre).tag(nombre)
@@ -4711,7 +5127,10 @@ struct ContentView: View {
                             .truncationMode(.middle)
                             .help(item.name)
                     }
-                    Text(item.detail).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                    Text("\(item.detail) · \(editor.usosDelMedio(item.id)) uso(s)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 .padding(.vertical, 4)
                 .tag(item.id)
@@ -4728,6 +5147,11 @@ struct ContentView: View {
                         }
                     }
                     Button("Quitar del bin") { editor.moverMedio(item.id, aBin: "Todos") }
+                    Divider()
+                    Button("Seleccionar todos los usos") { editor.seleccionarUsosDelMedio(item.id) }
+                    Button("Uso anterior") { editor.moverAlUso(item.id, haciaDelante: false) }
+                    Button("Uso siguiente") { editor.moverAlUso(item.id, haciaDelante: true) }
+                    Button("Abrir en origen") { editor.cargarMedioEnOrigen(item.id) }
                 }
             }
             .listStyle(.sidebar)
@@ -5109,7 +5533,9 @@ struct ContentView: View {
                 .padding(10)
                 Divider()
             }
-            if let clip = editor.selectedClip {
+            if editor.seleccionados().count > 1 {
+                inspectorDeLote()
+            } else if let clip = editor.selectedClip {
                 inspectorDeClip(clip)
             } else {
                 ContentUnavailableView(
@@ -5121,6 +5547,151 @@ struct ContentView: View {
             Divider()
             historiaDeEdicion
         }
+    }
+
+    private func inspectorDeLote() -> some View {
+        let clips = editor.seleccionados().compactMap { editor.montaje.clip($0) }
+        let transformacionComun = transformacionLoteComun(clips)
+        let colorComun = colorLoteComun(clips)
+        let transformacionBase = transformacionComun ?? TransformacionLote(
+            posicionX: clips.first?.transformacion.posicionX ?? 0,
+            posicionY: clips.first?.transformacion.posicionY ?? 0,
+            escala: clips.first?.transformacion.escala ?? 100,
+            rotacion: clips.first?.transformacion.rotacion ?? 0,
+            opacidad: clips.first?.transformacion.opacidad ?? 100
+        )
+        let colorBase = colorComun ?? ColorLote(
+            exposicion: clips.first?.color.exposicion ?? 0,
+            contraste: clips.first?.color.contraste ?? 0,
+            saturacion: clips.first?.color.saturacion ?? 0,
+            vineta: clips.first?.color.vignette ?? 0,
+            desenfoque: clips.first?.color.desenfoque ?? 0
+        )
+        let audioCount = clips.filter { clip in
+            guard let pistaID = editor.montaje.pistaDe(clip: clip.id) else { return false }
+            return editor.montaje.pista(pistaID)?.tipo == .audio
+        }.count
+        let bloqueadas = clips.filter { clip in
+            guard let pistaID = editor.montaje.pistaDe(clip: clip.id) else { return true }
+            return editor.montaje.pista(pistaID)?.bloqueada == true
+        }.count
+        return Form {
+            Section("Edición por lotes") {
+                Label("\(clips.count) clips seleccionados", systemImage: "square.stack.3d.up")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("\(audioCount) audio · \(bloqueadas) bloqueados · los cambios se aplican en un solo paso")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            Section("Transformación") {
+                if transformacionComun == nil {
+                    Text("Valores mixtos: al mover un mando se aplica un valor común")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                deslizador("X", (borradorLote.transformacion ?? transformacionBase).posicionX, -2000...2000, "px") { value in
+                    var draft = borradorLote.transformacion ?? transformacionBase
+                    draft.posicionX = value
+                    borradorLote.transformacion = draft
+                }
+                deslizador("Y", (borradorLote.transformacion ?? transformacionBase).posicionY, -2000...2000, "px") { value in
+                    var draft = borradorLote.transformacion ?? transformacionBase
+                    draft.posicionY = value
+                    borradorLote.transformacion = draft
+                }
+                deslizador("Escala", (borradorLote.transformacion ?? transformacionBase).escala, 10...800, "%") { value in
+                    var draft = borradorLote.transformacion ?? transformacionBase
+                    draft.escala = value
+                    borradorLote.transformacion = draft
+                }
+                deslizador("Giro", (borradorLote.transformacion ?? transformacionBase).rotacion, -3600...3600, "°") { value in
+                    var draft = borradorLote.transformacion ?? transformacionBase
+                    draft.rotacion = value
+                    borradorLote.transformacion = draft
+                }
+                deslizador("Opacidad", (borradorLote.transformacion ?? transformacionBase).opacidad, 0...100, "%") { value in
+                    var draft = borradorLote.transformacion ?? transformacionBase
+                    draft.opacidad = value
+                    borradorLote.transformacion = draft
+                }
+            }
+            Section("Color") {
+                if colorComun == nil {
+                    Text("Valores mixtos: al mover un mando se aplica un valor común")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                deslizador("Exposición", (borradorLote.color ?? colorBase).exposicion, -100...100, "") { value in
+                    var draft = borradorLote.color ?? colorBase
+                    draft.exposicion = value
+                    borradorLote.color = draft
+                }
+                deslizador("Contraste", (borradorLote.color ?? colorBase).contraste, -100...100, "") { value in
+                    var draft = borradorLote.color ?? colorBase
+                    draft.contraste = value
+                    borradorLote.color = draft
+                }
+                deslizador("Saturación", (borradorLote.color ?? colorBase).saturacion, -100...100, "") { value in
+                    var draft = borradorLote.color ?? colorBase
+                    draft.saturacion = value
+                    borradorLote.color = draft
+                }
+                deslizador("Viñeta", (borradorLote.color ?? colorBase).vineta, 0...100, "%") { value in
+                    var draft = borradorLote.color ?? colorBase
+                    draft.vineta = value / 100
+                    borradorLote.color = draft
+                }
+                deslizador("Desenfoque", (borradorLote.color ?? colorBase).desenfoque, 0...50, "%") { value in
+                    var draft = borradorLote.color ?? colorBase
+                    draft.desenfoque = value / 100
+                    borradorLote.color = draft
+                }
+            }
+            Section("Audio y fundidos") {
+                deslizador("Ganancia", clips.first?.ganancia ?? 0, -60...12, "dB") { value in
+                    borradorLote.ganancia = value
+                }
+                deslizador("Entrada", Double(clips.first?.entradaFundido ?? 0) / editor.timebase.fps, 0...5, "s") { value in
+                    borradorLote.entradaFundido = Int64(value * editor.timebase.fps)
+                }
+                deslizador("Salida", Double(clips.first?.salidaFundido ?? 0) / editor.timebase.fps, 0...5, "s") { value in
+                    borradorLote.salidaFundido = Int64(value * editor.timebase.fps)
+                }
+                Text("La ganancia solo se aplica a \(audioCount) clip(s) de audio; los fundidos se ajustan a la duración de cada clip.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            Section("Organización") {
+                Picker("Etiqueta", selection: Binding(
+                    get: { borradorLote.etiqueta ?? clips.first?.etiqueta ?? .ninguna },
+                    set: { borradorLote.etiqueta = $0 }
+                )) {
+                    ForEach(EtiquetaDeColor.allCases, id: \.self) { etiqueta in
+                        Text(etiqueta.nombre).tag(etiqueta)
+                    }
+                }
+                Toggle("Activados", isOn: Binding(
+                    get: { borradorLote.habilitado ?? clips.allSatisfy(\.habilitado) },
+                    set: { borradorLote.habilitado = $0 }
+                ))
+            }
+            HStack {
+                Button("Aplicar a la selección") { editor.aplicarEdicionLote(borradorLote) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!borradorLote.hayCambios)
+                Button("Restablecer todo") {
+                    editor.aplicarEdicionLote(AjustesLote(
+                        transformacion: TransformacionLote(),
+                        color: ColorLote.neutro,
+                        ganancia: 0,
+                        entradaFundido: 0,
+                        salidaFundido: 0
+                    ))
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .formStyle(.grouped)
     }
 
     /// Propiedades del clip seleccionado.
@@ -5947,6 +6518,8 @@ struct MenusDeEditorcito: Commands {
         CommandGroup(replacing: .newItem) {
             Button("Abrir proyecto…") { editor.openProject() }
                 .keyboardShortcut("o", modifiers: .command)
+            Button("Centro de comandos…") { editor.mostrarCentroDeComandos = true }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
             Button("Guardar proyecto…") { editor.saveProject() }
                 .keyboardShortcut("s", modifiers: .command)
             Button("Guardar versión…") { editor.guardarVersion() }
@@ -5954,6 +6527,8 @@ struct MenusDeEditorcito: Commands {
             Divider()
             Button("Importar medios…") { editor.importMedia() }
                 .keyboardShortcut("i", modifiers: .command)
+            Button("Revincular medios offline desde una carpeta…") { editor.revincularDesdeCarpeta() }
+                .disabled(!editor.hayMediosOffline)
             Button("Exportar película…") { editor.exportMovie() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(editor.duracionEnFrames == 0)
@@ -5962,6 +6537,7 @@ struct MenusDeEditorcito: Commands {
                 .disabled(editor.duracionEnFrames == 0)
             Button("Exportar FCPXML…") { editor.exportarFCPXML() }
                 .disabled(editor.duracionEnFrames == 0)
+            Button("Importar EDL…") { editor.importarEDL() }
             Button("Importar proyecto…") { editor.importarOtroProyecto() }
         }
 
