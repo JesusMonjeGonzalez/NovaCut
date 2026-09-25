@@ -71,10 +71,40 @@ struct Pixel: Equatable {
 }
 
 func pixelDe(_ cg: CGImage, en x: Int, _ y: Int) -> Pixel {
-    let datos = cg.dataProvider!.data! as Data
-    let bytes = [UInt8](datos)
-    let i = (y * cg.width + x) * 4
+    // AVAssetImageGenerator no garantiza BGRA, 8 bits ni filas sin padding.
+    // Conserva el espacio RGB de origen: se comparan valores de canal, sin
+    // introducir una conversion de color distinta para el nativo y el custom.
+    let contexto = CGContext(data: nil, width: cg.width, height: cg.height,
+                             bitsPerComponent: 8, bytesPerRow: cg.width * 4,
+                             space: cg.colorSpace!,
+                             bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue |
+                                 CGImageAlphaInfo.premultipliedFirst.rawValue)!
+    contexto.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+    let bytes = contexto.data!.assumingMemoryBound(to: UInt8.self)
+    let i = y * contexto.bytesPerRow + x * 4
     return Pixel(r: Int(bytes[i + 2]), g: Int(bytes[i + 1]), b: Int(bytes[i]))
+}
+
+// Dos filas distintas y padding para detectar canales, stride y eje Y incorrectos.
+for (nombre, info, filas) in [
+    ("ARGB", CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue,
+     [[255, 255, 0, 0, 255, 0, 255, 0], [255, 0, 0, 255, 255, 255, 255, 255]]),
+    ("RGBA", CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue,
+     [[255, 0, 0, 255, 0, 255, 0, 255], [0, 0, 255, 255, 255, 255, 255, 255]]),
+    ("BGRA", CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue,
+     [[0, 0, 255, 255, 0, 255, 0, 255], [255, 0, 0, 255, 255, 255, 255, 255]])
+] {
+    let datos = Data(filas.flatMap { $0.map { UInt8($0) } + Array(repeating: UInt8(37), count: 8) })
+    let imagen = CGImage(width: 2, height: 2, bitsPerComponent: 8, bitsPerPixel: 32,
+                         bytesPerRow: 16, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                         bitmapInfo: CGBitmapInfo(rawValue: info),
+                         provider: CGDataProvider(data: datos as CFData)!, decode: nil,
+                         shouldInterpolate: false, intent: .defaultIntent)!
+    comprobar(pixelDe(imagen, en: 0, 0) == Pixel(r: 255, g: 0, b: 0) &&
+              pixelDe(imagen, en: 1, 0) == Pixel(r: 0, g: 255, b: 0) &&
+              pixelDe(imagen, en: 0, 1) == Pixel(r: 0, g: 0, b: 255) &&
+              pixelDe(imagen, en: 1, 1) == Pixel(r: 255, g: 255, b: 255),
+              "lector de pixeles respeta \(nombre), padding y filas")
 }
 
 func frameDe(_ composicion: AVComposition, con composicionDeVideo: AVVideoComposition?, en segundo: Double) async -> CGImage? {
@@ -221,10 +251,7 @@ let genDirecto = AVAssetImageGenerator(asset: assetAzul)
 genDirecto.requestedTimeToleranceBefore = .zero
 genDirecto.requestedTimeToleranceAfter = .zero
 if let cgDirecto = try? await genDirecto.image(at: CMTime(seconds: 1, preferredTimescale: 600)).image {
-    let datos = cgDirecto.dataProvider!.data! as Data
-    let bytes = [UInt8](datos)
-    let i = (90 * cgDirecto.width + 160) * 4
-    print("  azul directo (B,G,R,A): \(bytes[i]),\(bytes[i+1]),\(bytes[i+2]),\(bytes[i+3])")
+    print("  azul directo: \(pixelDe(cgDirecto, en: 160, 90))")
 }
 let compD = AVMutableComposition()
 let tD = compD.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
@@ -284,24 +311,24 @@ do {
               "rojo × azul en multiplicar da negro (\(p))")
 }
 
-print("— máscara elíptica: fuera de la forma no se ve —")
-do {
+print("— máscaras: fuera de la forma no se ve —")
+for forma in [MascaraDeClip.Forma.elipse, .rectangulo] {
     let id = UUID()
     let medio = try await MedioResuelto.cargar(id: id, url: roja)
     var linea = LineaDeTiempo.nueva(timebase: .p25)
     let v1 = linea.pistas.first { $0.nombre == "V1" }!.id
     var clip = Clip(mediaID: id, nombre: "Rojo", inicio: 0, duracion: 50, entradaEnOrigen: 0)
-    // Elipse pequeña en el centro: el borde del frame debe quedar negro.
-    clip.mascara = MascaraDeClip(forma: .elipse, posicionX: 0.5, posicionY: 0.5,
+    // Forma pequeña en el centro: el borde del frame debe quedar negro.
+    clip.mascara = MascaraDeClip(forma: forma, posicionX: 0.5, posicionY: 0.5,
                                  tamanoX: 0.2, tamanoY: 0.2, pluma: 0.05)
     linea.sobrescribir(clip, enPista: v1, en: 0)
     let render = ConstructorDeMontaje.construir(linea, medios: [id: medio])
     let frame = await frameDe(render.composicion, con: render.composicionDeVideo, en: 1)!
     let centro = pixelDe(frame, en: 160, 90)
     let esquina = pixelDe(frame, en: 10, 10)
-    comprobar(centro.r > 200, "el centro de la máscara sigue rojo (\(centro))")
+    comprobar(centro.r > 200, "el centro de la mascara \(forma) sigue rojo (\(centro))")
     comprobar(esquina.r < 40 && esquina.g < 40 && esquina.b < 40,
-              "fuera de la elipse se ve el fondo negro (\(esquina))")
+              "fuera de la mascara \(forma) se ve el fondo negro (\(esquina))")
 }
 
 print("— máscara invertida: se ve todo menos la forma —")

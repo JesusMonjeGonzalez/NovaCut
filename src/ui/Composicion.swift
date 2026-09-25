@@ -714,23 +714,21 @@ final class CompositorDeColor: NSObject, AVVideoCompositing {
             // Esquinas redondeadas con el radio de la pluma: a pluma cero es un
             // rectángulo de esquinas vivas, y al crecer la pluma las esquinas
             // se redondean y el borde se suaviza con el desenfoque.
-            forma = CIImage(color: .black)
-                .cropped(to: rect)
-                .applyingFilter("CIRoundedRectangleGenerator", parameters: [
-                    "inputExtent": CIVector(cgRect: rect),
-                    "inputRadius": max(0, pluma),
-                ])
+            // Los generadores no aceptan el inputImage de applyingFilter.
+            forma = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: rect),
+                "inputRadius": max(0, pluma),
+                kCIInputColorKey: CIColor.white,
+            ])!.outputImage!
                 .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: pluma])
         case .elipse:
-            forma = CIImage(color: .black)
-                .cropped(to: rect)
-                .applyingFilter("CIRadialGradient", parameters: [
-                    "inputCenter": CIVector(x: centro.x, y: centro.y),
-                    "inputRadius0": max(0, min(ancho, alto) / 2 - pluma),
-                    "inputRadius1": min(ancho, alto) / 2,
-                    "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 1),
-                    "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 0),
-                ])
+            forma = CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": CIVector(x: centro.x, y: centro.y),
+                "inputRadius0": max(0, min(ancho, alto) / 2 - pluma),
+                "inputRadius1": min(ancho, alto) / 2,
+                "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 1),
+                "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 0),
+            ])!.outputImage!
         }
 
         let transparente = CIImage(color: .clear).cropped(to: CGRect(origin: .zero, size: tamano))
