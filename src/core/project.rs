@@ -91,6 +91,12 @@ impl ProjectCodec {
     }
 
     pub fn create_project(name: &str, workspace: &Path) -> Result<Project, String> {
+        if name.trim().is_empty()
+            || matches!(name, "." | "..")
+            || name.contains(['/', '\\', ':', '\0'])
+        {
+            return Err("Project name must be a single filename, not a path".to_owned());
+        }
         fs::create_dir_all(workspace)
             .map_err(|e| format!("Workspace creation failed: {}", e))?;
         let project = Project {
@@ -286,12 +292,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_project_rejects_paths_before_creating_workspace() {
+        let workspace = std::env::temp_dir().join(format!(
+            "editorcito_invalid_names_{}",
+            std::process::id()
+        ));
+        assert!(!workspace.exists());
+        for name in [
+            "", " ", ".", "..", "../outside", "a/b", "a\\b", "/absolute",
+            "C:\\absolute", "C:relative", "\\\\server\\share", "bad\0name",
+        ] {
+            assert!(
+                ProjectCodec::create_project(name, &workspace).is_err(),
+                "{name:?}"
+            );
+            assert!(!workspace.exists());
+        }
+    }
+
+    #[test]
     fn test_create_project() {
         let workspace = std::env::temp_dir().join("editorcito_test_workspace");
         let _ = fs::remove_dir_all(&workspace);
 
-        let project = ProjectCodec::create_project("TestProject", &workspace).unwrap();
-        assert_eq!(project.name, "TestProject");
+        let project = ProjectCodec::create_project("Test Project.v2", &workspace).unwrap();
+        assert_eq!(project.name, "Test Project.v2");
+        assert_eq!(project.path, workspace.join("Test Project.v2.ncproj"));
         assert_eq!(project.settings.default_resolution, (1920, 1080));
         assert_eq!(project.settings.default_fps, 30.0);
 

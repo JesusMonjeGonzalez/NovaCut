@@ -1130,9 +1130,27 @@ fn curves_filter(curves: Option<&Curves>) -> String {
     }
 }
 
+fn escape_lut_path(path: &Path) -> String {
+    let mut escaped = path.to_string_lossy().replace('\\', "/");
+    // Escape the option value first, then preserve those escapes in the enclosing
+    // filtergraph. Command::arg bypasses the shell, so there is no third layer.
+    // https://ffmpeg.org/ffmpeg-filters.html#Notes-on-filtergraph-escaping
+    for special in ["\\': \t\r\n", "\\'[],; \t\r\n"] {
+        let mut layer = String::new();
+        for ch in escaped.chars() {
+            if special.contains(ch) {
+                layer.push('\\');
+            }
+            layer.push(ch);
+        }
+        escaped = layer;
+    }
+    escaped
+}
+
 fn lut_filter(path: Option<&Path>) -> String {
     path.filter(|path| path.is_file())
-        .map(|path| format!(",lut3d=file='{}'", escape_filter_path(path)))
+        .map(|path| format!(",lut3d=file={}", escape_lut_path(path)))
         .unwrap_or_default()
 }
 
@@ -15208,12 +15226,24 @@ fn save_backup(project_path: &Path, project: &RoughProject) {
     if let Ok(json) = serde_json::to_string_pretty(project) {
         let _ = std::fs::write(&backup_path, json);
     }
-    // Podar: quedarse con las 10 más recientes.
+    // Solo podar copias de este proyecto, no otros archivos de la carpeta.
+    let prefix = format!("{stem}-");
     let mut backups: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&backup_dir)
         .map(|entries| {
             entries
                 .flatten()
                 .filter_map(|entry| {
+                    if !entry.file_type().ok()?.is_file() {
+                        return None;
+                    }
+                    let name = entry.file_name();
+                    let stamp = name
+                        .to_str()?
+                        .strip_prefix(&prefix)?
+                        .strip_suffix(".ncrough.bak")?;
+                    if stamp.is_empty() || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return None;
+                    }
                     let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
                     Some((modified, entry.path()))
                 })
@@ -15294,33 +15324,75 @@ fn run_winget_install() -> Result<(), String> {
 const FFMPEG_INSTALL_SCRIPT: &str = include_str!("../../installer/ffmpeg-install.ps1");
 
 fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
-    let script_path = std::env::temp_dir().join("novacut-install-ffmpeg.ps1");
-    let script = FFMPEG_INSTALL_SCRIPT;
-    let write_result = std::fs::write(&script_path, script);
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script_path)
-        .arg("-InstallDir")
-        .arg(app_dir)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("PowerShell no se pudo ejecutar: {error}"));
-    let _ = std::fs::remove_file(&script_path);
-    write_result.map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
-    let output = output?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Err(if stderr.is_empty() { stdout } else { stderr })
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "SystemRoot no contiene una ruta absoluta".to_owned())?;
+    let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "novacut-install-ffmpeg-{}-{stamp}",
+        std::process::id()
+    ));
+    with_install_script(&directory, |script_path| {
+        let output = Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script_path)
+            .arg("-InstallDir")
+            .arg(app_dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| format!("PowerShell no se pudo ejecutar: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            Err(if stderr.is_empty() { stdout } else { stderr })
+        }
+    })
+}
+
+fn with_install_script(
+    directory: &Path,
+    run: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
+    // No reutilizar directorios existentes, ni siquiera tras una colision.
+    builder
+        .create(directory)
+        .map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
+    let script_path = directory.join("install.ps1");
+    let result = (|| {
+        let mut script = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&script_path)
+            .map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
+        script
+            .write_all(FFMPEG_INSTALL_SCRIPT.as_bytes())
+            .map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
+        drop(script);
+        run(&script_path)
+    })();
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_dir(directory);
+    result
 }
 
 fn multimedia_tools_available() -> bool {
@@ -15722,6 +15794,74 @@ mod theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_script_is_complete_exclusive_and_cleaned_up() {
+        let directory =
+            std::env::temp_dir().join(format!("novacut-installer-test-{}", std::process::id()));
+        for fail in [false, true] {
+            let result = with_install_script(&directory, |script| {
+                assert_eq!(
+                    std::fs::read_to_string(script).unwrap(),
+                    FFMPEG_INSTALL_SCRIPT
+                );
+                assert!(with_install_script(&directory, |_| panic!("must not run")).is_err());
+                assert!(script.is_file());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                        0o700
+                    );
+                }
+                if fail {
+                    Err("simulated launch failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            assert!(!directory.exists());
+        }
+        let missing_parent = directory.join("missing");
+        assert!(with_install_script(&missing_parent, |_| panic!("must not run")).is_err());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn backups_prune_only_matching_project_files() {
+        let directory =
+            std::env::temp_dir().join(format!("novacut-backup-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let backups = directory.join("NovaCut-Backups");
+        std::fs::create_dir(&backups).unwrap();
+        let foreign = [
+            "other-1.ncrough.bak",
+            "film-extra-1.ncrough.bak",
+            "film-notes.ncrough.bak",
+            "film-.ncrough.bak",
+            "film-1.txt",
+            "notes.txt",
+        ];
+        for name in foreign {
+            std::fs::write(backups.join(name), "keep").unwrap();
+        }
+        std::fs::create_dir(backups.join("film-99.ncrough.bak")).unwrap();
+        for stamp in 0..12 {
+            std::fs::write(backups.join(format!("film-{stamp}.ncrough.bak")), "old").unwrap();
+        }
+        save_backup(&directory.join("film.ncrough"), &RoughProject::default());
+        for name in foreign {
+            assert_eq!(std::fs::read_to_string(backups.join(name)).unwrap(), "keep");
+        }
+        assert!(backups.join("film-99.ncrough.bak").is_dir());
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            10 + foreign.len() + 1
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// El montaje debe sobrevivir a salir por EDL y volver a entrar: cortes,
     /// entradas en origen, canales y velocidad. Es la comprobación que no
@@ -16399,6 +16539,105 @@ mod tests {
         assert_eq!(escape_drawtext("Hola mundo"), "Hola mundo");
         assert_eq!(escape_drawtext(r"ruta\C:'"), r"ruta\\C\:\'");
         assert_eq!(escape_drawtext("a'b"), r"a\'b");
+    }
+
+    #[test]
+    fn lut_paths_escape_option_and_filtergraph_layers() {
+        assert_eq!(escape_lut_path(Path::new("plain.cube")), "plain.cube");
+        assert_eq!(
+            escape_lut_path(Path::new(r"C:\LUTs\O'Brien, [v];look.cube")),
+            r"C\\:/LUTs/O\\\'Brien\,\\\ \[v\]\;look.cube"
+        );
+        assert_eq!(
+            escape_lut_path(Path::new(r"\\server\share\look.cube")),
+            "//server/share/look.cube"
+        );
+        assert_eq!(escape_lut_path(Path::new("'")), r"\\\'");
+        assert_eq!(escape_lut_path(Path::new(":")), r"\\:");
+        assert_eq!(escape_lut_path(Path::new(",[];")), r"\,\[\]\;");
+    }
+
+    #[test]
+    #[ignore = "requires real FFmpeg with lavfi and lut3d"]
+    fn lut_paths_render_with_real_ffmpeg() {
+        let directory = std::env::temp_dir().join(format!(
+            "novacut-lut-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        // Constant green: check that the LUT was applied, not merely parsed.
+        let cube = "LUT_3D_SIZE 2\n".to_owned() + &"0 1 0\n".repeat(8);
+        let mut failures = Vec::new();
+        for name in [
+            "plain",
+            "space name",
+            "quote'name",
+            "comma,name",
+            "[brackets]",
+            "semi;colon",
+            "mix'[,] ;name",
+            "two''quotes",
+            "=equals",
+            " leading space",
+            #[cfg(not(windows))]
+            "C:drive",
+        ] {
+            let folder = directory.join(name);
+            std::fs::create_dir(&folder).unwrap();
+            let path = folder.join(format!("{name}.cube"));
+            std::fs::write(&path, &cube).unwrap();
+            for complex in [false, true] {
+                let filter = format!("format=rgb24{},format=rgb24", lut_filter(Some(&path)));
+                let mut command = Command::new(tool_path("ffmpeg.exe"));
+                command.args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=black:s=2x2:r=1",
+                ]);
+                if complex {
+                    command.args([
+                        "-filter_complex",
+                        &format!("[0:v]{filter}[graded];[graded]null[out]"),
+                        "-map",
+                        "[out]",
+                    ]);
+                } else {
+                    command.args(["-vf", &filter]);
+                }
+                let output = command
+                    .args([
+                        "-frames:v",
+                        "1",
+                        "-c:v",
+                        "rawvideo",
+                        "-f",
+                        "rawvideo",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .expect("real FFmpeg is required for this test");
+                if !output.status.success() || output.stdout != [0, 255, 0].repeat(4) {
+                    failures.push(format!(
+                        "{name:?}, complex={complex}: {}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+        assert_eq!(lut_filter(None), "");
+        assert_eq!(lut_filter(Some(&directory.join("missing.cube"))), "");
+        assert_eq!(lut_filter(Some(&directory)), "");
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
