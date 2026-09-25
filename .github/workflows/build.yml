@@ -1,4 +1,4 @@
-name: macOS build
+name: build
 
 on:
   push:
@@ -9,13 +9,37 @@ permissions:
   contents: read
 
 jobs:
+  secrets:
+    uses: ./.github/workflows/secrets.yml
+
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - name: Build application
         run: ./build-mac.sh
       - name: Generate and verify synthetic media corpus
         run: |
           ./generar-corpus.sh build/corpus-ci
           ./probar-corpus.sh build/corpus-ci
+      - name: Verify VFR conforming pipeline
+        run: ./probar.sh build/corpus-ci/vfr-clap-h264.mov
+      # El núcleo compartido (timebase, SRT, EDL, caché de proxies,
+      # revinculación) es lógica pura y se verifica en cualquier sistema.
+      - name: Core tests
+        run: cargo test --lib
+
+  # El host de Windows tiene su propia lógica —mapeo del proyecto a EDL,
+  # colocación en pistas, timecodes— y sus pruebas solo se ejecutan aquí.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Build Windows host
+        run: cargo build --locked --release --features windows-host --bin novacut-windows
+      - name: Windows host tests
+        run: cargo test --features windows-host --bin novacut-windows

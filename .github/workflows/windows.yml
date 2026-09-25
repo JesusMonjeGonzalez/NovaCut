@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify packaging failure gates
+        shell: pwsh
+        run: ./tests/build-windows.ps1
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
@@ -34,6 +37,7 @@ jobs:
           path: build/installer/NovaCut-Windows-Setup.exe
           if-no-files-found: error
       - name: Refresh alpha release assets
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,6 +46,9 @@ jobs:
             Compress-Archive -Path build\NovaCut-Windows -DestinationPath build\NovaCut-Windows-x64.zip -Force
             gh release upload v0.1.0 build/installer/NovaCut-Windows-Setup.exe `
               build/NovaCut-Windows-x64.zip --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Release upload failed with exit code $LASTEXITCODE"
+            }
             Write-Host "Release v0.1.0 refreshed with CI artifacts"
           } else {
             Write-Host "Release v0.1.0 does not exist yet; skipping release refresh"

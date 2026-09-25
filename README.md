@@ -46,6 +46,33 @@ timeline model and uses native media frameworks from interaction through export.
 - Linked video/audio synchronization across edits and retiming.
 - Constant speed, speed ramps and freeze frames.
 - Titles, captions, masks, 14 blend modes and adjustment layers.
+- SRT import on both hosts accepts UTF-8 BOMs, whitespace-only cue separators,
+  multiline text and timestamps with comma or dot milliseconds. Invalid timestamps
+  are rejected; macOS export carries millisecond rounding across second/minute boundaries.
+- Subtitle workbench on both hosts: case-insensitive literal search over cue text, and a
+  global sync that shifts every cue by a millisecond offset or aligns the first cue to the
+  playhead. A shift that would push any cue before the project start is refused whole, so
+  the document is never left partially resynced. macOS also lists cues to add, edit, delete
+  and jump to, and every change is a single undo step.
+- Proxy cache budget on both hosts: a configurable disk limit evicts the least recently
+  used proxies first and stops as soon as the cache fits. Proxies the open project links
+  are never evicted; if they alone exceed the limit the app says so instead of deleting
+  work the preview is about to request again. A limit of zero disables the trim.
+- Proxies are named after the media and a fingerprint of its size and modification date,
+  not after the clip index. Two clips of the same file share one proxy instead of
+  re-encoding, reordering clips never reassigns a proxy to another video, and replacing
+  the source on disk invalidates the old proxy: Windows flags it as out of date and macOS
+  retires the superseded copy. Export always uses the original either way.
+- EDL (CMX 3600) import and export on both hosts, each verified by a round trip: cuts,
+  source and record timecodes, V/A channels, linked A/V from `B` events, clip names and
+  constant speed from `M2`. Dissolves arrive as cuts with a warning, because an EDL does
+  not carry the shape of a transition; titles, adjustment layers, nests and speed ramps
+  are listed as what could not travel; and each reel becomes an offline medium to relink.
+  Imported cuts are spread across tracks so they never overlap.
+- Batch relink on both hosts: point at a folder and every offline medium is located in a
+  single walk. Same-named candidates are decided by file size first, then by the shallowest
+  path, so two runs over the same folder always agree. Files found but unreadable are
+  reported separately from files not found at all, and a walk that hits its cap says so.
 - RGB curves, `.cube` LUTs, color wheels, chroma key, waveform, vectorscope and histogram.
 - H.264, HEVC, vertical MP4, ProRes 422, audio-only and master export presets.
 - VFR sources are detected from presentation timestamps; macOS conforms them to a
