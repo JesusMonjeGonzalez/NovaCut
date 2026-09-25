@@ -24,6 +24,19 @@
 
 <p align="center"><sub>The current application bundle still uses its working name, <code>Editorcito.app</code>.</sub></p>
 
+## Download And Install
+
+Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
+
+| System | File | First launch |
+|---|---|---|
+| Windows 10/11 x64 | `NovaCut-Windows-Setup.exe` (or the portable `NovaCut-Windows-x64.zip`) | SmartScreen: *More info → Run anyway*. The installer fetches FFmpeg and verifies its SHA-256. |
+| macOS 14+ (Apple Silicon and Intel) | `NovaCut-macOS.zip` | Move to Applications, then right-click → *Open* (Sonoma) or *System Settings → Privacy & Security → Open Anyway* (Sequoia and later). |
+
+Builds are not code-signed with a paid certificate nor notarized, hence the
+one-time warnings. Step-by-step instructions (in Spanish), optional Whisper
+setup and checksum verification: **[docs/INSTALAR.md](docs/INSTALAR.md)**.
+
 ## Why It Is Interesting
 
 NovaCut is not a web UI around FFmpeg. The working macOS application owns its
@@ -125,16 +138,19 @@ Install the ad-hoc-signed development build into `/Applications`:
 ./build-mac.sh instalar
 ```
 
-There is currently no notarized binary release or installer.
+Release packages (universal macOS app and Windows installer) are produced by
+`package-mac.sh` and `build-windows.ps1 -Installer`, and published by CI; they
+are ad-hoc signed, not notarized.
 
 ### Windows rough-cut build
 
 NovaCut now has a native Windows host for multipista editing, composition,
-audio mixing, subtitles and H.264/audio delivery. Install FFmpeg
+audio mixing, subtitles and multi-format delivery. Install FFmpeg
 (`winget install Gyan.FFmpeg`) and run
 `./build-windows.ps1` on Windows; the package is written to
 `build/NovaCut-Windows`. GitHub Actions publishes the same package as
-`novacut-windows-x64`.
+`novacut-windows-x64`. The host also builds on macOS and Linux for development
+(`cargo test --features windows-host --bin novacut-windows`).
 
 `./build-windows.ps1 -Installer` also creates a one-click NSIS installer
 with Start menu shortcuts, uninstall support, optional desktop shortcut,

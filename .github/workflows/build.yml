@@ -1,4 +1,4 @@
-name: build
+name: macOS build
 
 on:
   push:
@@ -29,17 +29,8 @@ jobs:
       # El núcleo compartido (timebase, SRT, EDL, caché de proxies,
       # revinculación) es lógica pura y se verifica en cualquier sistema.
       - name: Core tests
-        run: cargo test --lib
-
-  # El host de Windows tiene su propia lógica —mapeo del proyecto a EDL,
-  # colocación en pistas, timecodes— y sus pruebas solo se ejecutan aquí.
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          persist-credentials: false
-      - name: Build Windows host
-        run: cargo build --locked --release --features windows-host --bin novacut-windows
-      - name: Windows host tests
-        run: cargo test --features windows-host --bin novacut-windows
+        run: cargo test --locked --lib
+      # El host de Windows también compila en macOS: sus pruebas de lógica
+      # se ejecutan aquí además de en el runner de Windows.
+      - name: Windows host tests on macOS
+        run: cargo test --locked --features windows-host --bin novacut-windows

@@ -2,10 +2,17 @@ Unicode True
 
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !define APP_NAME "NovaCut"
-!define APP_VERSION "0.1.0"
+; build-windows.ps1 pasa la version de Cargo.toml con /DAPP_VERSION=x.y.z
+!ifndef APP_VERSION
+    !define APP_VERSION "0.0.0"
+!endif
 !define APP_EXE "novacut-windows.exe"
+!define APP_PUBLISHER "Jesus Monje Gonzalez"
+!define APP_URL "https://github.com/JesusMonjeGonzalez/NovaCut"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut"
 
 Name "${APP_NAME}"
 OutFile "..\build\installer\NovaCut-Windows-Setup.exe"
@@ -13,12 +20,17 @@ InstallDir "$LOCALAPPDATA\Programs\NovaCut"
 InstallDirRegKey HKCU "Software\NovaCut" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-VIProductVersion "0.1.0.0"
+VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey "ProductName" "NovaCut"
 VIAddVersionKey "FileDescription" "NovaCut Windows Installer"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
-VIAddVersionKey "LegalCopyright" "Copyright NovaCut contributors"
+VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 ${APP_PUBLISHER}"
+VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
+
+!define MUI_ICON "..\assets\icon.ico"
+!define MUI_UNICON "..\assets\icon.ico"
+BrandingText "NovaCut ${APP_VERSION}"
 
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
@@ -41,10 +53,18 @@ Section "NovaCut (obligatorio)" SEC_APP
     File "ffmpeg-install.ps1"
     WriteUninstaller "$INSTDIR\Desinstalar-NovaCut.exe"
     WriteRegStr HKCU "Software\NovaCut" "InstallDir" "$INSTDIR"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut" "DisplayName" "NovaCut"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut" "DisplayVersion" "${APP_VERSION}"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut" "DisplayIcon" "$INSTDIR\${APP_EXE}"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut" "UninstallString" '"$INSTDIR\Desinstalar-NovaCut.exe"'
+    ; Ficha completa en Configuracion > Aplicaciones instaladas.
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "NovaCut"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "${APP_PUBLISHER}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "URLInfoAbout" "${APP_URL}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "HelpLink" "${APP_URL}/issues"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\${APP_EXE}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\Desinstalar-NovaCut.exe"'
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '"$INSTDIR\Desinstalar-NovaCut.exe" /S'
+    WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
+    WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
     CreateDirectory "$SMPROGRAMS\NovaCut"
     CreateShortcut "$SMPROGRAMS\NovaCut\NovaCut.lnk" "$INSTDIR\${APP_EXE}"
     CreateShortcut "$SMPROGRAMS\NovaCut\Desinstalar NovaCut.lnk" "$INSTDIR\Desinstalar-NovaCut.exe"
@@ -65,16 +85,46 @@ Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
     nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR"'
     Pop $0
     ${If} $0 <> 0
-        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo instalar FFmpeg. Descargalo de https://www.gyan.dev/ffmpeg/builds/ y copia ffmpeg.exe junto a NovaCut."
+        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo descargar FFmpeg (revisa la conexion). NovaCut se ha instalado igualmente: al abrirlo te ofrecera instalar FFmpeg con un boton."
     ${EndIf}
 SectionEnd
+
+; Tamaño real (con FFmpeg, si se instalo) para la ficha de Aplicaciones.
+Section "-Tamano"
+    ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+    IntFmt $0 "0x%08X" $0
+    WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" "$0"
+SectionEnd
+
+; NovaCut abierto bloquearia la sustitucion del ejecutable.
+!macro EXIGIR_NOVACUT_CERRADO un
+Function ${un}ExigirNovaCutCerrado
+    reintentar:
+    nsExec::ExecToStack 'cmd /c tasklist /FI "IMAGENAME eq ${APP_EXE}" /NH | find /I "${APP_EXE}"'
+    Pop $0
+    ${If} $0 == 0
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "NovaCut esta abierto. Cierralo (guardando tu trabajo) y pulsa Reintentar." IDRETRY reintentar
+        Abort
+    ${EndIf}
+FunctionEnd
+!macroend
+!insertmacro EXIGIR_NOVACUT_CERRADO ""
+!insertmacro EXIGIR_NOVACUT_CERRADO "un."
+
+Function .onInit
+    Call ExigirNovaCutCerrado
+FunctionEnd
+
+Function un.onInit
+    Call un.ExigirNovaCutCerrado
+FunctionEnd
 
 Section "Uninstall"
     Delete "$DESKTOP\NovaCut.lnk"
     RMDir /r "$SMPROGRAMS\NovaCut"
     DeleteRegKey HKCU "Software\Classes\.ncrough"
     DeleteRegKey HKCU "Software\Classes\NovaCut.RoughProject"
-    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\NovaCut"
+    DeleteRegKey HKCU "${UNINSTALL_KEY}"
     DeleteRegKey HKCU "Software\NovaCut"
     Delete "$INSTDIR\${APP_EXE}"
     Delete "$INSTDIR\LEEME-WINDOWS.md"
@@ -82,6 +132,7 @@ Section "Uninstall"
     Delete "$INSTDIR\ffmpeg.exe"
     Delete "$INSTDIR\ffprobe.exe"
     Delete "$INSTDIR\ffplay.exe"
+    Delete "$INSTDIR\FFmpeg-LICENSE.txt"
     Delete "$INSTDIR\Desinstalar-NovaCut.exe"
     RMDir "$INSTDIR"
     System::Call 'shell32.dll::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'

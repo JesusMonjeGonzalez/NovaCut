@@ -51,7 +51,13 @@ if ($Installer) {
     # no existe en un checkout limpio de CI porque build/ está en .gitignore).
     $installerDir = Join-Path $root "build\installer"
     New-Item $installerDir -ItemType Directory -Force | Out-Null
-    & $nsisPath -WX "installer\NovaCut.nsi"
+    # La version del instalador sale de Cargo.toml: una sola fuente de verdad.
+    $cargoToml = Get-Content (Join-Path $root "Cargo.toml") -Raw
+    if ($cargoToml -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+        throw "No se pudo leer la version de Cargo.toml"
+    }
+    $appVersion = $Matches[1]
+    & $nsisPath -WX "/DAPP_VERSION=$appVersion" "installer\NovaCut.nsi"
     if ($LASTEXITCODE -ne 0) {
         throw "NSIS failed with exit code $LASTEXITCODE"
     }

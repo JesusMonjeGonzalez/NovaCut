@@ -15288,25 +15288,14 @@ fn run_winget_install() -> Result<(), String> {
 /// Descarga el build "release essentials" de gyan.dev y copia los binarios
 /// junto a la aplicacion, sin depender de WinGet ni de la Microsoft Store.
 /// PowerShell está disponible en todo Windows 10/11.
+/// El mismo script que usa el instalador (reintentos, TLS 1.2 y
+/// comprobación SHA-256), incrustado en el ejecutable para la versión
+/// portable.
+const FFMPEG_INSTALL_SCRIPT: &str = include_str!("../../installer/ffmpeg-install.ps1");
+
 fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
     let script_path = std::env::temp_dir().join("novacut-install-ffmpeg.ps1");
-    let app_dir_ps = app_dir.display().to_string().replace('\'', "''");
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$appDir = '{app_dir_ps}'
-$zip = Join-Path $env:TEMP 'novacut-ffmpeg.zip'
-$unzip = Join-Path $env:TEMP 'novacut-ffmpeg'
-if (Test-Path $unzip) {{ Remove-Item $unzip -Recurse -Force }}
-if (Test-Path $zip) {{ Remove-Item $zip -Force }}
-Invoke-WebRequest -UseBasicParsing -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip
-Expand-Archive -Path $zip -DestinationPath $unzip -Force
-$bin = Get-ChildItem $unzip -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
-if (-not $bin) {{ throw 'El paquete descargado no contiene ffmpeg.exe' }}
-Copy-Item (Join-Path $bin.DirectoryName '*') $appDir -Force
-Remove-Item $unzip -Recurse -Force
-Remove-Item $zip -Force
-"#
-    );
+    let script = FFMPEG_INSTALL_SCRIPT;
     let write_result = std::fs::write(&script_path, script);
     let output = Command::new("powershell.exe")
         .args([
@@ -15317,6 +15306,8 @@ Remove-Item $zip -Force
             "-File",
         ])
         .arg(&script_path)
+        .arg("-InstallDir")
+        .arg(app_dir)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("PowerShell no se pudo ejecutar: {error}"));
@@ -15444,14 +15435,30 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "NovaCut Windows",
         options,
         Box::new(|context| {
             theme::apply(&context.egui_ctx);
             Ok(Box::new(NovaCutWindows::new(context)))
         }),
-    )
+    );
+    // Sin OpenGL (máquinas virtuales sin aceleración, escritorio remoto,
+    // drivers genéricos) la ventana no llega a abrirse: en vez de cerrarse en
+    // silencio, se explica qué pasa y qué hacer.
+    if let Err(error) = &result {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("NovaCut no puede abrir su ventana")
+            .set_description(format!(
+                "La tarjeta gráfica no ofrece OpenGL 2.0 o superior, que NovaCut necesita para dibujar la interfaz.\n\n\
+                 Actualiza el controlador de la tarjeta gráfica (Intel, AMD o NVIDIA) desde la web del fabricante o Windows Update. \
+                 En máquinas virtuales o escritorio remoto, activa la aceleración 3D.\n\nDetalle: {error}"
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    result
 }
 
 /// Lenguaje visual unificado con la app macOS: grises neutros, acento cian,
@@ -17724,10 +17731,8 @@ mod render_real_tests {
             source_duration_seconds: Some(4.0),
             ..Default::default()
         }];
+        // Sin GPU (los runners de CI) se prueba igualmente la vuelta a CPU.
         let detected = aceleracion::detect(&tool_path("ffmpeg.exe"));
-        if detected.is_empty() {
-            skip("sin GPU que codifique");
-        }
         for backend in &detected {
             for (format, codec) in [
                 (ExportFormat::Mp4Video, "h264"),
