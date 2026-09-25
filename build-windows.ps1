@@ -6,17 +6,11 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 cargo test --locked
-if ($LASTEXITCODE -ne 0) {
-    throw "Core tests failed with exit code $LASTEXITCODE"
-}
+if ($LASTEXITCODE -ne 0) { throw "Core tests failed with exit code $LASTEXITCODE" }
 cargo test --locked --features windows-host --bin novacut-windows
-if ($LASTEXITCODE -ne 0) {
-    throw "Windows host tests failed with exit code $LASTEXITCODE"
-}
+if ($LASTEXITCODE -ne 0) { throw "Windows host tests failed with exit code $LASTEXITCODE" }
 cargo build --release --locked --features windows-host --bin novacut-windows
-if ($LASTEXITCODE -ne 0) {
-    throw "Windows build failed with exit code $LASTEXITCODE"
-}
+if ($LASTEXITCODE -ne 0) { throw "Windows build failed with exit code $LASTEXITCODE" }
 
 $output = Join-Path $root "build\NovaCut-Windows"
 if (Test-Path $output) {

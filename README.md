@@ -224,7 +224,7 @@ remote provider.
   filter path, but Windows-host runtime validation remains open.
 - Reverse playback and retimed multicam clips are not supported.
 - Nested clips cannot yet be opened as independently editable sequences.
-- Proxy cleanup, storage limits and packaged releases remain unfinished.
+- Proxy cleanup and storage limits are implemented on macOS; Windows wiring and packaged releases remain unfinished.
 - No automated UI suite for recovery, relinking or export cancellation.
 - Premiere, Resolve and Final Cut opening have not been verified in this repository.
 - Swift concurrency and deprecated AVFoundation warnings remain migration work.
