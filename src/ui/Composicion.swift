@@ -155,13 +155,14 @@ struct MedioResuelto {
     /// la ventana inicial.
     static func esCadenciaVFR(pista: AVAssetTrack) async -> Bool {
         guard let marcas = await marcasDePresentacion(pista: pista),
-              marcas.count > 30,
               let resumen = resumenDePTS(marcas) else {
             // Si no se puede inspeccionar el reloj, no se debe convertir esa
-            // falta de evidencia en una falsa garantía de sincronía. Un clip muy
-            // corto tampoco aporta suficientes muestras para declararlo CFR.
+            // falta de evidencia en una falsa garantía de sincronía.
             return true
         }
+        // Un clip corto con marcas regulares es CFR: con pocos frames un hueco
+        // se sigue viendo. Tratarlo como VFR mandaba cualquier clip de un
+        // segundo al conformado, que necesita el escalador por hardware.
         return resumen.esVFR
     }
 

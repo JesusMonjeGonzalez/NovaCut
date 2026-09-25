@@ -63,8 +63,11 @@ try {
     $license = Get-ChildItem $unzip -Recurse -Filter 'LICENSE*' | Select-Object -First 1
     if ($license) { Copy-Item $license.FullName (Join-Path $InstallDir 'FFmpeg-LICENSE.txt') -Force }
 
-    & (Join-Path $InstallDir 'ffmpeg.exe') -hide_banner -version | Select-Object -First 1
+    # Se recoge la salida entera: cortar la tuberia (Select-Object -First)
+    # mata el proceso y deja un codigo de salida de error aunque funcione.
+    $version = & (Join-Path $InstallDir 'ffmpeg.exe') -hide_banner -version
     if ($LASTEXITCODE -ne 0) { throw 'FFmpeg se copio pero no arranca' }
+    Write-Host ($version | Select-Object -First 1)
     Write-Host "FFmpeg instalado en $InstallDir"
 } finally {
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
