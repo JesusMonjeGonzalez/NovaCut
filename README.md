@@ -28,10 +28,9 @@
 
 Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
 
-The latest published prerelease is **v0.1.1**. Its macOS download is
-`NovaCut-macOS-arm64.zip` (Apple Silicon only), and it does not include
-`SHA256SUMS.txt`. Version **0.2.0 is an unpublished candidate**; the universal
-macOS package and checksum manifest below describe that candidate, not v0.1.1.
+The latest published prerelease is **v0.2.0**: universal macOS package (Apple
+Silicon and Intel) plus a `SHA256SUMS.txt` manifest for every download. Intel
+binary execution is packaged but not yet validated; see Current Limits.
 
 | System | File | First launch |
 |---|---|---|
@@ -239,8 +238,8 @@ remote provider.
 ## Current Limits
 
 - Engineering alpha, not a production NLE replacement.
-- Published macOS builds are Apple Silicon only; the 0.2.0 candidate packages
-  a universal binary, but Intel runtime validation remains pending. Spanish-first UI.
+- The published macOS package is universal; execution is validated on Apple
+  Silicon, while Intel runtime validation remains pending. Spanish-first UI.
 - VFR with dropped frames is detected from PTS. macOS uses a cached CFR
   intermediary before composition; Windows has the PTS scan and rational CFR
   filter path, but Windows-host runtime validation remains open.

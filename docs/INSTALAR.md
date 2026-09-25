@@ -5,10 +5,9 @@ Descarga siempre desde la página de **Releases** del repositorio:
 
 NovaCut es una alpha de ingeniería: guarda copia de tus originales.
 
-La última prerelease publicada es **v0.1.1**: su paquete macOS se llama
-`NovaCut-macOS-arm64.zip`, solo admite Apple Silicon y no incluye
-`SHA256SUMS.txt`. Las instrucciones del paquete universal y las sumas de
-comprobación siguientes corresponden a **0.2.0, todavía no publicada**.
+La última prerelease publicada es **v0.2.0** (25 de septiembre de 2026): el
+paquete macOS es universal (Apple Silicon e Intel) e incluye `SHA256SUMS.txt`
+con las tres descargas.
 
 ## Windows 10 / 11 (64 bits)
 
@@ -75,9 +74,8 @@ reconocimiento de voz si usas la transcripción.
 
 ## Comprobar la descarga
 
-La candidata 0.2.0 genera `SHA256SUMS.txt`; las releases anteriores no lo
-incluyen. Una suma verifica integridad, no la identidad del editor.
-Si la release incluye el manifiesto, en Windows (PowerShell):
+Una suma verifica la integridad de la descarga, no la identidad del editor.
+En Windows (PowerShell):
 
 ```powershell
 Get-FileHash .\NovaCut-Windows-Setup.exe -Algorithm SHA256
