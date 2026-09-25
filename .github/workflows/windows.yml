@@ -79,13 +79,13 @@ jobs:
         shell: pwsh
         run: ./tests/package-windows.ps1 -DisposableVM
       - name: Upload portable Windows application
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: novacut-windows-x64
           path: build/NovaCut-Windows
           if-no-files-found: error
       - name: Upload Windows installer
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: novacut-windows-installer-x64
           path: build/installer/NovaCut-Windows-Setup.exe
@@ -102,7 +102,7 @@ jobs:
       - name: Verify macOS package
         run: ./tests/package-mac.sh
       - name: Upload macOS application
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: novacut-macos-universal
           path: build/release/NovaCut-macOS.zip
