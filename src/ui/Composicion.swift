@@ -210,8 +210,8 @@ struct MedioResuelto {
 
         let mediana = deltas.sorted()[deltas.count / 2]
         guard mediana > 0, mediana.isFinite else { return nil }
-        let huecos = deltas.count(where: { $0 > mediana * 1.5 })
-        let variaciones = deltas.count(where: { abs($0 - mediana) > mediana * 0.02 })
+        let huecos = deltas.filter { $0 > mediana * 1.5 }.count
+        let variaciones = deltas.filter { abs($0 - mediana) > mediana * 0.02 }.count
         let desvioMaximo = deltas.map { abs($0 - mediana) }.max() ?? .infinity
         return ResumenDePTS(
             cantidadDeFrames: unicos.count,

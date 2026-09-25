@@ -17,14 +17,17 @@ try {
         $sentinel = Join-Path $case "build/NovaCut-Windows/previous-package.txt"
         Set-Content $sentinel "keep previous package"
 
-        $script:calls = 0
-        $script:failAt = $failAt
+        # Globales, no `$script:`: el simulador de cargo se ejecuta desde
+        # build-windows.ps1 y ahí `$script:` apuntaría a otro ámbito, así que
+        # el fallo simulado no llegaba a producirse nunca.
+        $global:NovaCutTestCalls = 0
+        $global:NovaCutTestFailAt = $failAt
         function cargo {
-            $script:calls++
+            $global:NovaCutTestCalls++
             $global:LASTEXITCODE = 0
-            if ($script:calls -eq $script:failAt) {
+            if ($global:NovaCutTestCalls -eq $global:NovaCutTestFailAt) {
                 $global:LASTEXITCODE = 37
-            } elseif ($script:calls -eq 3) {
+            } elseif ($global:NovaCutTestCalls -eq 3) {
                 Set-Content "target/release/novacut-windows.exe" "fresh executable"
             }
         }
@@ -39,7 +42,7 @@ try {
             if (-not $failure -or $failure.Exception.Message -notlike "*failed with exit code 37") {
                 throw "Case ${failAt}: expected the Cargo failure, got '$failure'"
             }
-            if ($script:calls -ne $failAt -or -not (Test-Path $sentinel)) {
+            if ($global:NovaCutTestCalls -ne $failAt -or -not (Test-Path $sentinel)) {
                 throw "Case ${failAt}: continued after failure or replaced the previous package"
             }
             if (Test-Path (Join-Path $case "build/NovaCut-Windows/novacut-windows.exe")) {
@@ -48,7 +51,7 @@ try {
         } else {
             if ($failure) { throw $failure }
             $packaged = Get-Content (Join-Path $case "build/NovaCut-Windows/novacut-windows.exe")
-            if ($script:calls -ne 3 -or $packaged -ne "fresh executable" -or (Test-Path $sentinel)) {
+            if ($global:NovaCutTestCalls -ne 3 -or $packaged -ne "fresh executable" -or (Test-Path $sentinel)) {
                 throw "Successful build did not replace the package with the fresh executable"
             }
             if (-not (Test-Path (Join-Path $case "build/NovaCut-Windows/LEEME-WINDOWS.md"))) {
@@ -60,6 +63,7 @@ try {
 } finally {
     Set-Location $originalLocation
     Remove-Item Function:\cargo -ErrorAction SilentlyContinue
+    Remove-Variable NovaCutTestCalls, NovaCutTestFailAt -Scope Global -ErrorAction SilentlyContinue
     $global:LASTEXITCODE = $originalExitCode
     if (Test-Path $sandbox) { Remove-Item $sandbox -Recurse -Force }
 }
