@@ -24,6 +24,7 @@ mod animacion;
 mod batch;
 mod command_center;
 mod efectos;
+mod fuentes;
 mod estabilizar;
 mod exportacion;
 mod montaje;
@@ -1786,6 +1787,9 @@ struct Titulo {
     /// Caja, contorno, sombra y mate de «Gráficos esenciales».
     #[serde(default)]
     style: efectos::TitleStyle,
+    /// Archivo de fuente elegido; `None` es la predeterminada.
+    #[serde(default)]
+    font: Option<PathBuf>,
 }
 
 fn half_center() -> f64 {
@@ -1811,6 +1815,7 @@ impl Default for Titulo {
             green: full_channel(),
             blue: full_channel(),
             style: efectos::TitleStyle::default(),
+            font: None,
         }
     }
 }
@@ -2275,6 +2280,7 @@ fn clips_with_subtitles(
                 green: style.green.clamp(0.0, 1.0),
                 blue: style.blue.clamp(0.0, 1.0),
                 style: efectos::TitleStyle::default(),
+                font: None,
             }),
             ..Default::default()
         });
@@ -5853,6 +5859,7 @@ impl NovaCutWindows {
                                 green: t.verde.clamp(0.0, 1.0),
                                 blue: t.azul.clamp(0.0, 1.0),
                                 style: efectos::TitleStyle::default(),
+                                font: None,
                             })
                         }
                         _ => {
@@ -12508,9 +12515,17 @@ impl eframe::App for NovaCutWindows {
                                 );
                             } else {
                                 ui.label("Texto del título");
-                                trim_changed |=
-                                    ui.text_edit_singleline(&mut title.text).changed();
+                                trim_changed |= ui
+                                    .add(
+                                        egui::TextEdit::multiline(&mut title.text)
+                                            .desired_rows(2)
+                                            .desired_width(ui.available_width()),
+                                    )
+                                    .on_hover_text("Intro añade una línea")
+                                    .changed();
                             }
+                            ui.label("Fuente");
+                            trim_changed |= font_picker(ui, &mut title.font);
                             ui.label("Tamaño");
                             trim_changed |= ui
                                 .add(
@@ -15931,7 +15946,7 @@ fn render_preview_frame(
             let Some(title) = clip.title.as_ref() else {
                 continue;
             };
-            let Some(font) = find_font() else {
+            let Some(font) = fuentes::resolve(title.font.as_deref()) else {
                 return Err("No se encontro una fuente TTF del sistema para los titulos".to_owned());
             };
             // El tamano se define sobre 1080p y se escala al monitor.
@@ -16466,7 +16481,7 @@ fn build_render_filters(
                 let Some(title) = clips[index].title.as_ref() else {
                     return Err("Entrada de titulo sin titulo".to_owned());
                 };
-                let Some(font) = find_font() else {
+                let Some(font) = fuentes::resolve(title.font.as_deref()) else {
                     return Err(
                         "No se encontro una fuente TTF del sistema para los titulos".to_owned()
                     );
@@ -17151,6 +17166,55 @@ fn use_proxy_paths(clips: &mut [RoughClip]) {
             clip.path = proxy;
         }
     }
+}
+
+/// Selector de fuente de un título: búsqueda y lista de familias instaladas.
+fn font_picker(ui: &mut egui::Ui, font: &mut Option<PathBuf>) -> bool {
+    fuentes::start_loading();
+    let current = font
+        .as_deref()
+        .and_then(fuentes::read_names)
+        .map(|(family, style)| {
+            if style.is_empty() || style.eq_ignore_ascii_case("regular") {
+                family
+            } else {
+                format!("{family} {style}")
+            }
+        })
+        .unwrap_or_else(|| "Predeterminada".to_owned());
+    let mut changed = false;
+    let search_id = ui.id().with("font-search");
+    egui::ComboBox::from_id_salt("title-font")
+        .width(ui.available_width().min(240.0))
+        .selected_text(current)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let mut query: String = ui.data_mut(|data| data.get_temp(search_id).unwrap_or_default());
+            ui.add(egui::TextEdit::singleline(&mut query).hint_text("Buscar fuente…"));
+            ui.data_mut(|data| data.insert_temp(search_id, query.clone()));
+            if ui.selectable_label(font.is_none(), "Predeterminada").clicked() {
+                *font = None;
+                changed = true;
+            }
+            let Some(installed) = fuentes::installed() else {
+                ui.label(egui::RichText::new("Cargando fuentes…").color(theme::TEXT_DIM));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            };
+            let query = query.to_lowercase();
+            for entry in installed
+                .iter()
+                .filter(|entry| query.is_empty() || entry.label().to_lowercase().contains(&query))
+                .take(300)
+            {
+                let chosen = font.as_deref() == Some(entry.path.as_path());
+                if ui.selectable_label(chosen, entry.label()).clicked() {
+                    *font = Some(entry.path.clone());
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 /// Muestra el archivo seleccionado en el Explorador (o en Finder en el
@@ -18881,6 +18945,7 @@ mod tests {
                     green: 0.5,
                     blue: 0.0,
                     style: efectos::TitleStyle::default(),
+                    font: None,
                 }),
                 ..Default::default()
             }],
@@ -20672,6 +20737,62 @@ mod render_real_tests {
         );
         // El giro deja esquinas negras al final, no al principio.
         assert!(covered(&early) > covered(&late) + 0.05);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn titles_with_percent_signs_new_lines_and_other_fonts_render() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("fuentes");
+        let title = |text: &str, font: Option<PathBuf>| RoughClip {
+            out_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: text.to_owned(),
+                size: 140.0,
+                font,
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        // Filas con texto encendido: dos líneas ocupan más alto que una.
+        let lit_rows = |path: &Path| {
+            let frame = frame_rgb(path, 0.5);
+            (0..90)
+                .filter(|y| (0..160).any(|x| frame[(y * 160 + x) * 3] > 128))
+                .count()
+        };
+        let one = directory.join("una.mp4");
+        export(&[title("50% de descuento", None)], &one, ExportFormat::Mp4Video)
+            .expect("un título con % debe exportarse");
+        let two = directory.join("dos.mp4");
+        export(&[title("50% de\ndescuento", None)], &two, ExportFormat::Mp4Video).unwrap();
+        assert!(
+            lit_rows(&two) as f64 > lit_rows(&one) as f64 * 1.6,
+            "{} vs {}",
+            lit_rows(&two),
+            lit_rows(&one)
+        );
+        // Otra fuente dibuja otros píxeles con el mismo texto.
+        let default = fuentes::resolve(None).unwrap();
+        let other = fuentes::font_dirs()
+            .into_iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
+                    && *path != default
+                    && fuentes::read_names(path).is_some()
+            });
+        if let Some(other) = other {
+            let styled = directory.join("otra.mp4");
+            export(&[title("50% de descuento", Some(other.clone()))], &styled, ExportFormat::Mp4Video).unwrap();
+            assert_ne!(frame_rgb(&styled, 0.5), frame_rgb(&one, 0.5), "{}", other.display());
+        }
         let _ = std::fs::remove_dir_all(&directory);
     }
 

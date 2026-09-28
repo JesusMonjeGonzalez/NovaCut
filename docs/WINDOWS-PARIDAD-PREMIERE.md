@@ -99,22 +99,58 @@ Fallos graves que destapó la revisión y que ya existían:
   desplaza de izquierda a derecha y en Karaoke se acumulan.
 - Compila en cruzado para `x86_64-pc-windows-gnu` desde macOS.
 
+## Cuarta ronda (28 sep 2026): los ocho bloques de la lista anterior
+
+Clasificados de más a menos útiles para montar a diario, y hechos en ese
+orden. Cada bloque destapó fallos que ya existían; van al final.
+
+| Premiere | NovaCut Windows | Dónde |
+|---|---|---|
+| J/K/L con velocidades, marcha atrás, K+J/K+L | 1×→2×→4×→8× en ambos sentidos; atrás compone por tramos | Teclado |
+| Rodar (N), Desplazar (Y), Deslizar (U) | Rodar N, Desplazar Y, Deslizar Mayús+Y | Herramientas |
+| Levantar (`;`) / Extraer (`'`) | Sobre el rango I–O, respetando pistas bloqueadas | Teclado |
+| Q/W recortar con ripple al cabezal | Igual, sobre el seleccionado o el de más arriba | Teclado |
+| Cronómetro de keyframes en cada efecto | ◇/◀◆▶ en exposición, contraste, saturación, viñeta, desenfoque, temperatura, tinte, intensidad y rotación | Inspector |
+| Media Encoder: preajustes, calidad/bitrate, cola | Panel Exportar (Ctrl+M), 10 preajustes, CRF o Mbps, audio kbps, cola en serie | Botón Exportar |
+| Panel Proyecto: bins y varias secuencias | Biblioteca con bins anidados; secuencias nuevas, duplicar, renombrar, anidar | Medios › Proyecto |
+| Lumetri: Blancos/Negros, HSL secundaria, Comparación de color | Los tres; la igualación mide la referencia ya graduada | Inspector |
+| Transiciones de barrido e iris; audio de potencia constante | 4 barridos, iris y zoom; todo cruce de audio con curva `qsin` | Transición de entrada |
+| Warp Stabilizer; interpolación por flujo óptico | vidstab de dos pasadas con análisis en caché; muestreo/mezcla/flujo óptico | Tiempo y estabilización |
+| Fuentes en títulos | Selector por familia de las fuentes instaladas; títulos de varias líneas | Inspector del título |
+
+Fallos que ya existían y que se arreglaron por el camino:
+
+- **La exportación de keyframes no animaba**: cada tramo entre keyframes salía
+  fijo en el valor de su punto medio. Ahora es animación por fotograma
+  (expresiones y `sendcmd`), y la escala animada pasa por un lienzo fijo para
+  que el giro no recorte.
+- **Reproducir desde el minuto 45 decodificaba 45 minutos**: el monitor
+  componía siempre desde 0. Ahora compone solo desde el cabezal.
+- **En Windows, los montajes largos no se podían exportar**: con unos 200
+  clips el grafo de filtros pasa de 32 767 caracteres, el límite de la línea
+  de órdenes. El grafo viaja siempre por archivo (`-/filter_complex`).
+- **«Exportar fotograma» nunca escribía el PNG** (faltaba el archivo de salida).
+- **Partir clips invertidos** daba el material equivocado, y partir o recortar
+  la cabeza desplazaba keyframes y banda de volumen. Había cuatro copias del
+  código de partir; ahora hay una (`montaje.rs`).
+- **Las disolvencias subían el volumen**: el saliente no bajaba mientras el
+  entrante subía.
+- **Los fundidos de los títulos** se aplicaban en el segundo 0 del montaje, no
+  al empezar el título.
+- **Un título con «%»** rompía el render entero.
+- **`rotate` dejaba restos** de fotogramas anteriores en las esquinas al
+  animar el giro.
+- **Exportar un rango** que empezaba en mitad de un fundido, una transición o
+  un anidado no coincidía con el montaje completo.
+
 ## Lo que sigue faltando frente a Premiere
 
-Por orden de lo que más se nota al montar (lo de texto, subtítulos y GPU ya
-está hecho):
-
-1. **Keyframes de cualquier parámetro.** Solo se animan posición, escala,
-   opacidad y volumen; Lumetri y efectos son constantes por clip.
-2. **Lumetri avanzado**: curvas HSL, secundarias con selección de color, blancos
-   y negros separados, coincidencia de color entre planos.
-3. **Warp Stabilizer de dos pasadas** (`vidstab`) y remapeo de tiempo con flujo
-   óptico (`minterpolate`).
-4. **Transiciones de barrido y zoom**, y transiciones de audio propias
-   (potencia constante) separadas de las de imagen.
-5. **Varias secuencias por proyecto** y bins; hoy un proyecto es una secuencia,
-   y las secuencias anidadas se importan desde otro `.ncrough`.
-6. **Cola de exportación** y ajustes de bitrate/CRF editables por el usuario.
-7. **Previsualización en el monitor** de efectos temporales: estabilizar y el
-   ruido animado solo se ven al reproducir o exportar, no en el fotograma fijo.
-8. Plantillas de gráficos animadas (.mogrt) y selección de fuente en títulos.
+1. **Enlace A/V y bloqueo de sincronía**: el ripple actúa por pista; con audio
+   separado (J/L-cuts) puede desincronizar pistas que Premiere movería juntas.
+2. **Previsualización en el monitor** de efectos temporales (estabilizar,
+   grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
+3. **Curvas HSL dibujables** (tono contra saturación); hoy la HSL secundaria es
+   por familias de color.
+4. **Plantillas de gráficos animadas** (.mogrt) y animación de texto por letra.
+5. **Render en segundo plano de la timeline** (barra roja/amarilla/verde) para
+   reproducir en tiempo real efectos pesados como el flujo óptico.

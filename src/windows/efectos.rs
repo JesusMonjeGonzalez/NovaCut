@@ -559,7 +559,7 @@ pub fn title_drawing(
             ));
         }
         parts.push(format!(
-            "drawtext=fontfile='{font}':text='{text}':fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
+            "drawtext=fontfile='{font}':text='{text}':expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
             position.0.clamp(0.0, 1.0),
             position.1.clamp(0.0, 1.0),
         ));
@@ -1412,7 +1412,7 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "drawtext=fontfile='f.ttf':text='Hola':fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
+            "drawtext=fontfile='f.ttf':text='Hola':expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
         );
         let matte_only = TitleStyle {
             matte: Some([1.0, 0.0, 0.0]),
