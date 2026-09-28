@@ -2986,6 +2986,8 @@ struct NovaCutWindows {
     project_rename: Option<(ProjectItem, String)>,
     /// Plano de referencia elegido para «Igualar color».
     match_reference: Option<usize>,
+    /// Instalación de Whisper en curso.
+    whisper_setup: Option<Receiver<Result<(), String>>>,
     /// Análisis de vidstab en curso: archivo destino y resultado.
     stabilization: Option<(PathBuf, Receiver<Result<PathBuf, String>>)>,
     media_file_status: media_browser::FileStatus,
@@ -4115,6 +4117,7 @@ impl NovaCutWindows {
             project_rename: None,
             match_reference: None,
             stabilization: None,
+            whisper_setup: None,
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Mixer,
             subtitle_query: String::new(),
@@ -5309,9 +5312,11 @@ impl NovaCutWindows {
             return;
         }
         let Some((whisper, model)) = whisper_files() else {
-            self.status =
-                "Instala whisper-cli.exe y un modelo ggml-*.bin en la carpeta whisper junto a NovaCut"
-                    .to_owned();
+            self.status = if cfg!(windows) {
+                "Falta la transcripción: pulsa «Instalar transcripción» en esta pestaña".to_owned()
+            } else {
+                "Falta whisper-cli: indica su carpeta en NOVACUT_WHISPER_DIR".to_owned()
+            };
             return;
         };
         let prepared = prepare_render_clips(&self.project.clips);
@@ -7347,6 +7352,55 @@ impl NovaCutWindows {
         let mut delete = false;
         let mut remove_fillers = false;
         let mut captions = false;
+        let installed = whisper_files();
+        if installed.is_none() {
+            // Sin Whisper, lo primero es instalarlo: un clic, como FFmpeg.
+            let installing = self.whisper_setup.is_some();
+            let mut choice: Option<&'static str> = None;
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("La transcripción no está instalada").strong());
+                    ui.label(
+                        egui::RichText::new("Whisper transcribe en tu equipo, sin enviar nada a internet. Hace falta para editar por texto y para los subtítulos automáticos.")
+                            .size(11.5)
+                            .color(theme::TEXT_DIM),
+                    );
+                    if installing {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Descargando e instalando…");
+                        });
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    } else if cfg!(windows) {
+                        ui.horizontal_wrapped(|ui| {
+                            if theme::accent_button(ui, "Instalar transcripción (precisa, 190 MB)")
+                                .on_hover_text("Modelo small: el mejor en español para su tamaño")
+                                .clicked()
+                            {
+                                choice = Some("precisa");
+                            }
+                            if ui
+                                .button("Rápida (60 MB)")
+                                .on_hover_text("Modelo base: tres veces más rápido en equipos modestos, algo menos preciso")
+                                .clicked()
+                            {
+                                choice = Some("rapida");
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("En este sistema, indica la carpeta de whisper-cli y su modelo en NOVACUT_WHISPER_DIR.")
+                                .size(11.5)
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+                });
+            if let Some(model) = choice {
+                self.start_whisper_setup(model);
+            }
+            ui.add_space(6.0);
+        }
         ui.horizontal_wrapped(|ui| {
             let label = if busy {
                 "Transcribiendo…"
@@ -7356,7 +7410,10 @@ impl NovaCutWindows {
                 "Volver a transcribir"
             };
             transcribe = ui
-                .add_enabled(!busy && self.ffmpeg_ready, egui::Button::new(label))
+                .add_enabled(
+                    !busy && self.ffmpeg_ready && installed.is_some(),
+                    egui::Button::new(label),
+                )
                 .on_hover_text("Transcribe la mezcla del montaje palabra a palabra, en local")
                 .clicked();
             let selected = selection.as_ref().map_or(0, |range| range.clone().count());
@@ -8590,6 +8647,39 @@ impl NovaCutWindows {
         }
         if let Some(clip) = source {
             self.open_source_clip(clip);
+        }
+    }
+
+    /// Descarga e instala whisper.cpp y el modelo elegido en segundo plano.
+    fn start_whisper_setup(&mut self, model: &'static str) {
+        if self.whisper_setup.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.whisper_setup = Some(receiver);
+        self.status = if model == "rapida" {
+            "Instalando la transcripción rápida (~60 MB)…".to_owned()
+        } else {
+            "Instalando la transcripción precisa (~190 MB)…".to_owned()
+        };
+        std::thread::spawn(move || {
+            let _ = sender.send(run_whisper_install(model));
+        });
+    }
+
+    fn poll_whisper_setup(&mut self) {
+        let Some(receiver) = &self.whisper_setup else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.whisper_setup = None;
+            self.status = match result {
+                Ok(()) if whisper_files().is_some() => {
+                    "Transcripción instalada: ya puedes transcribir el montaje".to_owned()
+                }
+                Ok(()) => "La instalación terminó pero no se encuentra whisper-cli".to_owned(),
+                Err(error) => format!("No se pudo instalar la transcripción: {error}"),
+            };
         }
     }
 
@@ -11085,6 +11175,7 @@ impl eframe::App for NovaCutWindows {
         self.pump_waveforms(context);
         self.poll_hw_detection();
         self.poll_stabilization();
+        self.poll_whisper_setup();
         // Primer arranque: en pantallas muy grandes en puntos (un 4K al
         // 100 %, un 1440p al 100 %) la interfaz se agranda sola; después
         // manda lo que elija el usuario.
@@ -17604,8 +17695,39 @@ fn run_winget_install() -> Result<(), String> {
 /// comprobación SHA-256), incrustado en el ejecutable para la versión
 /// portable.
 const FFMPEG_INSTALL_SCRIPT: &str = include_str!("../../installer/ffmpeg-install.ps1");
+/// Igual para la transcripción: whisper.cpp y su modelo, con huellas fijas.
+const WHISPER_INSTALL_SCRIPT: &str = include_str!("../../installer/whisper-install.ps1");
 
 fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
+    run_install_script(FFMPEG_INSTALL_SCRIPT, "ffmpeg", &[
+        "-InstallDir".into(),
+        app_dir.as_os_str().to_owned(),
+    ])
+}
+
+/// Carpeta donde el botón instala Whisper (una de las que busca
+/// `whisper_files`).
+fn whisper_install_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("NovaCut").join("Whisper"))
+}
+
+fn run_whisper_install(model: &str) -> Result<(), String> {
+    let directory = whisper_install_dir()
+        .ok_or_else(|| "LOCALAPPDATA no está definido".to_owned())?;
+    run_install_script(WHISPER_INSTALL_SCRIPT, "whisper", &[
+        "-InstallDir".into(),
+        directory.into_os_string(),
+        "-Model".into(),
+        model.into(),
+    ])
+}
+
+/// Ejecuta un script de instalación incrustado con el PowerShell del sistema.
+fn run_install_script(
+    script: &str,
+    tag: &str,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), String> {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -17616,10 +17738,10 @@ fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .as_nanos();
     let directory = std::env::temp_dir().join(format!(
-        "novacut-install-ffmpeg-{}-{stamp}",
+        "novacut-install-{tag}-{}-{stamp}",
         std::process::id()
     ));
-    with_install_script(&directory, |script_path| {
+    with_install_script(&directory, script, |script_path| {
         let output = Command::new(&powershell)
             .args([
                 "-NoProfile",
@@ -17629,8 +17751,7 @@ fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
                 "-File",
             ])
             .arg(script_path)
-            .arg("-InstallDir")
-            .arg(app_dir)
+            .args(arguments)
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| format!("PowerShell no se pudo ejecutar: {error}"))?;
@@ -17646,6 +17767,7 @@ fn run_powershell_install(app_dir: &Path) -> Result<(), String> {
 
 fn with_install_script(
     directory: &Path,
+    contents: &str,
     run: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::io::Write;
@@ -17667,7 +17789,7 @@ fn with_install_script(
             .open(&script_path)
             .map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
         script
-            .write_all(FFMPEG_INSTALL_SCRIPT.as_bytes())
+            .write_all(contents.as_bytes())
             .map_err(|error| format!("No se pudo preparar el instalador: {error}"))?;
         drop(script);
         run(&script_path)
@@ -18082,12 +18204,12 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("novacut-installer-test-{}", std::process::id()));
         for fail in [false, true] {
-            let result = with_install_script(&directory, |script| {
+            let result = with_install_script(&directory, FFMPEG_INSTALL_SCRIPT, |script| {
                 assert_eq!(
                     std::fs::read_to_string(script).unwrap(),
                     FFMPEG_INSTALL_SCRIPT
                 );
-                assert!(with_install_script(&directory, |_| panic!("must not run")).is_err());
+                assert!(with_install_script(&directory, FFMPEG_INSTALL_SCRIPT, |_| panic!("must not run")).is_err());
                 assert!(script.is_file());
                 #[cfg(unix)]
                 {
@@ -18107,7 +18229,7 @@ mod tests {
             assert!(!directory.exists());
         }
         let missing_parent = directory.join("missing");
-        assert!(with_install_script(&missing_parent, |_| panic!("must not run")).is_err());
+        assert!(with_install_script(&missing_parent, FFMPEG_INSTALL_SCRIPT, |_| panic!("must not run")).is_err());
         assert!(!directory.exists());
     }
 

@@ -55,6 +55,7 @@ Section "NovaCut (obligatorio)" SEC_APP
     File "..\THIRD_PARTY_NOTICES.md"
     File "..\docs\licenses\THIRD_PARTY_LICENSES-Windows.html"
     File "ffmpeg-install.ps1"
+    File "whisper-install.ps1"
     WriteUninstaller "$INSTDIR\Desinstalar-NovaCut.exe"
     WriteRegStr HKCU "Software\NovaCut" "InstallDir" "$INSTDIR"
     ; Ficha completa en Configuracion > Aplicaciones instaladas.
@@ -99,6 +100,20 @@ Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
     ${EndIf}
 SectionEnd
 
+Section "Transcripcion local con Whisper (recomendado)" SEC_WHISPER
+    DetailPrint "Descargando e instalando la transcripcion (~200 MB)..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\whisper-install.ps1" -InstallDir "$LOCALAPPDATA\NovaCut\Whisper" -Model precisa'
+    Pop $0
+    ${If} $0 <> 0
+        IfSilent whisper_silent_failure
+        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo instalar la transcripcion (revisa la conexion). NovaCut funciona igualmente: la pestana Transcripcion te ofrecera instalarla con un boton."
+        Goto whisper_failure_done
+        whisper_silent_failure:
+        DetailPrint "No se pudo instalar la transcripcion."
+        whisper_failure_done:
+    ${EndIf}
+SectionEnd
+
 ; Tamaño real (con FFmpeg, si se instalo) para la ficha de Aplicaciones.
 Section "-Tamano"
     ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
@@ -133,6 +148,11 @@ Function .onInit
     ${IfNot} ${Errors}
         !insertmacro UnselectSection ${SEC_FFMPEG}
     ${EndIf}
+    ClearErrors
+    ${GetOptions} $0 "/NOWHISPER" $1
+    ${IfNot} ${Errors}
+        !insertmacro UnselectSection ${SEC_WHISPER}
+    ${EndIf}
 FunctionEnd
 
 Function un.onInit
@@ -152,6 +172,9 @@ Section "Uninstall"
     Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
     Delete "$INSTDIR\THIRD_PARTY_LICENSES-Windows.html"
     Delete "$INSTDIR\ffmpeg-install.ps1"
+    Delete "$INSTDIR\whisper-install.ps1"
+    ; Whisper ocupa ~200 MB en la carpeta de datos del usuario.
+    RMDir /r "$LOCALAPPDATA\NovaCut\Whisper"
     Delete "$INSTDIR\ffmpeg.exe"
     Delete "$INSTDIR\ffprobe.exe"
     Delete "$INSTDIR\ffplay.exe"
@@ -164,9 +187,11 @@ SectionEnd
 LangString DESC_SEC_APP ${LANG_SPANISH} "Instala NovaCut, el menu Inicio, el desinstalador y la asociacion de proyectos."
 LangString DESC_SEC_DESKTOP ${LANG_SPANISH} "Crea un acceso directo en el escritorio."
 LangString DESC_SEC_FFMPEG ${LANG_SPANISH} "Instala el motor necesario para importar, previsualizar y exportar video."
+LangString DESC_SEC_WHISPER ${LANG_SPANISH} "Transcripcion en tu equipo para editar por texto y crear subtitulos. Descarga unos 200 MB."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_APP} $(DESC_SEC_APP)
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} $(DESC_SEC_DESKTOP)
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_FFMPEG} $(DESC_SEC_FFMPEG)
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_WHISPER} $(DESC_SEC_WHISPER)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END

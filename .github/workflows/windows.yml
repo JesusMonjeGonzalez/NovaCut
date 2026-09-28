@@ -52,6 +52,11 @@ jobs:
       - name: Verify FFmpeg installer gates
         shell: powershell
         run: ./tests/ffmpeg-install.ps1
+      # Lo mismo para la transcripción: huellas, runtime de Visual C++ firmado
+      # y sustitución atómica de la carpeta, sin red.
+      - name: Verify Whisper installer gates
+        shell: powershell
+        run: ./tests/whisper-install.ps1
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
@@ -74,6 +79,29 @@ jobs:
           $env:PATH = "$env:RUNNER_TEMP\ffmpeg;$env:PATH"
           cargo test --locked --features windows-host --bin novacut-windows render_real -- --skip text_based_editing
           if ($LASTEXITCODE -ne 0) { throw "Real render tests failed" }
+      # El script de Whisper tal cual se distribuye (modelo rápido, 60 MB) y
+      # una transcripción real de una frase dicha por la voz de Windows.
+      - name: Install Whisper with the shipped script and transcribe
+        shell: powershell
+        run: |
+          $whisper = Join-Path $env:RUNNER_TEMP 'whisper'
+          ./installer/whisper-install.ps1 -InstallDir $whisper -Model rapida
+          Add-Type -AssemblyName System.Speech
+          $voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $raw = Join-Path $env:RUNNER_TEMP 'voz.wav'
+          $voice.SetOutputToWaveFile($raw)
+          $voice.Speak('Hello world. This is a transcription test for NovaCut.')
+          $voice.Dispose()
+          $wav = Join-Path $env:RUNNER_TEMP 'voz16k.wav'
+          & "$env:RUNNER_TEMP\ffmpeg\ffmpeg.exe" -v error -y -i $raw -ar 16000 -ac 1 $wav
+          if ($LASTEXITCODE -ne 0) { throw 'No se pudo preparar el audio' }
+          $model = Get-ChildItem $whisper -Filter 'ggml-*.bin' | Select-Object -First 1
+          $out = Join-Path $env:RUNNER_TEMP 'voz'
+          & "$whisper\whisper-cli.exe" -m $model.FullName -f $wav -l en -oj -of $out
+          if ($LASTEXITCODE -ne 0) { throw 'whisper-cli fallo' }
+          $text = (Get-Content "$out.json" -Raw).ToLowerInvariant()
+          if ($text -notmatch 'hello' -or $text -notmatch 'test') { throw "Transcripcion inesperada: $text" }
+          Write-Host 'Whisper transcribe en Windows'
       # Solo en la VM desechable de Actions: toca HKCU y accesos directos.
       - name: Verify package install, launch and uninstall
         shell: pwsh

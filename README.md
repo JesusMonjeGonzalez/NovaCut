@@ -28,8 +28,9 @@
 
 Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
 
-The latest published prerelease is **v0.2.0**: universal macOS package (Apple
-Silicon and Intel) plus a `SHA256SUMS.txt` manifest for every download. Intel
+The latest published prerelease is **v0.3.0**: Premiere-style editing tools,
+keyframes, multiple sequences and one-click local transcription on Windows,
+plus a universal macOS package and a `SHA256SUMS.txt` manifest. Intel
 binary execution is packaged but not yet validated; see Current Limits.
 
 | System | File | First launch |
