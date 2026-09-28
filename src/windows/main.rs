@@ -2953,6 +2953,8 @@ struct NovaCutWindows {
     import_library_only: bool,
     /// Elemento del panel Proyecto que se está renombrando y el texto.
     project_rename: Option<(ProjectItem, String)>,
+    /// Plano de referencia elegido para «Igualar color».
+    match_reference: Option<usize>,
     media_file_status: media_browser::FileStatus,
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
@@ -4078,6 +4080,7 @@ impl NovaCutWindows {
             project_bin: String::new(),
             import_library_only: false,
             project_rename: None,
+            match_reference: None,
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Mixer,
             subtitle_query: String::new(),
@@ -8555,6 +8558,26 @@ impl NovaCutWindows {
         }
     }
 
+    /// «Igualar color»: corrige el clip `target` para parecerse a `reference`.
+    fn match_color(&mut self, target: usize, reference: usize) {
+        let (Some(target_clip), Some(reference_clip)) = (
+            self.project.clips.get(target).cloned(),
+            self.project.clips.get(reference).cloned(),
+        ) else {
+            return;
+        };
+        match compute_color_match(&target_clip, &reference_clip, self.project.timebase()) {
+            Ok(matched) => {
+                let before = self.project.clone();
+                self.project.clips[target].fx.color_match = Some(matched);
+                self.finish_edit(before);
+                self.request_preview();
+                self.status = format!("Color igualado a «{}»", reference_clip.name());
+            }
+            Err(error) => self.status = format!("No se pudo igualar el color: {error}"),
+        }
+    }
+
     /// Abre otra secuencia del proyecto.
     fn switch_sequence(&mut self, id: u64) {
         self.flush_pending_edit();
@@ -12097,6 +12120,36 @@ impl eframe::App for NovaCutWindows {
         let mut proxy_limit_gb = self.proxy_limit_gb;
         let mut trim_cache_requested = false;
         let mut nest_requested = false;
+        // Planos que pueden servir de referencia para «Igualar color».
+        let match_candidates: Vec<(usize, String)> = self
+            .project
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(index, clip)| {
+                Some(*index) != self.selected
+                    && clip.has_video
+                    && clip.title.is_none()
+                    && !clip.is_adjustment
+                    && clip.nested.is_none()
+                    && !clip.path.as_os_str().is_empty()
+            })
+            .map(|(index, clip)| {
+                (
+                    index,
+                    format!(
+                        "{} · V{} {}",
+                        clip.name(),
+                        clip.track + 1,
+                        timecode(clip.timeline_start, self.project.fps)
+                    ),
+                )
+            })
+            .collect();
+        let mut match_reference = self
+            .match_reference
+            .filter(|index| match_candidates.iter().any(|(candidate, _)| candidate == index));
+        let mut color_match_request = false;
         let mut unnest_requested = false;
         // Panel de medios a la izquierda, como el "MEDIOS" de la app macOS:
         // lista de clips del proyecto; un clic selecciona y centra el cabezal.
@@ -12757,6 +12810,41 @@ impl eframe::App for NovaCutWindows {
                             trim_changed |= fx_changed;
                             if let Some(t) = fx_seek {
                                 keyframe_seek = Some(clip.timeline_start + t);
+                            }
+                            if !clip.is_adjustment {
+                                ui.collapsing("Igualar color", |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Lleva el color y el contraste de este plano a los de otro, como la Comparación de color de Lumetri.")
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    egui::ComboBox::from_id_salt("match-reference")
+                                        .width(ui.available_width().min(260.0))
+                                        .selected_text(
+                                            match_reference
+                                                .and_then(|index| match_candidates.iter().find(|(candidate, _)| *candidate == index))
+                                                .map(|(_, name)| name.clone())
+                                                .unwrap_or_else(|| "Elige el plano de referencia".to_owned()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (index, name) in &match_candidates {
+                                                ui.selectable_value(&mut match_reference, Some(*index), name);
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        color_match_request = ui
+                                            .add_enabled(match_reference.is_some(), egui::Button::new("Igualar"))
+                                            .on_hover_text("Mide los dos planos a mitad de su duración y corrige este")
+                                            .on_disabled_hover_text("Primero elige un plano de referencia")
+                                            .clicked();
+                                        if clip.fx.color_match.is_some()
+                                            && ui.button("Quitar igualación").clicked()
+                                        {
+                                            clip.fx.color_match = None;
+                                            trim_changed = true;
+                                        }
+                                    });
+                                });
                             }
                             if !clip.is_adjustment {
                                 ui.collapsing("Croma (pantalla verde/azul)", |ui| {
@@ -13484,6 +13572,12 @@ impl eframe::App for NovaCutWindows {
         if let Some(time) = keyframe_seek {
             self.stop_playback();
             self.seek(time);
+        }
+        self.match_reference = match_reference;
+        if let (true, Some(target), Some(reference)) =
+            (color_match_request, self.selected, match_reference)
+        {
+            self.match_color(target, reference);
         }
         if relink_requested {
             self.relink_selected();
@@ -16889,6 +16983,40 @@ fn run_export_once(
             .collect::<Vec<_>>()
             .join(" | "))
     }
+}
+
+/// Fuente a mitad de un clip, respetando velocidad e inversión.
+fn middle_source_time(clip: &RoughClip) -> f64 {
+    let advanced = clip.duration() / 2.0 * clip.speed.clamp(0.1, 8.0);
+    if clip.fx.reverse {
+        (clip.out_seconds - advanced).max(clip.in_seconds)
+    } else {
+        clip.in_seconds + advanced
+    }
+}
+
+/// Mide el plano de referencia tal como se ve (con su gradación) y el
+/// objetivo en bruto (la igualación va antes de su propia gradación), y
+/// devuelve la corrección que lleva uno al otro.
+fn compute_color_match(
+    target: &RoughClip,
+    reference: &RoughClip,
+    timebase: Timebase,
+) -> Result<efectos::ColorMatch, String> {
+    let mut graded = reference.clone();
+    graded.freeze_animation(reference.duration() / 2.0);
+    graded.position_x = 0.0;
+    graded.position_y = 0.0;
+    graded.scale_percent = 100.0;
+    graded.opacity = 100.0;
+    graded.fade_in_seconds = 0.0;
+    graded.fade_out_seconds = 0.0;
+    let reference_frame = render_preview_frame(&[(graded, middle_source_time(reference))], timebase)?;
+    let target_frame = extract_frame(&target.path, middle_source_time(target), 160, 90)?;
+    Ok(efectos::ColorMatch::between(
+        efectos::ColorMatch::stats(&target_frame.pixels, 4),
+        efectos::ColorMatch::stats(&reference_frame.pixels, 4),
+    ))
 }
 
 /// Muestra el archivo seleccionado en el Explorador (o en Finder en el
@@ -20441,6 +20569,95 @@ mod render_real_tests {
         assert!(full > 200.0, "el título no se ve: {full}");
         assert!(start < full * 0.35, "sin fundido: {start} vs {full}");
         assert!(middle > start && middle < full, "{start} {middle} {full}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn secondary_hsl_whites_blacks_and_color_match_render() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("lumetri");
+        let camera = camera_clip(&directory);
+        let reference_out = export_and_read(camera.clone(), &directory, "referencia.mp4");
+        let reference = frame_rgb(&reference_out, 2.0);
+        // HSL: quitar la saturación de los azules deja el resto igual.
+        let mut blues = camera.clone();
+        blues.fx.hsl = vec![efectos::HslAdjust {
+            families: [false, false, false, false, true, false],
+            saturation: -1.0,
+            ..Default::default()
+        }];
+        let graded = frame_rgb(&export_and_read(blues, &directory, "azules.mp4"), 2.0);
+        let spread = |pixel: &[u8]| {
+            (*pixel.iter().max().unwrap() as f64) - (*pixel.iter().min().unwrap() as f64)
+        };
+        let (mut blue_before, mut blue_after, mut red_before, mut red_after, mut blue_n, mut red_n) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for (before, after) in reference.chunks_exact(3).zip(graded.chunks_exact(3)) {
+            let (r, g, b) = (before[0] as i32, before[1] as i32, before[2] as i32);
+            if b > 150 && r < 90 && g < 90 {
+                blue_before += spread(before);
+                blue_after += spread(after);
+                blue_n += 1.0;
+            } else if r > 150 && g < 90 && b < 90 {
+                red_before += spread(before);
+                red_after += spread(after);
+                red_n += 1.0;
+            }
+        }
+        assert!(blue_n > 20.0 && red_n > 20.0, "la carta de prueba cambió");
+        assert!(blue_after / blue_n < blue_before / blue_n * 0.5, "los azules siguen saturados");
+        assert!(
+            (red_after / red_n - red_before / red_n).abs() < 25.0,
+            "los rojos no deberían cambiar"
+        );
+        // Negros levantados: el píxel más oscuro sube.
+        let mut lifted = camera.clone();
+        lifted.fx.blacks = 1.0;
+        let lifted = frame_rgb(&export_and_read(lifted, &directory, "negros.mp4"), 2.0);
+        // El 5 % más oscuro: un mínimo suelto lo decide el submuestreo de
+        // croma en los bordes de colores saturados, no la curva.
+        let darkest = |pixels: &[u8]| {
+            let mut values: Vec<u8> = pixels.to_vec();
+            values.sort_unstable();
+            let count = values.len() / 20;
+            values[..count].iter().map(|&value| value as f64).sum::<f64>() / count as f64
+        };
+        assert!(darkest(&lifted) > darkest(&reference) + 15.0);
+        // Igualar color: un plano teñido de azul vuelve hacia la referencia.
+        let tinted_path = directory.join("tenido.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&camera.path)
+            .args([
+                "-vf", "colorchannelmixer=rr=0.6:gg=0.8:bb=1.0,eq=contrast=0.7", "-c:v", "libx264",
+                "-pix_fmt", "yuv420p", "-c:a", "copy",
+            ])
+            .arg(&tinted_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let tinted = RoughClip {
+            path: tinted_path,
+            ..camera.clone()
+        };
+        let matched_fx = compute_color_match(&tinted, &camera, Timebase::from_fps(25.0)).unwrap();
+        let mut matched = tinted.clone();
+        matched.fx.color_match = Some(matched_fx);
+        let before = frame_rgb(&export_and_read(tinted, &directory, "sin.mp4"), 2.0);
+        let after = frame_rgb(&export_and_read(matched, &directory, "con.mp4"), 2.0);
+        let distance = |pixels: &[u8]| {
+            (0..3)
+                .map(|c| (mean_channel(pixels, c) - mean_channel(&reference, c)).abs())
+                .sum::<f64>()
+        };
+        assert!(
+            distance(&after) < distance(&before) * 0.4,
+            "igualado {:.1} vs sin igualar {:.1}",
+            distance(&after),
+            distance(&before)
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 

@@ -53,6 +53,16 @@ pub struct ClipFx {
     pub shadows: f64,
     /// -1 … +1, recupera o empuja las altas luces.
     pub highlights: f64,
+    /// -1 … +1, punto blanco: recorta o recupera los blancos.
+    pub whites: f64,
+    /// -1 … +1, punto negro: hunde o levanta los negros.
+    pub blacks: f64,
+    // --- Lumetri › Curvas HSL secundarias
+    /// Ajustes por familia de color (rojos, azules…), en orden.
+    pub hsl: Vec<HslAdjust>,
+    /// Igualación de color con otro plano: ganancia y desplazamiento por
+    /// canal R, G, B, calculados por `match_color`.
+    pub color_match: Option<ColorMatch>,
     // --- Detalle y textura
     /// 0 … 1, máscara de enfoque.
     pub sharpen: f64,
@@ -73,6 +83,123 @@ pub struct ClipFx {
     pub duck_db: f64,
     /// Banda elástica de volumen; vacía = ganancia fija.
     pub volume_keys: Vec<VolumeKey>,
+}
+
+/// Familias de color de `huesaturation`, en el orden de sus banderas.
+pub const HSL_FAMILIES: [(&str, &str); 6] = [
+    ("r", "Rojos"),
+    ("y", "Amarillos"),
+    ("g", "Verdes"),
+    ("c", "Cian"),
+    ("b", "Azules"),
+    ("m", "Magentas"),
+];
+
+/// Un ajuste HSL secundario: qué familias de color toca y cómo.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HslAdjust {
+    /// Una bandera por familia de `HSL_FAMILIES`.
+    pub families: [bool; 6],
+    /// Giro de tono en grados (−180 … 180).
+    pub hue: f64,
+    /// −1 … +1.
+    pub saturation: f64,
+    /// −1 … +1, luminosidad de esos colores.
+    pub intensity: f64,
+}
+
+impl Default for HslAdjust {
+    fn default() -> Self {
+        Self {
+            families: [false, false, false, false, true, false],
+            hue: 0.0,
+            saturation: 0.0,
+            intensity: 0.0,
+        }
+    }
+}
+
+impl HslAdjust {
+    fn filter(&self) -> Option<String> {
+        let colors: Vec<&str> = HSL_FAMILIES
+            .iter()
+            .zip(self.families)
+            .filter(|(_, on)| *on)
+            .map(|((flag, _), _)| *flag)
+            .collect();
+        if colors.is_empty()
+            || (self.hue.abs() < 0.05 && self.saturation.abs() < 0.001 && self.intensity.abs() < 0.001)
+        {
+            return None;
+        }
+        Some(format!(
+            ",huesaturation=hue={:.2}:saturation={:.4}:intensity={:.4}:colors={}:strength=6",
+            self.hue.clamp(-180.0, 180.0),
+            self.saturation.clamp(-1.0, 1.0),
+            self.intensity.clamp(-1.0, 1.0),
+            colors.join("+")
+        ))
+    }
+}
+
+/// Corrección por canal que lleva la media y el contraste de un plano a los
+/// de otro (la «Comparación de color» de Lumetri, en su forma estadística).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorMatch {
+    pub gain: [f64; 3],
+    /// En fracción de la escala (0 … 1).
+    pub offset: [f64; 3],
+}
+
+impl ColorMatch {
+    /// Media y desviación de cada canal de píxeles RGBA/RGB.
+    pub fn stats(pixels: &[u8], channels: usize) -> [(f64, f64); 3] {
+        let mut out = [(0.0, 0.0); 3];
+        let count = (pixels.len() / channels).max(1) as f64;
+        for (channel, slot) in out.iter_mut().enumerate() {
+            let values = pixels.chunks_exact(channels).map(|pixel| pixel[channel] as f64 / 255.0);
+            let mean = values.clone().sum::<f64>() / count;
+            let variance = values.map(|value| (value - mean).powi(2)).sum::<f64>() / count;
+            *slot = (mean, variance.sqrt());
+        }
+        out
+    }
+
+    /// Corrección que lleva `target` hacia `reference`. La ganancia se limita
+    /// para que una referencia casi plana no dispare el contraste.
+    pub fn between(target: [(f64, f64); 3], reference: [(f64, f64); 3]) -> Self {
+        let mut gain = [1.0; 3];
+        let mut offset = [0.0; 3];
+        for channel in 0..3 {
+            let (target_mean, target_std) = target[channel];
+            let (reference_mean, reference_std) = reference[channel];
+            let g = if target_std > 0.01 {
+                (reference_std / target_std).clamp(0.5, 2.0)
+            } else {
+                1.0
+            };
+            gain[channel] = g;
+            offset[channel] = (reference_mean - g * target_mean).clamp(-0.5, 0.5);
+        }
+        Self { gain, offset }
+    }
+
+    fn filter(&self) -> String {
+        let channel = |c: usize| {
+            format!(
+                "clip(val*{:.4}+{:.2},0,255)",
+                self.gain[c],
+                self.offset[c] * 255.0
+            )
+        };
+        format!(
+            ",lutrgb=r='{}':g='{}':b='{}'",
+            channel(0),
+            channel(1),
+            channel(2)
+        )
+    }
 }
 
 impl ClipFx {
@@ -140,6 +267,11 @@ impl ClipFx {
                 luma * 1.1
             ));
         }
+        // La igualación normaliza el plano antes de cualquier otro ajuste,
+        // como en Lumetri, donde va antes de las ruedas creativas.
+        if let Some(matched) = &self.color_match {
+            out.push_str(&matched.filter());
+        }
         let kelvin = |v: f64| 6500.0 - v.clamp(-1.0, 1.0) * 2500.0;
         let green = |v: f64| 1.0 - v.clamp(-1.0, 1.0) * 0.15;
         let other = |v: f64| 1.0 + v.clamp(-1.0, 1.0) * 0.05;
@@ -195,12 +327,28 @@ impl ClipFx {
                 out.push_str(&format!(",vibrance=intensity={:.4}", vibrance(value)));
             }
         }
-            if self.shadows.abs() > 0.001 || self.highlights.abs() > 0.001 {
+            if self.shadows.abs() > 0.001
+            || self.highlights.abs() > 0.001
+            || self.whites.abs() > 0.001
+            || self.blacks.abs() > 0.001
+        {
             let shadow = (0.25 + self.shadows.clamp(-1.0, 1.0) * 0.12).clamp(0.02, 0.6);
             let light = (0.75 + self.highlights.clamp(-1.0, 1.0) * 0.12).clamp(0.4, 0.98);
+            // Blancos y negros mueven los extremos de la curva: +1 en negros
+            // levanta el negro a 0,15 (lavado); −1 lo hunde recortando hasta
+            // 0,1 de entrada. Igual, reflejado, para los blancos.
+            let black = self.blacks.clamp(-1.0, 1.0);
+            let white = self.whites.clamp(-1.0, 1.0);
+            let (black_in, black_out) = if black >= 0.0 { (0.0, black * 0.15) } else { (-black * 0.1, 0.0) };
+            let (white_in, white_out) = if white >= 0.0 { (1.0 - white * 0.1, 1.0) } else { (1.0, 1.0 + white * 0.15) };
             out.push_str(&format!(
-                ",curves=all='0/0 0.25/{shadow:.4} 0.75/{light:.4} 1/1'"
+                ",curves=all='{black_in:.4}/{black_out:.4} 0.25/{shadow:.4} 0.75/{light:.4} {white_in:.4}/{white_out:.4}'"
             ));
+        }
+        for adjust in &self.hsl {
+            if let Some(filter) = adjust.filter() {
+                out.push_str(&filter);
+            }
         }
         if self.sharpen > 0.001 {
             out.push_str(&format!(
@@ -653,6 +801,49 @@ pub fn inspector_video(
         }
         changed |= slider(ui, &mut fx.shadows, -1.0..=1.0, "Sombras");
         changed |= slider(ui, &mut fx.highlights, -1.0..=1.0, "Iluminaciones");
+        changed |= slider(ui, &mut fx.whites, -1.0..=1.0, "Blancos");
+        changed |= slider(ui, &mut fx.blacks, -1.0..=1.0, "Negros");
+    });
+    ui.collapsing("HSL secundario", |ui| {
+        ui.label(
+            egui::RichText::new("Cambia solo ciertos colores: bajar los azules del cielo, calentar la piel…")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        let mut remove = None;
+        for (index, adjust) in fx.hsl.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (family, (_, name)) in HSL_FAMILIES.iter().enumerate() {
+                        changed |= ui.toggle_value(&mut adjust.families[family], *name).changed();
+                    }
+                    if ui.small_button("×").on_hover_text("Quitar este ajuste").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.hue, -180.0..=180.0).suffix("°").text("Tono"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.saturation, -1.0..=1.0).text("Saturación"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.intensity, -1.0..=1.0).text("Luminosidad"))
+                    .changed();
+            });
+        }
+        if let Some(index) = remove {
+            fx.hsl.remove(index);
+            changed = true;
+        }
+        if ui
+            .button("+ Ajuste de color")
+            .on_hover_text("Añade un ajuste para una o varias familias de color")
+            .clicked()
+        {
+            fx.hsl.push(HslAdjust::default());
+            changed = true;
+        }
     });
     ui.collapsing("Detalle y textura", |ui| {
         changed |= slider(ui, &mut fx.sharpen, 0.0..=1.0, "Enfocar");
