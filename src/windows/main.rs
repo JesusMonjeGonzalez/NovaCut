@@ -4559,12 +4559,26 @@ impl NovaCutWindows {
     }
 
     /// Proxies que el proyecto abierto tiene enlazados: nunca se desalojan.
+    /// Proxies que usa cualquier secuencia (abierta o no), la biblioteca o
+    /// un anidado: el presupuesto de caché nunca debe borrarlos.
     fn linked_proxies(&self) -> HashSet<PathBuf> {
-        self.project
-            .clips
-            .iter()
-            .filter_map(|clip| clip.proxy.clone())
-            .collect()
+        fn collect(clips: &[RoughClip], out: &mut HashSet<PathBuf>) {
+            for clip in clips {
+                out.extend(clip.proxy.clone());
+                if let Some(children) = &clip.nested {
+                    collect(children, out);
+                }
+            }
+        }
+        let mut linked = HashSet::new();
+        collect(&self.project.clips, &mut linked);
+        for sequence in &self.project.sequences {
+            collect(&sequence.data.clips, &mut linked);
+        }
+        for item in &self.project.library {
+            linked.extend(item.clip.proxy.clone());
+        }
+        linked
     }
 
     /// ¿El proxy enlazado por el clip seleccionado sigue describiendo su medio?
