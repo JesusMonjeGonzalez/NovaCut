@@ -794,6 +794,8 @@ struct Playback {
     /// Mantiene vivo el dispositivo de audio mientras se reproduce.
     _stream: Option<rodio::OutputStream>,
     sink: Option<Arc<rodio::Sink>>,
+    /// Grafos de los procesos en curso; se borran al parar.
+    _graphs: Vec<GraphFile>,
 }
 
 impl Playback {
@@ -2026,8 +2028,8 @@ fn transcribe_mix(
         None,
     )
     .and_then(|filters| {
+        let _graph = attach_graph(&mut ffmpeg, &filters)?;
         let output = ffmpeg
-            .args(["-filter_complex", &filters.join(";")])
             .args([
                 "-map",
                 "[aout]",
@@ -4571,8 +4573,8 @@ impl NovaCutWindows {
                 filters.push(
                     "[aout]loudnorm=I=-14:TP=-1:LRA=11:print_format=json[analysis]".to_owned(),
                 );
+                let _graph = attach_graph(&mut command, &filters)?;
                 let output = command
-                    .args(["-filter_complex", &filters.join(";")])
                     .args(["-map", "[analysis]", "-f", "null", "NUL"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()
@@ -6582,7 +6584,8 @@ impl NovaCutWindows {
         self.playback = None;
     }
 
-    /// Exporta el fotograma compuesto del cabezal como PNG.
+    /// Exporta el fotograma compuesto del cabezal como PNG, a la resolución
+    /// de exportación.
     fn export_frame(&mut self) {
         if !self.ffmpeg_ready || self.project.clips.is_empty() {
             self.status = "Importa clips antes de exportar un fotograma".to_owned();
@@ -6598,52 +6601,23 @@ impl NovaCutWindows {
         else {
             return;
         };
-        let prepared = prepare_render_clips(&self.effective_clips());
-        let mut command = Command::new(tool_path("ffmpeg.exe"));
-        command.args(["-v", "error", "-y"]);
-        let size = self.export_size;
         let timebase = self.project.timebase();
-        let (input_indices, is_title_input) =
-            push_render_inputs(&mut command, &prepared, size, self.use_proxies, timebase);
-        let Ok(filters) = build_render_filters(
-            &prepared,
-            &input_indices,
-            &is_title_input,
-            size,
-            true,
-            false,
-            &self.project.track_gains,
-            self.project.master_gain_db,
-            self.project.normalize_loudness,
-            timebase,
-            None,
-        ) else {
-            self.status = "No se pudo componer el fotograma".to_owned();
-            return;
+        let at = timebase.seconds(timebase.frames(
+            self.playhead
+                .clamp(0.0, (self.project.duration() - timebase.seconds(1)).max(0.0)),
+        ));
+        let (windowed, preroll) =
+            montaje::window(&self.effective_clips(), at, at + timebase.seconds(1));
+        let job = RenderJob {
+            clips: windowed,
+            skip: preroll,
+            length: None,
+            ..self.render_job(output.clone())
         };
-        // Recorta el montaje al instante del cabezal y saca un solo frame.
-        let clip = self.playhead.clamp(0.0, self.project.duration().max(0.001));
         let (sender, receiver) = mpsc::channel();
         self.frame_result = Some(receiver);
         std::thread::spawn(move || {
-            let result = command
-                .args(["-filter_complex", &filters.join(";")])
-                .args(["-map", "[vout]"])
-                .args(["-ss", &format_seconds(clip), "-frames:v", "1"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|error| format!("FFmpeg no esta disponible: {error}"))
-                .and_then(|out| {
-                    if out.status.success() {
-                        Ok(())
-                    } else {
-                        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
-                    }
-                })
-                .map(|()| output);
-            let _ = sender.send(result);
+            let _ = sender.send(render_still(&job).map(|()| output));
         });
     }
 
@@ -9215,8 +9189,14 @@ impl NovaCutWindows {
         };
         let monitor_label =
             append_monitor_scopes(&mut filters, self.show_waveform, self.show_vectorscope);
+        let video_graph = match attach_graph(&mut command, &filters) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         let Ok(mut child) = command
-            .args(["-filter_complex", &filters.join(";")])
             .args(["-map", &format!("[{monitor_label}]")])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -9303,8 +9283,14 @@ impl NovaCutWindows {
             "[aout]atrim=start={preroll:.6},asetpts=PTS-STARTPTS{}[aplay]",
             atempo_chain(rate as u32)
         ));
+        let audio_graph = match attach_graph(&mut audio_command, &audio_filters) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         let Ok(mut audio_child) = audio_command
-            .args(["-filter_complex", &audio_filters.join(";")])
             .args(["-map", "[aplay]"])
             .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -9379,6 +9365,7 @@ impl NovaCutWindows {
             meter,
             _stream: Some(stream),
             sink: Some(sink),
+            _graphs: vec![video_graph, audio_graph],
         });
         self.status = if rate == 1 {
             "Reproduciendo el montaje".to_owned()
@@ -9430,8 +9417,11 @@ impl NovaCutWindows {
                 let label = append_monitor_scopes(&mut filters, waveform, vectorscope);
                 let skip = timebase.frames(preroll).max(0);
                 let wanted = end_frame - begin_frame;
+                let Ok(_graph) = attach_graph(&mut command, &filters) else {
+                    let _ = sender.send(None);
+                    return;
+                };
                 let Ok(mut child) = command
-                    .args(["-filter_complex", &filters.join(";")])
                     .args(["-map", &format!("[{label}]")])
                     .args(["-frames:v", &(skip + wanted).to_string()])
                     .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
@@ -9498,6 +9488,7 @@ impl NovaCutWindows {
             meter: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
             _stream: None,
             sink: None,
+            _graphs: Vec::new(),
         });
         self.status = format!("Marcha atrás a {step}× (J acelera, K para)");
     }
@@ -14502,8 +14493,9 @@ fn render_preview_frame(
         }
         previous = output;
     }
+    let _graph = attach_graph(&mut command, &filters)?;
     let result = command
-        .args(["-filter_complex", &filters.join(";"), "-map", "[vout]"])
+        .args(["-map", "[vout]"])
         .args([
             "-frames:v",
             "1",
@@ -15172,6 +15164,42 @@ impl RenderJob {
     }
 }
 
+/// Un único fotograma PNG del trabajo, en `job.skip` segundos.
+fn render_still(job: &RenderJob) -> Result<(), String> {
+    let prepared = prepare_render_clips(&job.clips);
+    let mut command = Command::new(tool_path("ffmpeg.exe"));
+    command.args(["-v", "error", "-y"]);
+    let (indices, titles) = push_render_inputs(&mut command, &prepared, job.size, false, job.timebase);
+    let filters = build_render_filters(
+        &prepared,
+        &indices,
+        &titles,
+        job.size,
+        true,
+        false,
+        &job.track_gains,
+        job.master_gain_db,
+        job.normalize_loudness,
+        job.timebase,
+        None,
+    )?;
+    let _graph = attach_graph(&mut command, &filters)?;
+    let output = command
+        .args(["-map", "[vout]"])
+        .args(["-ss", &format_seconds(job.skip), "-frames:v", "1", "-update", "1"])
+        .arg(&job.output)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+    if output.status.success() && job.output.is_file() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
 /// Exporta con la GPU si se pide y, si la GPU falla (driver viejo, sesión
 /// remota, límite de sesiones de NVENC…), repite con CPU en vez de fallar.
 fn run_export(
@@ -15269,7 +15297,8 @@ fn run_export_once(
     } else {
         "[vout]"
     };
-    let child = command.args(["-filter_complex", &filters.join(";")]);
+    let _graph = attach_graph(&mut command, &filters)?;
+    let child = &mut command;
     if !audio_only {
         child.args(["-map", video_label]);
     }
@@ -15357,6 +15386,32 @@ fn run_export_once(
             .collect::<Vec<_>>()
             .join(" | "))
     }
+}
+
+/// Grafo de filtros escrito en un temporal. Windows limita la línea de
+/// órdenes a 32 767 caracteres y el grafo de un montaje de un par de
+/// centenares de clips ya lo supera, así que siempre viaja por archivo
+/// (`-/filter_complex`, FFmpeg ≥ 7). El archivo se borra al soltar el guardia,
+/// que debe vivir hasta que FFmpeg haya arrancado.
+struct GraphFile(PathBuf);
+
+impl Drop for GraphFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn attach_graph(command: &mut Command, filters: &[String]) -> Result<GraphFile, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "novacut-grafo-{}-{serial}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, filters.join(";"))
+        .map_err(|error| format!("No se pudo escribir el grafo de filtros: {error}"))?;
+    command.arg("-/filter_complex").arg(&path);
+    Ok(GraphFile(path))
 }
 
 fn tool_path(name: &str) -> PathBuf {
@@ -17678,6 +17733,31 @@ mod tests {
     }
 
     #[test]
+    fn long_edits_fit_the_windows_command_line_through_a_graph_file() {
+        let clips: Vec<RoughClip> = (0..200)
+            .map(|index| RoughClip {
+                path: PathBuf::from(format!("C:\\Grabaciones\\entrevista-{index:03}.mp4")),
+                out_seconds: 3.0,
+                timeline_start: index as f64 * 3.0,
+                ..Default::default()
+            })
+            .collect();
+        let prepared = prepare_render_clips(&clips);
+        let mut command = Command::new("ffmpeg");
+        let (indices, titles) =
+            push_render_inputs(&mut command, &prepared, (1920, 1080), false, Timebase::from_fps(25.0));
+        let filters = build_render_filters(
+            &prepared, &indices, &titles, (1920, 1080), true, true, &[], 0.0, false,
+            Timebase::from_fps(25.0), None,
+        )
+        .unwrap();
+        assert!(filters.join(";").len() > 32_767, "el grafo solo ya no cabe");
+        let _graph = attach_graph(&mut command, &filters).unwrap();
+        let line: usize = command.get_args().map(|arg| arg.len() + 3).sum();
+        assert!(line < 32_767, "línea de órdenes de {line} caracteres");
+    }
+
+    #[test]
     fn jkl_shuttle_doubles_up_to_eight_and_flips_to_one() {
         assert_eq!(next_shuttle_rate(None, true), 1);
         assert_eq!(next_shuttle_rate(Some(1), true), 2);
@@ -18690,6 +18770,38 @@ mod render_real_tests {
             .stdout;
         assert_eq!(raw.len(), 160 * 90, "no hay fotograma en {at} s");
         raw.iter().map(|&value| value as f64).sum::<f64>() / raw.len() as f64
+    }
+
+    #[test]
+    fn exported_still_is_the_frame_under_the_playhead() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("fotograma");
+        let (video, _) = generate(&directory);
+        let clip = RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            fade_in_seconds: 2.0,
+            ..Default::default()
+        };
+        let full = directory.join("completo.mp4");
+        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        let (windowed, preroll) = montaje::window(&[clip], 1.0, 1.04);
+        let still = directory.join("fotograma.png");
+        let job = RenderJob {
+            skip: preroll,
+            ..test_job(&windowed, &still, ExportFormat::Mp4Video, None)
+        };
+        render_still(&job).unwrap();
+        let expected = mean_brightness_at(&full, 1.0);
+        let actual = mean_brightness_at(&still, 0.0);
+        assert!(
+            (actual - expected).abs() < 6.0,
+            "fotograma {actual:.1}, montaje {expected:.1}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
