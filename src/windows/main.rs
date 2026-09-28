@@ -27,6 +27,7 @@ mod efectos;
 mod exportacion;
 mod montaje;
 mod navigation;
+mod proyecto;
 mod subtitulos_animados;
 mod transcripcion;
 
@@ -2417,9 +2418,37 @@ struct RoughProject {
     /// la superficie de la edición por texto.
     #[serde(default)]
     transcript: Vec<transcripcion::Word>,
+    /// Medios del proyecto (panel Proyecto), estén o no en una secuencia.
+    #[serde(default)]
+    library: Vec<proyecto::LibraryItem>,
+    /// Bins declarados, aunque estén vacíos (rutas con `/`).
+    #[serde(default)]
+    bins: Vec<String>,
+    /// Secuencias que no están abiertas; la abierta son los campos de arriba.
+    #[serde(default)]
+    sequences: Vec<proyecto::StoredSequence>,
+    #[serde(default)]
+    sequence_id: u64,
+    #[serde(default)]
+    sequence_name: String,
+    #[serde(default)]
+    sequence_bin: String,
 }
 
 impl RoughProject {
+    /// Todos los clips del proyecto: la secuencia abierta, las guardadas y
+    /// la biblioteca. Para relativizar rutas, reenlazar y similares.
+    fn all_clips_mut(&mut self) -> impl Iterator<Item = &mut RoughClip> {
+        self.clips
+            .iter_mut()
+            .chain(
+                self.sequences
+                    .iter_mut()
+                    .flat_map(|sequence| sequence.data.clips.iter_mut()),
+            )
+            .chain(self.library.iter_mut().map(|item| &mut item.clip))
+    }
+
     fn normalize(&mut self) {
         if self.version < 2 {
             let mut cursor = 0.0;
@@ -2436,6 +2465,19 @@ impl RoughProject {
             .unwrap_or_else(|| Timebase::from_fps(self.fps));
         self.timebase = Some(timebase);
         self.fps = timebase.fps();
+        if self.sequence_id == 0 {
+            self.sequence_id = self
+                .sequences
+                .iter()
+                .map(|sequence| sequence.id)
+                .max()
+                .unwrap_or(0)
+                + 1;
+        }
+        if self.sequence_name.trim().is_empty() {
+            self.sequence_name = self.unique_sequence_name("Secuencia 1");
+        }
+        self.migrate_library();
         let inferred_source_durations: HashMap<PathBuf, f64> = self
             .clips
             .iter()
@@ -2777,6 +2819,12 @@ impl Default for RoughProject {
             min_video_tracks: 0,
             min_audio_tracks: 0,
             transcript: Vec::new(),
+            library: Vec::new(),
+            bins: Vec::new(),
+            sequences: Vec::new(),
+            sequence_id: 1,
+            sequence_name: "Secuencia 1".to_owned(),
+            sequence_bin: String::new(),
         }
     }
 }
@@ -2897,6 +2945,14 @@ struct NovaCutWindows {
     /// Filtro de texto del panel de medios.
     media_filter: String,
     media_options: media_browser::Options,
+    /// Vista del panel izquierdo: el proyecto (bins) o los usos de la secuencia.
+    media_view_project: bool,
+    /// Bin que se está viendo en el panel Proyecto; destino de lo importado.
+    project_bin: String,
+    /// La próxima importación va solo a la biblioteca, no a la timeline.
+    import_library_only: bool,
+    /// Elemento del panel Proyecto que se está renombrando y el texto.
+    project_rename: Option<(ProjectItem, String)>,
     media_file_status: media_browser::FileStatus,
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
@@ -3876,6 +3932,7 @@ impl NovaCutWindows {
             probe_media(new_path).ok()
         };
         let ok = metadata.is_some();
+        let old_path = self.project.clips[index].path.clone();
         let clip = &mut self.project.clips[index];
         clip.path = new_path.to_path_buf();
         clip.source_duration_seconds = metadata.as_ref().map(|probe| probe.duration);
@@ -3884,6 +3941,26 @@ impl NovaCutWindows {
             .as_ref()
             .is_some_and(|probe| probe.variable_frame_rate);
         clip.source_pts = metadata.and_then(|probe| probe.source_pts);
+        // El mismo archivo en la biblioteca, en otras secuencias y dentro de
+        // anidados apunta también al nuevo.
+        let relinked = self.project.clips[index].clone();
+        fn follow(clip: &mut RoughClip, old: &Path, relinked: &RoughClip) {
+            if clip.path == old {
+                clip.path = relinked.path.clone();
+                clip.source_duration_seconds = relinked.source_duration_seconds;
+                clip.source_timebase = relinked.source_timebase;
+                clip.source_vfr = relinked.source_vfr;
+                clip.source_pts = relinked.source_pts.clone();
+            }
+            for child in clip.nested.iter_mut().flatten() {
+                follow(child, old, relinked);
+            }
+        }
+        if !old_path.as_os_str().is_empty() {
+            for clip in self.project.all_clips_mut() {
+                follow(clip, &old_path, &relinked);
+            }
+        }
         ok
     }
 
@@ -3997,6 +4074,10 @@ impl NovaCutWindows {
             waveform_inflight: None,
             media_filter: String::new(),
             media_options: media_browser::Options::default(),
+            media_view_project: true,
+            project_bin: String::new(),
+            import_library_only: false,
+            project_rename: None,
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Mixer,
             subtitle_query: String::new(),
@@ -4063,9 +4144,14 @@ impl NovaCutWindows {
 
     /// Abre el monitor de fuente con el medio del clip indicado.
     fn open_source_monitor(&mut self, index: usize) {
-        let Some(clip) = self.project.clips.get(index).cloned() else {
-            return;
-        };
+        if let Some(clip) = self.project.clips.get(index).cloned() {
+            self.open_source_clip(clip);
+        }
+    }
+
+    /// Monitor de fuente para cualquier clip de archivo (también de la
+    /// biblioteca, aunque no esté en la secuencia).
+    fn open_source_clip(&mut self, clip: RoughClip) {
         if clip.title.is_some() || clip.nested.is_some() || clip.path.as_os_str().is_empty() {
             self.status = "El monitor de fuente necesita un medio de archivo".to_owned();
             return;
@@ -5522,7 +5608,20 @@ impl NovaCutWindows {
                 Err(error) => errors.push(error),
             }
         }
+        let library_only = std::mem::take(&mut self.import_library_only);
+        if imported > 0 && library_only {
+            let bin = self.project_bin.clone();
+            let added = self.project.register_media(&clips_to_add, &bin);
+            self.finish_edit(before);
+            self.status = format!(
+                "{added} medio(s) añadido(s) al proyecto{}",
+                if bin.is_empty() { String::new() } else { format!(" en «{bin}»") }
+            );
+            return;
+        }
         if imported > 0 {
+            let bin = self.project_bin.clone();
+            self.project.register_media(&clips_to_add, &bin);
             self.project.clips.extend(clips_to_add);
             self.select_only(self.project.clips.len() - 1);
             self.status = if variable_frame_rate > 0 {
@@ -7976,6 +8075,526 @@ impl NovaCutWindows {
     }
 
     /// Fila de la biblioteca de medios: miniatura, nombre, duración y avisos.
+    /// Panel Proyecto: navegación por bins con sus medios y secuencias.
+    fn project_panel(&mut self, ui: &mut egui::Ui) {
+        let mut import = false;
+        let mut new_sequence = false;
+        let mut new_bin = false;
+        ui.horizontal_wrapped(|ui| {
+            import = ui
+                .small_button("+ Medios")
+                .on_hover_text("Añade archivos a este bin sin ponerlos en la secuencia")
+                .clicked();
+            new_sequence = ui
+                .small_button("+ Secuencia")
+                .on_hover_text("Crea una secuencia vacía en este bin y la abre")
+                .clicked();
+            new_bin = ui
+                .small_button("+ Bin")
+                .on_hover_text("Crea una carpeta dentro de este bin")
+                .clicked();
+        });
+        if import && self.ffmpeg_ready {
+            self.import_library_only = true;
+            self.import_media();
+            if self.import_result.is_none() {
+                self.import_library_only = false;
+            }
+        }
+        if new_sequence {
+            let before = self.project.clone();
+            let bin = self.project_bin.clone();
+            self.stop_playback();
+            self.project.new_sequence(&bin);
+            self.after_sequence_switch();
+            self.finish_edit(before);
+            self.status = format!("{} creada", self.project.sequence_name);
+        }
+        if new_bin {
+            let base = if self.project_bin.is_empty() {
+                "Bin nuevo".to_owned()
+            } else {
+                format!("{}/Bin nuevo", self.project_bin)
+            };
+            let name = (1..)
+                .map(|n| if n == 1 { base.clone() } else { format!("{base} {n}") })
+                .find(|name| !self.project.all_bins().contains(name))
+                .unwrap_or(base);
+            let before = self.project.clone();
+            if let Some(path) = self.project.add_bin(&name) {
+                self.finish_edit(before);
+                let leaf = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                self.project_rename = Some((ProjectItem::Bin(path), leaf));
+            }
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.media_filter)
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Small)
+                .hint_text("Buscar en todo el proyecto…"),
+        );
+        let query = self.media_filter.trim().to_lowercase();
+        // Migas de pan del bin actual.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.project_bin.is_empty(), "Raíz")
+                .on_hover_text("Raíz del proyecto")
+                .clicked()
+            {
+                self.project_bin.clear();
+            }
+            let parts: Vec<String> = self.project_bin.split('/').map(str::to_owned).collect();
+            if !self.project_bin.is_empty() {
+                for depth in 0..parts.len() {
+                    ui.label(egui::RichText::new("›").color(theme::TEXT_FAINT));
+                    let path = parts[..=depth].join("/");
+                    if ui
+                        .selectable_label(depth + 1 == parts.len(), &parts[depth])
+                        .clicked()
+                    {
+                        self.project_bin = path;
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+        let bins = self.project.all_bins();
+        let current = self.project_bin.clone();
+        let searching = !query.is_empty();
+        let in_view = |bin: &str| {
+            if searching {
+                true
+            } else {
+                bin == current
+            }
+        };
+        let child_bins: Vec<String> = if searching {
+            bins.iter()
+                .filter(|bin| bin.to_lowercase().contains(&query))
+                .cloned()
+                .collect()
+        } else {
+            bins.iter()
+                .filter(|bin| {
+                    let parent = bin.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+                    parent == current
+                })
+                .cloned()
+                .collect()
+        };
+        // Secuencias visibles: la abierta y las guardadas.
+        let mut sequences: Vec<(u64, String, String, f64, bool)> = vec![(
+            self.project.sequence_id,
+            self.project.sequence_name.clone(),
+            self.project.sequence_bin.clone(),
+            self.project.duration(),
+            true,
+        )];
+        sequences.extend(self.project.sequences.iter().map(|sequence| {
+            (
+                sequence.id,
+                sequence.name.clone(),
+                sequence.bin.clone(),
+                sequence.data.duration(),
+                false,
+            )
+        }));
+        sequences.retain(|(_, name, bin, _, _)| {
+            in_view(bin) && (!searching || name.to_lowercase().contains(&query))
+        });
+        let media: Vec<usize> = self
+            .project
+            .library
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                in_view(&item.bin)
+                    && (!searching
+                        || item.clip.name().to_lowercase().contains(&query)
+                        || item.clip.path.to_string_lossy().to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut open_bin: Option<String> = None;
+        let mut move_media: Option<(usize, String)> = None;
+        let mut move_sequence: Option<(u64, String)> = None;
+        let mut open_sequence: Option<u64> = None;
+        let mut duplicate: Option<u64> = None;
+        let mut delete_sequence: Option<u64> = None;
+        let mut nest: Option<u64> = None;
+        let mut delete_bin: Option<String> = None;
+        let mut remove_media: Option<usize> = None;
+        let mut source: Option<RoughClip> = None;
+        let mut rename_done: Option<(ProjectItem, String)> = None;
+        let mut rename_cancel = false;
+        let mut start_rename: Option<(ProjectItem, String)> = None;
+        let row_height = 30.0;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Nombre editable en línea para el elemento que se renombra.
+            let mut rename_field = |ui: &mut egui::Ui, item: &ProjectItem| -> bool {
+                let Some((target, text)) = self.project_rename.as_mut() else {
+                    return false;
+                };
+                if target != item {
+                    return false;
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(text).desired_width(ui.available_width()),
+                );
+                response.request_focus();
+                if response.lost_focus() {
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        rename_cancel = true;
+                    } else {
+                        rename_done = Some((item.clone(), text.clone()));
+                    }
+                }
+                true
+            };
+            let row = |ui: &mut egui::Ui, icon: &str, name: &str, detail: &str, active: bool| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter();
+                let fill = if active {
+                    theme::ACCENT_SOFT
+                } else if response.hovered() {
+                    theme::CARD_HOVER
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                painter.rect_filled(rect, 4.0, fill);
+                painter.text(
+                    egui::pos2(rect.left() + 6.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    icon,
+                    egui::FontId::proportional(13.0),
+                    theme::TEXT_DIM,
+                );
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    name.to_owned(),
+                    egui::FontId::proportional(12.0),
+                    if active { theme::ACCENT } else { theme::TEXT },
+                );
+                job.wrap.max_width = (rect.width() - 90.0).max(20.0);
+                job.wrap.max_rows = 1;
+                painter.galley(
+                    egui::pos2(rect.left() + 26.0, rect.center().y - 8.0),
+                    painter.layout_job(job),
+                    theme::TEXT,
+                );
+                painter.text(
+                    egui::pos2(rect.right() - 6.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    detail,
+                    egui::FontId::monospace(10.5),
+                    theme::TEXT_FAINT,
+                );
+                response
+            };
+            for bin in &child_bins {
+                let item = ProjectItem::Bin(bin.clone());
+                if rename_field(ui, &item) {
+                    continue;
+                }
+                let label = if searching {
+                    bin.clone()
+                } else {
+                    bin.rsplit('/').next().unwrap_or(bin).to_owned()
+                };
+                let response = row(ui, "▸", &label, "bin", false)
+                    .on_hover_text("Doble clic: abrir · Suelta aquí medios o secuencias para moverlos");
+                if response.double_clicked() {
+                    open_bin = Some(bin.clone());
+                }
+                if let Some(payload) = response.dnd_release_payload::<LibraryPayload>() {
+                    move_media = Some((payload.0, bin.clone()));
+                }
+                if let Some(payload) = response.dnd_release_payload::<SequencePayload>() {
+                    move_sequence = Some((payload.0, bin.clone()));
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Abrir").clicked() {
+                        open_bin = Some(bin.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Renombrar").clicked() {
+                        let leaf = bin.rsplit('/').next().unwrap_or(bin).to_owned();
+                        start_rename = Some((ProjectItem::Bin(bin.clone()), leaf));
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Eliminar bin")
+                        .on_hover_text("Su contenido pasa al bin superior; no se borra nada")
+                        .clicked()
+                    {
+                        delete_bin = Some(bin.clone());
+                        ui.close_menu();
+                    }
+                });
+            }
+            for (id, name, _bin, duration, active) in &sequences {
+                let item = ProjectItem::Sequence(*id);
+                if rename_field(ui, &item) {
+                    continue;
+                }
+                let response = row(ui, "▤", name, &format_clock(*duration), *active).on_hover_text(
+                    if *active {
+                        "Secuencia abierta · clic derecho: más opciones"
+                    } else {
+                        "Doble clic: abrir · Arrastra a la timeline para anidarla"
+                    },
+                );
+                if response.double_clicked() && !*active {
+                    open_sequence = Some(*id);
+                }
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), SequencePayload(*id));
+                }
+                response.context_menu(|ui| {
+                    if !*active && ui.button("Abrir").clicked() {
+                        open_sequence = Some(*id);
+                        ui.close_menu();
+                    }
+                    if !*active
+                        && ui
+                            .button("Anidar en el cabezal")
+                            .on_hover_text("Coloca una copia de esta secuencia como clip anidado en la abierta")
+                            .clicked()
+                    {
+                        nest = Some(*id);
+                        ui.close_menu();
+                    }
+                    if ui.button("Renombrar").clicked() {
+                        start_rename = Some((ProjectItem::Sequence(*id), name.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Duplicar").clicked() {
+                        duplicate = Some(*id);
+                        ui.close_menu();
+                    }
+                    ui.menu_button("Mover a", |ui| {
+                        for target in std::iter::once(String::new()).chain(bins.iter().cloned()) {
+                            let label = if target.is_empty() { "Proyecto (raíz)".to_owned() } else { target.clone() };
+                            if ui.button(label).clicked() {
+                                move_sequence = Some((*id, target));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    if !*active && ui.button("Eliminar").clicked() {
+                        delete_sequence = Some(*id);
+                        ui.close_menu();
+                    }
+                });
+            }
+            for index in &media {
+                let item = &self.project.library[*index];
+                let offline = !self.media_file_status.is_file(&item.clip.path);
+                let name = item.clip.name();
+                let detail = if offline {
+                    "OFFLINE".to_owned()
+                } else {
+                    format_clock(item.clip.source_duration_seconds.unwrap_or(item.clip.out_seconds))
+                };
+                let icon = if !item.clip.has_video { "♪" } else { "▶" };
+                let clip = item.clip.clone();
+                let response = row(ui, icon, &name, &detail, false).on_hover_text(format!(
+                    "{}\nDoble clic: monitor de fuente · Arrastra a la timeline o a un bin",
+                    clip.path.display()
+                ));
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), LibraryPayload(*index));
+                }
+                if response.double_clicked() {
+                    source = Some(clip.clone());
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Abrir en el monitor de fuente").clicked() {
+                        source = Some(clip.clone());
+                        ui.close_menu();
+                    }
+                    ui.menu_button("Mover a", |ui| {
+                        for target in std::iter::once(String::new()).chain(bins.iter().cloned()) {
+                            let label = if target.is_empty() { "Proyecto (raíz)".to_owned() } else { target.clone() };
+                            if ui.button(label).clicked() {
+                                move_media = Some((*index, target));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    if ui
+                        .button("Quitar del proyecto")
+                        .on_hover_text("Solo si ninguna secuencia lo usa; el archivo no se borra")
+                        .clicked()
+                    {
+                        remove_media = Some(*index);
+                        ui.close_menu();
+                    }
+                });
+            }
+            if child_bins.is_empty() && sequences.is_empty() && media.is_empty() {
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(if searching {
+                            "Nada coincide con la búsqueda"
+                        } else {
+                            "Bin vacío: arrastra aquí medios o usa + Medios"
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                    );
+                });
+            }
+        });
+        if rename_cancel {
+            self.project_rename = None;
+        }
+        if start_rename.is_some() {
+            self.project_rename = start_rename;
+        }
+        if let Some((item, text)) = rename_done {
+            self.project_rename = None;
+            let before = self.project.clone();
+            match item {
+                ProjectItem::Sequence(id) => self.project.rename_sequence(id, &text),
+                ProjectItem::Bin(path) => {
+                    let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+                    let leaf = proyecto::clean_bin(&text.replace('/', "-"));
+                    if !leaf.is_empty() {
+                        let target = match parent {
+                            Some(parent) => format!("{parent}/{leaf}"),
+                            None => leaf,
+                        };
+                        self.project.rename_bin(&path, &target);
+                        if proyecto::is_inside(&self.project_bin, &path) && !self.project_bin.is_empty() {
+                            self.project_bin = self.project_bin.replacen(&path, &target, 1);
+                        }
+                    }
+                }
+            }
+            self.finish_edit(before);
+        }
+        if let Some(bin) = open_bin {
+            self.project_bin = bin;
+            self.media_filter.clear();
+        }
+        let edit = |app: &mut Self, change: &dyn Fn(&mut RoughProject), message: String| {
+            let before = app.project.clone();
+            change(&mut app.project);
+            app.finish_edit(before);
+            app.status = message;
+        };
+        if let Some((index, bin)) = move_media {
+            edit(self, &|project| {
+                if let Some(item) = project.library.get_mut(index) {
+                    item.bin = bin.clone();
+                }
+            }, "Medio movido de bin".to_owned());
+        }
+        if let Some((id, bin)) = move_sequence {
+            edit(self, &|project| {
+                if project.sequence_id == id {
+                    project.sequence_bin = bin.clone();
+                } else if let Some(sequence) = project.sequences.iter_mut().find(|sequence| sequence.id == id) {
+                    sequence.bin = bin.clone();
+                }
+            }, "Secuencia movida de bin".to_owned());
+        }
+        if let Some(bin) = delete_bin {
+            edit(self, &|project| project.delete_bin(&bin), "Bin eliminado; su contenido subió un nivel".to_owned());
+            if proyecto::is_inside(&self.project_bin, &bin) {
+                self.project_bin = bin.rsplit_once('/').map(|(parent, _)| parent.to_owned()).unwrap_or_default();
+            }
+        }
+        if let Some(id) = duplicate {
+            edit(self, &|project| {
+                project.duplicate_sequence(id);
+            }, "Secuencia duplicada".to_owned());
+        }
+        if let Some(id) = delete_sequence {
+            edit(self, &|project| {
+                project.delete_sequence(id);
+            }, "Secuencia eliminada (Ctrl+Z la recupera)".to_owned());
+        }
+        if let Some(index) = remove_media {
+            let path = self.project.library[index].clip.path.clone();
+            if self.project.media_in_use(&path) {
+                self.status = "Ese medio se usa en alguna secuencia; quítalo de ellas primero".to_owned();
+            } else {
+                edit(self, &|project| {
+                    project.library.remove(index);
+                }, "Medio quitado del proyecto".to_owned());
+            }
+        }
+        if let Some(id) = open_sequence {
+            self.switch_sequence(id);
+        }
+        if let Some(id) = nest {
+            self.nest_sequence_at_playhead(id);
+        }
+        if let Some(clip) = source {
+            self.open_source_clip(clip);
+        }
+    }
+
+    /// Abre otra secuencia del proyecto.
+    fn switch_sequence(&mut self, id: u64) {
+        self.flush_pending_edit();
+        self.stop_playback();
+        let before = self.project.clone();
+        if self.project.open_sequence(id) {
+            self.after_sequence_switch();
+            self.finish_edit(before);
+            self.status = format!("Secuencia abierta: {}", self.project.sequence_name);
+        }
+    }
+
+    /// Estado de la vista que depende de la secuencia abierta.
+    fn after_sequence_switch(&mut self) {
+        self.clear_selection();
+        self.playhead = 0.0;
+        self.work_in = None;
+        self.work_out = None;
+        self.transcript_selection = None;
+        self.zoom = 1.0;
+        self.hscroll = 0.0;
+        self.preview_texture = None;
+        self.request_preview();
+    }
+
+    /// Copia de la secuencia `id` como clip anidado en el cabezal, en la
+    /// pista de vídeo más alta libre.
+    fn nest_sequence_at_playhead(&mut self, id: u64) {
+        let Some(mut clip) = self.project.sequence_as_nested(id) else {
+            self.status = "Esa secuencia está vacía".to_owned();
+            return;
+        };
+        let start = self.playhead;
+        let end = start + clip.duration();
+        let track = (0..16)
+            .find(|track| {
+                !self.project.lane_locked(*track, true)
+                    && !self.project.clips.iter().any(|other| {
+                        other.has_video
+                            && other.track == *track
+                            && other.timeline_start < end - 0.001
+                            && other.timeline_start + other.duration() > start + 0.001
+                    })
+            })
+            .unwrap_or(0);
+        clip.timeline_start = start;
+        clip.track = track;
+        let before = self.project.clone();
+        self.project.clips.push(clip);
+        self.select_only(self.project.clips.len() - 1);
+        self.finish_edit(before);
+        self.status = format!("Secuencia anidada en V{}", track + 1);
+    }
+
     fn draw_media_row(&mut self, ui: &mut egui::Ui, row: &media_browser::Row) {
         let index = self
             .selected
@@ -11483,6 +12102,16 @@ impl eframe::App for NovaCutWindows {
                 use media_browser::{Kind, Proxy, Sort};
                 theme::panel_header(ui, "Medios", None);
                 ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.media_view_project, true, "Proyecto")
+                        .on_hover_text("Bins, medios y secuencias del proyecto, estén o no montados");
+                    ui.selectable_value(&mut self.media_view_project, false, "En la secuencia")
+                        .on_hover_text("Cada medio con sus usos en la secuencia abierta");
+                });
+                if self.media_view_project {
+                    self.project_panel(ui);
+                    return;
+                }
+                ui.horizontal(|ui| {
                     ui.add_space(6.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.media_filter)
@@ -13177,12 +13806,53 @@ impl eframe::App for NovaCutWindows {
                     ui.add_space(2.0);
                 }
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("TIMELINE")
-                            .strong()
-                            .size(11.5)
-                            .color(theme::TEXT),
-                    );
+                    // Secuencia abierta; el desplegable cambia a otra o crea
+                    // una nueva, como las pestañas de secuencia de Premiere.
+                    let mut switch_to: Option<u64> = None;
+                    let mut create = false;
+                    egui::ComboBox::from_id_salt("timeline-sequence")
+                        .width(if compact_header { 96.0 } else { 150.0 })
+                        .selected_text(
+                            egui::RichText::new(&self.project.sequence_name)
+                                .strong()
+                                .size(11.5),
+                        )
+                        .show_ui(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&self.project.sequence_name)
+                                    .strong()
+                                    .color(theme::ACCENT),
+                            );
+                            for sequence in &self.project.sequences {
+                                if ui
+                                    .selectable_label(false, &sequence.name)
+                                    .on_hover_text(format!(
+                                        "{} · {}",
+                                        if sequence.bin.is_empty() { "Proyecto" } else { &sequence.bin },
+                                        format_clock(sequence.data.duration())
+                                    ))
+                                    .clicked()
+                                {
+                                    switch_to = Some(sequence.id);
+                                }
+                            }
+                            ui.separator();
+                            create = ui.button("+ Nueva secuencia").clicked();
+                        })
+                        .response
+                        .on_hover_text("Secuencia abierta; el panel Proyecto las organiza en bins");
+                    if let Some(id) = switch_to {
+                        self.switch_sequence(id);
+                    }
+                    if create {
+                        let before = self.project.clone();
+                        let bin = self.project.sequence_bin.clone();
+                        self.stop_playback();
+                        self.project.new_sequence(&bin);
+                        self.after_sequence_switch();
+                        self.finish_edit(before);
+                        self.status = format!("{} creada", self.project.sequence_name);
+                    }
                     if !compact_header {
                         ui.label(
                             egui::RichText::new(format!("{video_tracks}V · {audio_tracks}A"))
@@ -14396,7 +15066,26 @@ impl eframe::App for NovaCutWindows {
                 // Arrastre desde la biblioteca: previsualiza dónde caerá el
                 // medio y lo inserta al soltar, sobrescribiendo como un drop
                 // de archivo.
-                if let Some(source_index) = egui::DragAndDrop::payload::<usize>(context) {
+                // Qué se está arrastrando: un uso del panel de medios, un
+                // medio de la biblioteca o una secuencia entera (anidada).
+                let dragged: Option<(RoughClip, bool)> =
+                    if let Some(index) = egui::DragAndDrop::payload::<usize>(context) {
+                        self.project.clips.get(*index).cloned().map(|clip| (clip, false))
+                    } else if let Some(item) = egui::DragAndDrop::payload::<LibraryPayload>(context) {
+                        self.project
+                            .library
+                            .get(item.0)
+                            .map(|item| (item.clip.clone(), false))
+                    } else if let Some(sequence) =
+                        egui::DragAndDrop::payload::<SequencePayload>(context)
+                    {
+                        self.project
+                            .sequence_as_nested(sequence.0)
+                            .map(|clip| (clip, true))
+                    } else {
+                        None
+                    };
+                if let Some((dragged_clip, is_sequence)) = dragged {
                     if let Some(pointer) = context.input(|input| input.pointer.hover_pos()) {
                         if lanes_area.contains(pointer) {
                             let drop_time = pointer_time(pointer.x);
@@ -14411,18 +15100,19 @@ impl eframe::App for NovaCutWindows {
                             };
                             let released = context.input(|input| input.pointer.any_released());
                             if released {
-                                let source = self.project.clips.get(*source_index).cloned();
-                                let Some(mut clip) = source else {
-                                    egui::DragAndDrop::clear_payload(context);
-                                    return;
-                                };
+                                egui::DragAndDrop::clear_payload(context);
+                                let mut clip = dragged_clip;
                                 let file_based = clip.title.is_none()
                                     && clip.nested.is_none()
                                     && !clip.path.as_os_str().is_empty();
-                                if !file_based {
+                                if !file_based && !is_sequence {
                                     self.status =
                                         "Arrastra medios de archivo, no capas generadas".to_owned();
-                                    egui::DragAndDrop::clear_payload(context);
+                                    return;
+                                }
+                                if is_sequence && !is_video {
+                                    self.status =
+                                        "Suelta la secuencia en una pista de vídeo".to_owned();
                                     return;
                                 }
                                 if let Err(reason) = media_browser::validate_drop_destination(
@@ -14432,15 +15122,27 @@ impl eframe::App for NovaCutWindows {
                                     clip.has_audio,
                                 ) {
                                     self.status = reason.to_owned();
-                                    egui::DragAndDrop::clear_payload(context);
                                     return;
                                 }
                                 let before = self.project.clone();
                                 clip.timeline_start = drop_time;
                                 clip.track = track;
-                                clip.has_video = is_video;
-                                // Preserve source audio capability; never invent a stream.
+                                if !is_sequence {
+                                    // Preserve source audio capability; never invent a stream.
+                                    clip.has_video = is_video;
+                                }
                                 let span_end = clip.timeline_start + clip.duration();
+                                if span_hits_complex_clip(
+                                    &self.project.clips,
+                                    clip.track,
+                                    clip.has_video,
+                                    clip.timeline_start,
+                                    span_end,
+                                    &[],
+                                ) {
+                                    self.status = "No se puede soltar encima de una rampa o secuencia anidada".to_owned();
+                                    return;
+                                }
                                 clear_track_span(
                                     &mut self.project.clips,
                                     clip.track,
@@ -14453,17 +15155,19 @@ impl eframe::App for NovaCutWindows {
                                 self.select_only(self.project.clips.len() - 1);
                                 self.finish_edit(before);
                                 self.status = format!(
-                                    "Medio colocado en {}{} · {}",
+                                    "{} en {}{} · {}",
+                                    if is_sequence { "Secuencia anidada" } else { "Medio colocado" },
                                     if is_video { "V" } else { "A" },
                                     track + 1,
                                     timecode(drop_time, self.project.fps)
                                 );
                             } else {
                                 let x0 = to_x(drop_time);
+                                let width = (dragged_clip.duration() as f32 * pps as f32).clamp(24.0, 4000.0);
                                 let row_bottom = tracks_bottom - row as f32 * row_height;
                                 let preview = egui::Rect::from_min_max(
                                     egui::pos2(x0, row_bottom - row_height),
-                                    egui::pos2(x0 + 120.0, row_bottom),
+                                    egui::pos2(x0 + width, row_bottom),
                                 );
                                 lane_painter.rect_filled(
                                     preview,
@@ -15869,6 +16573,21 @@ fn build_render_filters(
     Ok(filters)
 }
 
+/// Algo del panel Proyecto que se puede renombrar.
+#[derive(Clone, PartialEq)]
+enum ProjectItem {
+    Sequence(u64),
+    Bin(String),
+}
+
+/// Arrastre de un medio de la biblioteca (índice en `project.library`).
+#[derive(Clone, Copy)]
+struct LibraryPayload(usize);
+
+/// Arrastre de una secuencia guardada (su id), que entra como anidada.
+#[derive(Clone, Copy)]
+struct SequencePayload(u64);
+
 /// Estado de un trabajo de la cola de exportación.
 #[derive(Clone, PartialEq)]
 enum JobState {
@@ -16305,7 +17024,7 @@ fn resolve_project_paths(project: &mut RoughProject, project_directory: Option<&
     let Some(directory) = project_directory.filter(|path| !path.as_os_str().is_empty()) else {
         return;
     };
-    for clip in &mut project.clips {
+    for clip in project.all_clips_mut() {
         resolve_clip_paths(clip, directory);
     }
 }
@@ -16333,7 +17052,7 @@ fn project_for_storage(project: &RoughProject, project_path: &Path) -> RoughProj
     else {
         return stored;
     };
-    for clip in &mut stored.clips {
+    for clip in stored.all_clips_mut() {
         relativize_clip_paths(clip, directory);
     }
     stored
