@@ -23,6 +23,7 @@ mod aceleracion;
 mod batch;
 mod command_center;
 mod efectos;
+mod montaje;
 mod navigation;
 mod subtitulos_animados;
 mod transcripcion;
@@ -629,6 +630,12 @@ enum DragKind {
     TrimEnd,
     RippleTrimStart,
     RippleTrimEnd,
+    /// Rodar el corte entre `left` y `right`, que estaba en `cut`.
+    Roll { left: usize, right: usize, cut: f64 },
+    /// Desplazar el contenido; `grab` es el instante donde empezó el gesto.
+    Slip { grab: f64 },
+    /// Deslizar el clip entre sus vecinos.
+    Slide { grab: f64 },
 }
 
 /// Herramienta activa del montaje. Cambia tanto el cursor como el significado
@@ -640,18 +647,24 @@ enum EditTool {
     Blade,
     Trim,
     RippleTrim,
+    Roll,
+    Slip,
+    Slide,
     Hand,
     Zoom,
     Magic,
 }
 
 impl EditTool {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 11] = [
         Self::Select,
         Self::TrackSelect,
         Self::Blade,
         Self::Trim,
         Self::RippleTrim,
+        Self::Roll,
+        Self::Slip,
+        Self::Slide,
         Self::Hand,
         Self::Zoom,
         Self::Magic,
@@ -664,6 +677,9 @@ impl EditTool {
             Self::Blade => "✂",
             Self::Trim => "↔",
             Self::RippleTrim => "⇤",
+            Self::Roll => "⇹",
+            Self::Slip => "⇆",
+            Self::Slide => "⇄",
             Self::Hand => "✋",
             Self::Zoom => "🔍",
             Self::Magic => "✨",
@@ -677,6 +693,9 @@ impl EditTool {
             Self::Blade => "Tijeras",
             Self::Trim => "Recortar",
             Self::RippleTrim => "Ripple",
+            Self::Roll => "Rodar",
+            Self::Slip => "Desplazar",
+            Self::Slide => "Deslizar",
             Self::Hand => "Mano",
             Self::Zoom => "Zoom",
             Self::Magic => "Varita",
@@ -690,6 +709,9 @@ impl EditTool {
             Self::Blade => "C",
             Self::Trim => "R",
             Self::RippleTrim => "T",
+            Self::Roll => "N",
+            Self::Slip => "Y",
+            Self::Slide => "Mayús+Y",
             Self::Hand => "H",
             Self::Zoom => "Z",
             Self::Magic => "G",
@@ -703,6 +725,9 @@ impl EditTool {
             Self::Blade => "Partir el clip exactamente donde pulses",
             Self::Trim => "Arrastrar cualquier mitad del clip para recortar ese borde",
             Self::RippleTrim => "Recortar y cerrar o abrir el montaje automáticamente",
+            Self::Roll => "Mover un corte: un clip gana lo que pierde el vecino",
+            Self::Slip => "Cambiar qué parte del medio muestra el clip sin moverlo",
+            Self::Slide => "Mover el clip entre sus vecinos, que ceden o ganan tiempo",
             Self::Hand => "Arrastrar la timeline horizontalmente",
             Self::Zoom => "Clic para acercar; Mayús+clic para alejar",
             Self::Magic => "Detectar escenas en vídeo o silencios en audio",
@@ -750,28 +775,76 @@ fn is_image_file(path: &Path) -> bool {
     )
 }
 
-/// Reproducción en curso del monitor: proceso FFmpeg + reloj local.
+/// Reproducción en curso del monitor: procesos FFmpeg + reloj.
 struct Playback {
-    child: std::process::Child,
-    audio_child: std::process::Child,
+    /// FFmpeg de vídeo hacia delante. Hacia atrás, los procesos viven en el
+    /// hilo lector, que compone tramo a tramo.
+    child: Option<std::process::Child>,
+    audio_child: Option<std::process::Child>,
     rx: Receiver<Option<PreviewFrame>>,
     start_playhead: f64,
     last_consumed: u64,
     timebase: Timebase,
+    /// Velocidad JKL: 1, 2, 4 u 8 hacia delante; negativa hacia atrás.
+    rate: i32,
+    /// Reloj de pared para cuando no hay audio que marque el tiempo.
+    started: std::time::Instant,
     /// RMS de audio por canal, actualizado por el hilo lector.
     meter: Arc<std::sync::Mutex<(f32, f32)>>,
     /// Mantiene vivo el dispositivo de audio mientras se reproduce.
-    _stream: rodio::OutputStream,
-    sink: Arc<rodio::Sink>,
+    _stream: Option<rodio::OutputStream>,
+    sink: Option<Arc<rodio::Sink>>,
+}
+
+impl Playback {
+    /// Segundos reales transcurridos: el audio es el reloj maestro para
+    /// evitar deriva; sin audio, el reloj de pared.
+    fn elapsed(&self) -> f64 {
+        match &self.sink {
+            Some(sink) => sink.get_pos().as_secs_f64(),
+            None => self.started.elapsed().as_secs_f64(),
+        }
+    }
+
+    /// Instante de timeline del fotograma entregado número `consumed`: cada
+    /// fotograma entregado avanza `|rate|` fotogramas del montaje.
+    fn time_of(&self, consumed: u64) -> f64 {
+        let frames = consumed as i64 * self.rate.unsigned_abs() as i64;
+        self.start_playhead + self.rate.signum() as f64 * self.timebase.seconds(frames)
+    }
 }
 
 impl Drop for Playback {
     fn drop(&mut self) {
-        self.sink.stop();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = self.audio_child.kill();
-        let _ = self.audio_child.wait();
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+        for child in [&mut self.child, &mut self.audio_child].into_iter().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Cadena `atempo` para reproducir el audio a `rate`× sin cambiar el tono.
+fn atempo_chain(rate: u32) -> String {
+    let mut chain = String::new();
+    let mut remaining = rate.max(1);
+    while remaining > 1 {
+        chain.push_str(",atempo=2");
+        remaining /= 2;
+    }
+    chain
+}
+
+/// Siguiente velocidad al pulsar L (`forward`) o J con la reproducción a
+/// `current`: arranca a 1× y cada pulsación en el mismo sentido duplica
+/// hasta 8×; cambiar de sentido vuelve a 1×.
+fn next_shuttle_rate(current: Option<i32>, forward: bool) -> i32 {
+    let sign = if forward { 1 } else { -1 };
+    match current {
+        Some(rate) if rate.signum() == sign => sign * (rate.abs() * 2).min(8),
+        _ => sign,
     }
 }
 
@@ -828,6 +901,8 @@ enum TimelineDragEvent {
     Move(usize, f64, usize),
     TrimStart(usize, f64),
     TrimEnd(usize, f64),
+    /// Rodar, desplazar o deslizar: instante bajo el puntero.
+    Tool(usize, f64),
     Commit(usize),
     Select(usize, SelectionMode),
 }
@@ -1555,18 +1630,14 @@ fn ripple_track_at(
             continue;
         }
         if crosses(clip) {
-            let speed = clip.speed.clamp(0.1, 8.0);
-            let source_cut = clip.in_seconds + (at - clip.timeline_start) * speed;
-            let mut head = clip.clone();
-            head.out_seconds = source_cut;
-            head.fade_out_seconds = 0.0;
-            let mut tail = clip.clone();
-            tail.timeline_start = at + span;
-            tail.in_seconds = source_cut;
-            tail.fade_in_seconds = 0.0;
-            tail.transition = None;
-            result.push(head);
-            result.push(tail);
+            let local = at - clip.timeline_start;
+            let head = montaje::clip_portion(clip, 0.0, local);
+            let tail = montaje::clip_portion(clip, local, clip.duration());
+            result.extend(head);
+            if let Some(mut tail) = tail {
+                tail.timeline_start = at + span;
+                result.push(tail);
+            }
         } else {
             let mut shifted = clip.clone();
             if shifted.timeline_start >= at - 0.001 {
@@ -1577,45 +1648,6 @@ fn ripple_track_at(
     }
     *clips = result;
     true
-}
-
-/// Recorta el montaje al rango [start, end] y lo desplaza al origen. Los clips
-/// con rampa o secuencia anidada no se recortan por dentro: se conservan
-/// enteros si tocan el rango, porque su tiempo de origen no es lineal.
-fn trim_clips_to_range(clips: &[RoughClip], start: f64, end: f64) -> Vec<RoughClip> {
-    let mut result = Vec::new();
-    for clip in clips {
-        let clip_start = clip.timeline_start;
-        let clip_end = clip.timeline_start + clip.duration();
-        if clip_end <= start + 0.001 || clip_start >= end - 0.001 {
-            continue;
-        }
-        let mut trimmed = clip.clone();
-        let complex = clip.nested.is_some()
-            || clip
-                .speed_ramp
-                .as_ref()
-                .is_some_and(|points| !points.is_empty());
-        if complex {
-            trimmed.timeline_start = clip_start - start;
-            result.push(trimmed);
-            continue;
-        }
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let head = (start - clip_start).max(0.0);
-        let tail = (clip_end - end).max(0.0);
-        trimmed.timeline_start = (clip_start + head) - start;
-        trimmed.in_seconds = clip.in_seconds + head * speed;
-        trimmed.out_seconds = clip.out_seconds - tail * speed;
-        if trimmed.out_seconds - trimmed.in_seconds <= 0.001 {
-            continue;
-        }
-        let half = trimmed.duration() / 2.0;
-        trimmed.fade_in_seconds = trimmed.fade_in_seconds.min(half).max(0.0);
-        trimmed.fade_out_seconds = trimmed.fade_out_seconds.min(half).max(0.0);
-        result.push(trimmed);
-    }
-    result
 }
 
 fn color_eq_filter(exposure: f64, contrast: f64, saturation: f64) -> String {
@@ -5957,14 +5989,13 @@ impl NovaCutWindows {
                 self.status = "La pista está bloqueada".to_owned();
                 return;
             }
-            let before = self.project.clone();
             let local = self.playhead - self.project.clips[index].timeline_start;
-            let source_split = self.project.clips[index].in_seconds
-                + local * self.project.clips[index].speed.clamp(0.1, 8.0);
-            let mut right = self.project.clips[index].clone();
-            self.project.clips[index].out_seconds = source_split;
-            right.in_seconds = source_split;
-            right.timeline_start = self.playhead;
+            let Some((left, right)) = montaje::split(&self.project.clips[index], local) else {
+                self.status = "El cabezal está demasiado cerca del borde del clip".to_owned();
+                return;
+            };
+            let before = self.project.clone();
+            self.project.clips[index] = left;
             self.project.clips.insert(index + 1, right);
             self.select_only(index + 1);
             self.finish_edit(before);
@@ -6008,15 +6039,12 @@ impl NovaCutWindows {
             return;
         }
         let cut = clip.timeline_start + local;
-        let source_cut = clip.in_seconds + local * clip.speed.clamp(0.1, 8.0);
+        let Some((left, right)) = montaje::split(&clip, local) else {
+            self.status = "Pulsa dentro del clip, lejos de sus bordes".to_owned();
+            return;
+        };
         let before = self.project.clone();
-        let mut right = clip;
-        self.project.clips[index].out_seconds = source_cut;
-        self.project.clips[index].fade_out_seconds = 0.0;
-        right.in_seconds = source_cut;
-        right.timeline_start = cut;
-        right.fade_in_seconds = 0.0;
-        right.transition = None;
+        self.project.clips[index] = left;
         self.project.clips.insert(index + 1, right);
         self.playhead = cut;
         self.select_only(index + 1);
@@ -6076,8 +6104,8 @@ impl NovaCutWindows {
             return;
         };
 
-        let clips = self.export_clips();
-        if clips.is_empty() {
+        let job = self.render_job(output.clone());
+        if job.clips.is_empty() {
             self.status = "El rango de trabajo no contiene ningún clip".to_owned();
             return;
         }
@@ -6088,14 +6116,7 @@ impl NovaCutWindows {
             state.pct = 0.0;
             state.eta_secs = 0.0;
         }
-        let size = self.export_size;
-        let format = self.export_format;
-        let track_gains = self.project.track_gains.clone();
-        let master_gain_db = self.project.master_gain_db;
-        let normalize_loudness = self.project.normalize_loudness;
-        let timebase = self.project.timebase();
-        let measured_loudness = self.current_loudness_measurement().cloned();
-        let hw = self.active_hw();
+        let (size, format) = (job.size, job.format);
         if let Ok(mut state) = self.render_progress.lock() {
             state.note = None;
         }
@@ -6113,23 +6134,7 @@ impl NovaCutWindows {
             )
         };
         std::thread::spawn(move || {
-            let result = run_export(
-                &clips,
-                &output,
-                &thread_cancel,
-                false,
-                size,
-                audio_only,
-                format,
-                &track_gains,
-                master_gain_db,
-                normalize_loudness,
-                timebase,
-                measured_loudness.as_ref(),
-                hw,
-                &progress,
-            )
-            .map(|()| output);
+            let result = run_export(&job, &thread_cancel, &progress).map(|()| output);
             let _ = sender.send(result);
         });
     }
@@ -6447,16 +6452,35 @@ impl NovaCutWindows {
         clips
     }
 
-    /// Clips que van al render final: como los efectivos, pero recortados al
-    /// rango de trabajo cuando el usuario pide exportar solo ese tramo.
-    fn export_clips(&self) -> Vec<RoughClip> {
-        let clips = self.effective_clips();
+    /// Exportación con los ajustes actuales. Con «solo rango», los clips se
+    /// recortan al rango de trabajo y el preroll se descarta en la salida.
+    fn render_job(&self, output: PathBuf) -> RenderJob {
+        let mut clips = self.effective_clips();
+        let (mut skip, mut length) = (0.0, None);
         if self.export_range_only {
             if let Some((start, end)) = self.work_range() {
-                return trim_clips_to_range(&clips, start, end);
+                let (windowed, preroll) = montaje::window(&clips, start, end);
+                clips = windowed;
+                skip = preroll;
+                length = Some(end - start);
             }
         }
-        clips
+        RenderJob {
+            clips,
+            output,
+            fast: false,
+            size: self.export_size,
+            audio_only: self.export_format.is_audio_only(),
+            format: self.export_format,
+            track_gains: self.project.track_gains.clone(),
+            master_gain_db: self.project.master_gain_db,
+            normalize_loudness: self.project.normalize_loudness,
+            timebase: self.project.timebase(),
+            measured_loudness: self.current_loudness_measurement().cloned(),
+            hw: self.active_hw(),
+            skip,
+            length,
+        }
     }
 
     /// Sincroniza los ángulos de multicámara por audio: alinea cada clip de vídeo
@@ -6732,9 +6756,7 @@ impl NovaCutWindows {
                     self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
                     return;
                 }
-                let speed = orig.speed.clamp(0.1, 8.0);
-                let start_min = (orig.timeline_start - orig.in_seconds / speed).max(0.0);
-                let max_start = (orig.timeline_start + orig.duration() - 0.04).max(start_min);
+                let (head_min, head_max, _, _) = montaje::edge_limits(&orig);
                 let new_start = snap_time(
                     self.quantize_time(target_time),
                     &before.clips,
@@ -6743,15 +6765,18 @@ impl NovaCutWindows {
                     self.playhead,
                     self.snap_tolerance(),
                 )
-                .clamp(start_min, max_start);
+                .clamp(
+                    orig.timeline_start + head_min,
+                    orig.timeline_start + head_max.max(head_min),
+                );
                 let delta_t = new_start - orig.timeline_start;
-                let clip_out = &mut self.project.clips[index];
-                clip_out.timeline_start = if ripple {
-                    orig.timeline_start
-                } else {
-                    new_start
+                let Some(mut trimmed) = montaje::retime(&orig, delta_t, 0.0) else {
+                    return;
                 };
-                clip_out.in_seconds = (orig.in_seconds + delta_t * speed).max(0.0);
+                if ripple {
+                    trimmed.timeline_start = orig.timeline_start;
+                }
+                self.project.clips[index] = trimmed;
                 if ripple {
                     let orig_end = orig.timeline_start + orig.duration();
                     for (other, baseline) in before.clips.iter().enumerate() {
@@ -6790,14 +6815,8 @@ impl NovaCutWindows {
                     self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
                     return;
                 }
-                let speed = orig.speed.clamp(0.1, 8.0);
-                let min_end = orig.timeline_start + 0.04;
-                let max_end = orig
-                    .source_duration_seconds
-                    .map(|duration| {
-                        orig.timeline_start + (duration - orig.in_seconds).max(0.04) / speed
-                    })
-                    .unwrap_or(f64::INFINITY);
+                let orig_end = orig.timeline_start + orig.duration();
+                let (_, _, tail_min, tail_max) = montaje::edge_limits(&orig);
                 let new_end = snap_time(
                     self.quantize_time(target_time),
                     &before.clips,
@@ -6806,10 +6825,11 @@ impl NovaCutWindows {
                     self.playhead,
                     self.snap_tolerance(),
                 )
-                .clamp(min_end, max_end.max(min_end));
-                let clip_out = &mut self.project.clips[index];
-                clip_out.in_seconds = orig.in_seconds;
-                clip_out.out_seconds = orig.in_seconds + (new_end - orig.timeline_start) * speed;
+                .clamp(orig_end + tail_min, orig_end + tail_max.max(tail_min));
+                let Some(trimmed) = montaje::retime(&orig, 0.0, new_end - orig_end) else {
+                    return;
+                };
+                self.project.clips[index] = trimmed;
                 if ripple {
                     let orig_end = orig.timeline_start + orig.duration();
                     let delta_t = new_end - orig_end;
@@ -6825,6 +6845,64 @@ impl NovaCutWindows {
                     }
                 }
                 self.request_preview();
+            }
+            Some(TimelineDragEvent::Tool(index, pointer)) => {
+                let Some((kind, before)) = self
+                    .drag_edit
+                    .as_ref()
+                    .filter(|state| state.0 == index)
+                    .map(|state| (state.1, &state.2))
+                else {
+                    return;
+                };
+                // Cada paso parte del estado al empezar el gesto: el delta es
+                // absoluto y no acumula errores de redondeo.
+                let mut clips = before.clips.clone();
+                let applied = match kind {
+                    DragKind::Roll { left, right, cut } => {
+                        let target = snap_time(
+                            self.quantize_time(pointer),
+                            &before.clips,
+                            Some(index),
+                            &before.markers,
+                            self.playhead,
+                            self.snap_tolerance(),
+                        );
+                        let locked = self.project.clip_locked(&before.clips[left])
+                            || self.project.clip_locked(&before.clips[right]);
+                        (!locked)
+                            .then(|| montaje::roll(&mut clips, left, right, target - cut))
+                            .flatten()
+                    }
+                    // Arrastrar a la derecha lleva el contenido a la derecha:
+                    // se ve material anterior, como en Premiere.
+                    DragKind::Slip { grab } => {
+                        montaje::slip(&mut clips[index], -self.quantize_time(pointer - grab))
+                    }
+                    DragKind::Slide { grab } => {
+                        let delta = self.quantize_time(pointer - grab);
+                        let neighbours_locked = clips.iter().any(|other| {
+                            other.track == clips[index].track
+                                && other.has_video == clips[index].has_video
+                                && self.project.clip_locked(other)
+                        });
+                        (!neighbours_locked)
+                            .then(|| montaje::slide(&mut clips, index, delta))
+                            .flatten()
+                    }
+                    _ => None,
+                };
+                match applied {
+                    Some(_) => {
+                        self.project.clips = clips;
+                        self.request_preview();
+                    }
+                    None => {
+                        self.status =
+                            "Ese clip no admite la edición (rampa, anidado o pista bloqueada)"
+                                .to_owned();
+                    }
+                }
             }
             Some(TimelineDragEvent::Commit(index)) => {
                 if let Some((active, kind, before)) = self.drag_edit.take() {
@@ -6921,6 +6999,9 @@ impl NovaCutWindows {
                             DragKind::RippleTrimStart | DragKind::RippleTrimEnd => {
                                 "Clip recortado con ripple".to_owned()
                             }
+                            DragKind::Roll { .. } => "Corte rodado".to_owned(),
+                            DragKind::Slip { .. } => "Contenido desplazado".to_owned(),
+                            DragKind::Slide { .. } => "Clip deslizado entre sus vecinos".to_owned(),
                             _ => "Clip recortado".to_owned(),
                         };
                     }
@@ -7971,9 +8052,10 @@ impl NovaCutWindows {
                     (
                         "Reproducción",
                         &[
-                            ("Espacio / L", "Reproducir / detener"),
+                            ("Espacio", "Reproducir / detener"),
+                            ("L / J", "Adelante / atrás; repetir acelera hasta 8×"),
                             ("K", "Detener la reproducción"),
-                            ("J", "Corte anterior"),
+                            ("K + L / K + J", "Un fotograma adelante / atrás"),
                             ("← →", "Un fotograma atrás / adelante"),
                             ("Mayús + ← →", "Un segundo atrás / adelante"),
                             ("↑ ↓", "Corte anterior / siguiente"),
@@ -7990,6 +8072,9 @@ impl NovaCutWindows {
                             ("C", "Tijeras: partir donde pulses"),
                             ("R", "Recortar desde cualquier mitad del clip"),
                             ("T", "Recorte ripple que cierra el montaje"),
+                            ("N", "Rodar: mover un corte entre dos clips"),
+                            ("Y", "Desplazar el contenido sin mover el clip"),
+                            ("Mayús+Y", "Deslizar el clip entre sus vecinos"),
                             ("H", "Mano: desplazar la timeline"),
                             ("Z / Mayús+clic", "Acercar / alejar con Zoom"),
                             ("G", "Varita: escenas o silencios"),
@@ -8015,7 +8100,8 @@ impl NovaCutWindows {
                             ("D", "Activar o desactivar los clips marcados"),
                             ("Supr", "Quitar dejando hueco"),
                             ("Mayús + Supr", "Quitar y cerrar hueco"),
-                            ("Q / W", "Recortar entrada / salida al cabezal"),
+                            ("Q / W", "Recortar entrada / salida al cabezal (ripple)"),
+                            ("; / '", "Levantar / extraer el rango I–O"),
                             ("E", "Extender el borde más cercano"),
                             ("F", "Match frame: clip bajo el cabezal"),
                             ("Ctrl + ← →", "Mover los clips un fotograma"),
@@ -8456,16 +8542,11 @@ impl NovaCutWindows {
         // De mayor a menor para que las inserciones no muevan los índices
         // pendientes.
         for index in targets.iter().rev() {
-            let clip = self.project.clips[*index].clone();
-            let local = playhead - clip.timeline_start;
-            let source_split = clip.in_seconds + local * clip.speed.clamp(0.1, 8.0);
-            let mut right = clip.clone();
-            self.project.clips[*index].out_seconds = source_split;
-            self.project.clips[*index].fade_out_seconds = 0.0;
-            right.in_seconds = source_split;
-            right.timeline_start = playhead;
-            right.fade_in_seconds = 0.0;
-            right.transition = None;
+            let clip = &self.project.clips[*index];
+            let Some((left, right)) = montaje::split(clip, playhead - clip.timeline_start) else {
+                continue;
+            };
+            self.project.clips[*index] = left;
             self.project.clips.insert(index + 1, right);
         }
         self.clear_selection();
@@ -8576,10 +8657,79 @@ impl NovaCutWindows {
         self.batch_state.paste = Some((indices, self.document_generation, source));
     }
 
-    /// Recorta el borde indicado del clip seleccionado hasta el cabezal (Q/W).
+    /// Levantar (`;`) deja hueco; Extraer (`'`) lo cierra. Actúan sobre el
+    /// rango de entrada/salida en todas las pistas no bloqueadas.
+    fn lift_or_extract(&mut self, extract: bool) {
+        if self.work_in.is_none() || self.work_out.is_none() {
+            self.status = "Marca entrada (I) y salida (O) antes de levantar o extraer".to_owned();
+            return;
+        }
+        let Some((start, end)) = self.work_range() else {
+            return;
+        };
+        let project = &self.project;
+        let editable = |clip: &RoughClip| !project.clip_locked(clip);
+        let result = if extract {
+            // Extraer desplaza todo lo posterior: una pista bloqueada con
+            // material después del rango se desincronizaría.
+            let blocked = self.project.clips.iter().any(|clip| {
+                self.project.clip_locked(clip) && clip.timeline_start + clip.duration() > start
+            });
+            if blocked {
+                Err("Hay pistas bloqueadas con material después de la entrada".to_owned())
+            } else {
+                transcripcion::extract_ranges(&self.project.clips, &[(start, end)])
+            }
+        } else {
+            montaje::lift(&self.project.clips, start, end, editable)
+        };
+        match result {
+            Ok(clips) => {
+                let before = self.project.clone();
+                self.project.clips = clips;
+                self.clear_selection();
+                if extract {
+                    self.work_in = None;
+                    self.work_out = None;
+                    self.playhead = start;
+                }
+                self.finish_edit(before);
+                self.request_preview();
+                self.status = format!(
+                    "{} {} del montaje",
+                    if extract { "Extraído" } else { "Levantado" },
+                    format_clock(end - start)
+                );
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Clip sobre el que actúan Q/W: el seleccionado o, sin selección, el de
+    /// la pista de vídeo más alta bajo el cabezal.
+    fn edit_target(&self) -> Option<usize> {
+        self.selected
+            .filter(|index| *index < self.project.clips.len())
+            .or_else(|| {
+                self.project
+                    .clips
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, clip)| {
+                        self.playhead > clip.timeline_start
+                            && self.playhead < clip.timeline_start + clip.duration()
+                            && !self.project.clip_locked(clip)
+                    })
+                    .max_by_key(|(_, clip)| (clip.has_video, clip.track))
+                    .map(|(index, _)| index)
+            })
+    }
+
+    /// Q / W de Premiere: recorta la entrada (o la salida) del clip hasta el
+    /// cabezal y cierra el hueco desplazando lo que venga detrás en su pista.
     fn trim_to_playhead(&mut self, start_edge: bool) {
-        let Some(index) = self.selected.filter(|i| *i < self.project.clips.len()) else {
-            self.status = "Selecciona un clip para recortarlo".to_owned();
+        let Some(index) = self.edit_target() else {
+            self.status = "Selecciona un clip o pon el cabezal encima de uno".to_owned();
             return;
         };
         let clip = self.project.clips[index].clone();
@@ -8587,36 +8737,47 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        if clip
-            .speed_ramp
-            .as_ref()
-            .is_some_and(|points| !points.is_empty())
-        {
-            self.status = "Desanida o quita la rampa antes de recortar".to_owned();
-            return;
-        }
         let end = clip.timeline_start + clip.duration();
-        if self.playhead <= clip.timeline_start + 0.04 || self.playhead >= end - 0.04 {
+        if self.playhead <= clip.timeline_start + montaje::MIN_CLIP
+            || self.playhead >= end - montaje::MIN_CLIP
+        {
             self.status = "Coloca el cabezal dentro del clip para recortarlo".to_owned();
             return;
         }
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let before = self.project.clone();
-        if start_edge {
-            let delta = self.playhead - clip.timeline_start;
-            let target = &mut self.project.clips[index];
-            target.timeline_start = self.playhead;
-            target.in_seconds = (clip.in_seconds + delta * speed).max(0.0);
+        let (head, tail) = if start_edge {
+            (self.playhead - clip.timeline_start, 0.0)
         } else {
-            let target = &mut self.project.clips[index];
-            target.out_seconds = clip.in_seconds + (self.playhead - clip.timeline_start) * speed;
+            (0.0, self.playhead - end)
+        };
+        let Some(mut trimmed) = montaje::retime(&clip, head, tail) else {
+            self.status = "Desanida o quita la rampa antes de recortar".to_owned();
+            return;
+        };
+        let before = self.project.clone();
+        // Ripple: el clip conserva su inicio y lo posterior de su pista se
+        // acerca lo mismo que se ha quitado.
+        let removed = head - tail;
+        trimmed.timeline_start = clip.timeline_start;
+        self.project.clips[index] = trimmed;
+        for (other, baseline) in before.clips.iter().enumerate() {
+            if other != index
+                && baseline.track == clip.track
+                && baseline.has_video == clip.has_video
+                && baseline.timeline_start >= end - 0.001
+            {
+                self.project.clips[other].timeline_start =
+                    (baseline.timeline_start - removed).max(0.0);
+            }
+        }
+        if start_edge {
+            self.playhead = clip.timeline_start;
         }
         self.finish_edit(before);
         self.request_preview();
         self.status = if start_edge {
-            "Entrada recortada al cabezal".to_owned()
+            "Entrada recortada al cabezal (ripple)".to_owned()
         } else {
-            "Salida recortada al cabezal".to_owned()
+            "Salida recortada al cabezal (ripple)".to_owned()
         };
     }
 
@@ -8631,49 +8792,44 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        if clip.nested.is_some()
-            || clip
-                .speed_ramp
-                .as_ref()
-                .is_some_and(|points| !points.is_empty())
-        {
+        if montaje::is_complex(&clip) {
             self.status = "Desanida o quita la rampa antes de extender".to_owned();
             return;
         }
-        let speed = clip.speed.clamp(0.1, 8.0);
         let end = clip.timeline_start + clip.duration();
-        let before = self.project.clone();
-        if self.playhead > end {
-            let source_end = clip
-                .source_duration_seconds
-                .unwrap_or(clip.out_seconds)
-                .max(clip.out_seconds);
-            let requested = clip.in_seconds + (self.playhead - clip.timeline_start) * speed;
-            if requested > source_end + 0.001 {
+        let (head_min, _, _, tail_max) = montaje::edge_limits(&clip);
+        let (head, tail, status) = if self.playhead > end {
+            if tail_max <= 0.001 {
                 self.status = "No queda más material en el archivo fuente".to_owned();
                 return;
             }
-            let target = &mut self.project.clips[index];
-            target.out_seconds = requested.min(source_end);
-            self.status = "Salida extendida al cabezal".to_owned();
+            let wanted = self.playhead - end;
+            let status = if wanted > tail_max + 0.001 {
+                "Salida extendida hasta el final del material"
+            } else {
+                "Salida extendida al cabezal"
+            };
+            (0.0, wanted.min(tail_max), status)
         } else if self.playhead < clip.timeline_start {
-            let delta = clip.timeline_start - self.playhead;
-            let available = clip.in_seconds / speed;
-            let delta = delta.min(available);
-            if delta <= 0.001 {
+            if head_min >= -0.001 {
                 self.status = "No queda material antes de la entrada".to_owned();
                 return;
             }
-            let target = &mut self.project.clips[index];
-            target.timeline_start = clip.timeline_start - delta;
-            target.in_seconds = (clip.in_seconds - delta * speed).max(0.0);
-            self.status = "Entrada extendida al cabezal".to_owned();
+            let wanted = self.playhead - clip.timeline_start;
+            (wanted.max(head_min), 0.0, "Entrada extendida al cabezal")
         } else {
             self.status = "Coloca el cabezal fuera del clip para extenderlo".to_owned();
             return;
-        }
+        };
+        let Some(extended) = montaje::retime(&clip, head, tail) else {
+            self.status = "No se pudo extender el clip".to_owned();
+            return;
+        };
+        let before = self.project.clone();
+        self.project.clips[index] = extended;
         self.finish_edit(before);
         self.request_preview();
+        self.status = status.to_owned();
     }
 
     /// Selecciona el clip que hay bajo el cabezal en la pista más alta (F).
@@ -8992,6 +9148,20 @@ impl NovaCutWindows {
             self.stop_playback();
             return;
         }
+        self.start_playback(1);
+    }
+
+    /// Transporte JKL: L acelera hacia delante, J hacia atrás.
+    fn shuttle(&mut self, forward: bool) {
+        let current = self.playback.as_ref().map(|playback| playback.rate);
+        self.start_playback(next_shuttle_rate(current, forward));
+    }
+
+    /// Reproduce desde el cabezal a `rate`× (negativo, hacia atrás). Solo se
+    /// compone desde el cabezal (más el preroll que pida la ventana), así
+    /// que arrancar en el minuto 45 cuesta lo mismo que en el 0.
+    fn start_playback(&mut self, rate: i32) {
+        self.playback = None;
         if !self.ffmpeg_ready || self.project.clips.is_empty() {
             return;
         }
@@ -8999,6 +9169,11 @@ impl NovaCutWindows {
             self.status = "Espera a que termine el render antes de reproducir".to_owned();
             return;
         }
+        if rate < 0 {
+            self.start_reverse_playback(rate);
+            return;
+        }
+        let rate = rate.clamp(1, 8);
         // Reproducir dentro del rango arranca en su entrada si el cabezal
         // está fuera, para no esperar a que llegue.
         if self.export_range_only {
@@ -9010,7 +9185,9 @@ impl NovaCutWindows {
         }
         let timebase = self.project.timebase();
         let start_playhead = timebase.seconds(timebase.frames(self.playhead));
-        let prepared = prepare_render_clips(&self.effective_clips());
+        let (windowed, preroll) =
+            montaje::window(&self.effective_clips(), start_playhead, f64::INFINITY);
+        let prepared = prepare_render_clips(&windowed);
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error"]);
         let (input_indices, is_title_input) = push_render_inputs(
@@ -9051,7 +9228,8 @@ impl NovaCutWindows {
             return;
         };
         let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
-        let skip_frames = timebase.frames(start_playhead).max(0) as u64;
+        let skip_frames = timebase.frames(preroll).max(0) as u64;
+        let step = rate as u64;
         let stdout = child.stdout.take();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -9064,29 +9242,22 @@ impl NovaCutWindows {
             let mut index: u64 = 0;
             let mut buffer = vec![0u8; frame_len];
             loop {
-                let mut filled = 0;
-                while filled < frame_len {
-                    match reader.read(&mut buffer[filled..]) {
-                        Ok(0) => {
-                            let _ = sender.send(None);
-                            return;
-                        }
-                        Ok(n) => filled += n,
-                        Err(_) => {
-                            let _ = sender.send(None);
-                            return;
-                        }
-                    }
+                if reader.read_exact(&mut buffer).is_err() {
+                    let _ = sender.send(None);
+                    return;
                 }
                 index += 1;
                 if index <= skip_frames {
                     continue;
                 }
-                // Ritmo en tiempo real: el frame j se entrega en j/fps.
+                // A 2×, 4× u 8× se entrega uno de cada `step` fotogramas.
+                let played = index - skip_frames - 1;
+                if played % step != 0 {
+                    continue;
+                }
+                // Ritmo en tiempo real: el entregado j sale en j/fps.
                 let due = started
-                    + std::time::Duration::from_secs_f64(
-                        timebase.seconds((index - skip_frames - 1) as i64),
-                    );
+                    + std::time::Duration::from_secs_f64(timebase.seconds((played / step) as i64));
                 let now = std::time::Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
@@ -9112,7 +9283,7 @@ impl NovaCutWindows {
             self.use_proxies,
             timebase,
         );
-        let Ok(audio_filters) = build_render_filters(
+        let Ok(mut audio_filters) = build_render_filters(
             &prepared,
             &audio_indices,
             &audio_titles,
@@ -9128,10 +9299,13 @@ impl NovaCutWindows {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
             return;
         };
+        audio_filters.push(format!(
+            "[aout]atrim=start={preroll:.6},asetpts=PTS-STARTPTS{}[aplay]",
+            atempo_chain(rate as u32)
+        ));
         let Ok(mut audio_child) = audio_command
             .args(["-filter_complex", &audio_filters.join(";")])
-            .args(["-map", "[aout]"])
-            .args(["-ss", &format_seconds(start_playhead)])
+            .args(["-map", "[aplay]"])
             .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
@@ -9194,20 +9368,141 @@ impl NovaCutWindows {
             });
         }
         self.playback = Some(Playback {
-            child,
-            audio_child,
+            child: Some(child),
+            audio_child: Some(audio_child),
             rx: receiver,
             start_playhead,
             last_consumed: 0,
             timebase,
+            rate,
+            started: std::time::Instant::now(),
             meter,
-            _stream: stream,
-            sink,
+            _stream: Some(stream),
+            sink: Some(sink),
         });
-        self.status = "Reproduciendo el montaje".to_owned();
+        self.status = if rate == 1 {
+            "Reproduciendo el montaje".to_owned()
+        } else {
+            format!("Reproduciendo a {rate}× (L acelera, K para)")
+        };
     }
 
-    /// Consume vídeo con el reloj de audio como maestro para evitar deriva.
+    /// Marcha atrás (J): FFmpeg no decodifica hacia atrás, así que un hilo
+    /// compone el montaje en tramos cortos que terminan en el cabezal y los
+    /// entrega del último fotograma al primero. Sin audio, como el scrub.
+    fn start_reverse_playback(&mut self, rate: i32) {
+        let timebase = self.project.timebase();
+        let start_playhead = timebase.seconds(timebase.frames(self.playhead));
+        if start_playhead <= 0.0 {
+            self.status = "El cabezal ya está al principio".to_owned();
+            return;
+        }
+        let step = rate.unsigned_abs().clamp(1, 8) as i64;
+        let clips = self.effective_clips();
+        let use_proxies = self.use_proxies;
+        let (waveform, vectorscope) = (self.show_waveform, self.show_vectorscope);
+        let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
+        std::thread::spawn(move || {
+            let size = (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32);
+            let frame_len = MONITOR_WIDTH * MONITOR_HEIGHT * 4;
+            let started = std::time::Instant::now();
+            let start_frame = timebase.frames(start_playhead);
+            let mut end_frame = start_frame;
+            let mut emitted: i64 = 0;
+            // Un segundo de reproducción por tramo, sea cual sea la velocidad.
+            let chunk_frames = (timebase.frames(1.0).max(1)) * step;
+            while end_frame > 0 {
+                let begin_frame = (end_frame - chunk_frames).max(0);
+                let (begin, end) = (timebase.seconds(begin_frame), timebase.seconds(end_frame));
+                let (windowed, preroll) = montaje::window(&clips, begin, end);
+                let prepared = prepare_render_clips(&windowed);
+                let mut command = Command::new(tool_path("ffmpeg.exe"));
+                command.args(["-v", "error"]);
+                let (indices, titles) =
+                    push_render_inputs(&mut command, &prepared, size, use_proxies, timebase);
+                let Ok(mut filters) = build_render_filters(
+                    &prepared, &indices, &titles, size, true, false, &[], 0.0, false, timebase,
+                    None,
+                ) else {
+                    let _ = sender.send(None);
+                    return;
+                };
+                let label = append_monitor_scopes(&mut filters, waveform, vectorscope);
+                let skip = timebase.frames(preroll).max(0);
+                let wanted = end_frame - begin_frame;
+                let Ok(mut child) = command
+                    .args(["-filter_complex", &filters.join(";")])
+                    .args(["-map", &format!("[{label}]")])
+                    .args(["-frames:v", &(skip + wanted).to_string()])
+                    .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    let _ = sender.send(None);
+                    return;
+                };
+                // Solo se guardan los fotogramas que se van a entregar.
+                let mut kept: Vec<(i64, Vec<u8>)> = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read;
+                    let mut buffer = vec![0u8; frame_len];
+                    for index in 0..skip + wanted {
+                        if stdout.read_exact(&mut buffer).is_err() {
+                            break;
+                        }
+                        let frame = begin_frame + index - skip;
+                        if index >= skip && (start_frame - frame) % step == 0 && frame < start_frame
+                        {
+                            kept.push((frame, buffer.clone()));
+                        }
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                if kept.is_empty() {
+                    let _ = sender.send(None);
+                    return;
+                }
+                for (_, pixels) in kept.into_iter().rev() {
+                    let due = started
+                        + std::time::Duration::from_secs_f64(timebase.seconds(emitted));
+                    let now = std::time::Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    }
+                    emitted += 1;
+                    let frame = PreviewFrame {
+                        pixels,
+                        width: MONITOR_WIDTH,
+                        height: MONITOR_HEIGHT,
+                    };
+                    if sender.send(Some(frame)).is_err() {
+                        return;
+                    }
+                }
+                end_frame = begin_frame;
+            }
+            let _ = sender.send(None);
+        });
+        self.playback = Some(Playback {
+            child: None,
+            audio_child: None,
+            rx: receiver,
+            start_playhead,
+            last_consumed: 0,
+            timebase,
+            rate: -(step as i32),
+            started: std::time::Instant::now(),
+            meter: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
+            _stream: None,
+            sink: None,
+        });
+        self.status = format!("Marcha atrás a {step}× (J acelera, K para)");
+    }
+
+    /// Consume vídeo al ritmo del reloj de la reproducción.
     fn poll_playback(&mut self, context: &egui::Context) {
         // Con "solo rango" activo, la reproducción se detiene en la salida.
         let total = match self.work_range() {
@@ -9217,16 +9512,13 @@ impl NovaCutWindows {
         let Some(playback) = &mut self.playback else {
             return;
         };
-        let audio_time = playback.sink.get_pos().as_secs_f64();
-        let expected = playback.timebase.frames(audio_time).max(0) as u64;
+        let expected = playback.timebase.frames(playback.elapsed()).max(0) as u64;
         let mut reached_end = false;
         while playback.last_consumed < expected {
             match playback.rx.try_recv() {
                 Ok(Some(frame)) => {
                     playback.last_consumed += 1;
-                    self.playhead = (playback.start_playhead
-                        + playback.timebase.seconds(playback.last_consumed as i64))
-                    .min(total);
+                    self.playhead = playback.time_of(playback.last_consumed).clamp(0.0, total);
                     let image = egui::ColorImage::from_rgba_unmultiplied(
                         [frame.width, frame.height],
                         &frame.pixels,
@@ -9244,19 +9536,21 @@ impl NovaCutWindows {
                 Err(_) => break,
             }
         }
-        if reached_end || self.playhead >= total {
-            let restart_at = self
-                .playback
-                .as_ref()
-                .map(|playback| playback.start_playhead)
-                .unwrap_or(0.0);
+        let rate = playback.rate;
+        let past_edge = if rate > 0 {
+            self.playhead >= total
+        } else {
+            self.playhead <= 0.0
+        };
+        if reached_end || past_edge {
+            let restart_at = playback.start_playhead;
             self.playback = None;
-            if self.loop_playback && reached_end {
+            if self.loop_playback && reached_end && rate > 0 {
                 self.playhead = restart_at;
-                self.toggle_playback();
+                self.start_playback(rate);
                 return;
             }
-            self.playhead = self.playhead.min(total);
+            self.playhead = self.playhead.clamp(0.0, total);
             self.status = "Reproducción terminada".to_owned();
         }
     }
@@ -9271,45 +9565,30 @@ impl NovaCutWindows {
             return;
         }
         cleanup_old_previews();
-        let clips = self.effective_clips();
         let progress = Arc::clone(&self.render_progress);
         if let Ok(mut state) = progress.lock() {
             state.pct = 0.0;
             state.eta_secs = 0.0;
         }
-        let size = self.export_size;
-        let track_gains = self.project.track_gains.clone();
-        let master_gain_db = self.project.master_gain_db;
-        let normalize_loudness = self.project.normalize_loudness;
-        let timebase = self.project.timebase();
-        let measured_loudness = self.current_loudness_measurement().cloned();
-        let hw = self.active_hw();
+        let target = montage_preview_path();
+        let job = RenderJob {
+            clips: self.effective_clips(),
+            fast: true,
+            audio_only: false,
+            format: ExportFormat::Mp4Video,
+            skip: 0.0,
+            length: None,
+            ..self.render_job(target.clone())
+        };
         let (sender, receiver) = mpsc::channel();
         self.montage_render = Some(receiver);
         self.status = "Renderizando previsualización del montaje...".to_owned();
         std::thread::spawn(move || {
             let cancel = Arc::new(AtomicBool::new(false));
-            let target = montage_preview_path();
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let result = run_export(
-                &clips,
-                &target,
-                &cancel,
-                true,
-                size,
-                false,
-                ExportFormat::Mp4Video,
-                &track_gains,
-                master_gain_db,
-                normalize_loudness,
-                timebase,
-                measured_loudness.as_ref(),
-                hw,
-                &progress,
-            )
-            .map(|()| target);
+            let result = run_export(&job, &cancel, &progress).map(|()| target);
             let _ = sender.send(result);
         });
     }
@@ -9544,7 +9823,9 @@ impl eframe::App for NovaCutWindows {
         }
         // Decaimiento del medidor y volumen del monitor.
         if let Some(playback) = &self.playback {
-            playback.sink.set_volume(self.monitor_volume);
+            if let Some(sink) = &playback.sink {
+                sink.set_volume(self.monitor_volume);
+            }
             if let Ok(state) = playback.meter.lock() {
                 self.meter_display.0 = (self.meter_display.0 * 0.85).max(state.0);
                 self.meter_display.1 = (self.meter_display.1 * 0.85).max(state.1);
@@ -9601,6 +9882,21 @@ impl eframe::App for NovaCutWindows {
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
         let magic_tool_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::G));
+        let roll_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::N));
+        let slide_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Y));
+        let slip_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
+        // Levantar (;) y Extraer ('), como en Premiere. En teclados españoles
+        // «;» lleva Mayús, así que se aceptan ambas.
+        let lift_key = keyboard_shortcuts
+            && context.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Semicolon)
+                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Semicolon)
+            });
+        let extract_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Quote));
         let goto_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::G));
         let detach_audio_key = keyboard_shortcuts
@@ -9768,8 +10064,10 @@ impl eframe::App for NovaCutWindows {
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let stop_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::K));
-        let prev_cut_key = keyboard_shortcuts
+        let reverse_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::J));
+        // Con K pulsada, J y L avanzan fotograma a fotograma, como en Premiere.
+        let k_held = keyboard_shortcuts && context.input(|input| input.key_down(egui::Key::K));
         for (pressed, tool) in [
             (select_tool_key, EditTool::Select),
             (track_tool_key, EditTool::TrackSelect),
@@ -9779,6 +10077,9 @@ impl eframe::App for NovaCutWindows {
             (hand_tool_key, EditTool::Hand),
             (zoom_tool_key, EditTool::Zoom),
             (magic_tool_key, EditTool::Magic),
+            (roll_tool_key, EditTool::Roll),
+            (slip_tool_key, EditTool::Slip),
+            (slide_tool_key, EditTool::Slide),
         ] {
             if pressed {
                 self.set_edit_tool(tool);
@@ -9848,6 +10149,12 @@ impl eframe::App for NovaCutWindows {
         }
         if clear_range {
             self.clear_work_range();
+        }
+        if lift_key {
+            self.lift_or_extract(false);
+        }
+        if extract_key {
+            self.lift_or_extract(true);
         }
         if trim_start_key {
             self.trim_to_playhead(true);
@@ -9954,16 +10261,17 @@ impl eframe::App for NovaCutWindows {
         if preview_shortcut && self.ffmpeg_ready {
             self.toggle_playback();
         }
-        // Transporte JKL, como en los montadores clásicos.
-        if play_key && self.ffmpeg_ready {
-            self.toggle_playback();
-        }
+        // Transporte JKL: cada pulsación duplica la velocidad (hasta 8×) y
+        // cambiar de sentido vuelve a 1×; con K pulsada, fotograma a fotograma.
         if stop_key && self.playback.is_some() {
             self.stop_playback();
             self.status = "Reproducción detenida (K)".to_owned();
         }
-        if prev_cut_key {
-            self.go_to_cut(false);
+        if (play_key || reverse_key) && k_held {
+            self.stop_playback();
+            self.step_frames(if play_key { 1 } else { -1 });
+        } else if (play_key || reverse_key) && self.ffmpeg_ready {
+            self.shuttle(play_key);
         }
         let title = format!(
             "{}{} - NovaCut Windows",
@@ -12457,7 +12765,10 @@ impl eframe::App for NovaCutWindows {
                         EditTool::Select => egui::CursorIcon::Default,
                         EditTool::TrackSelect => egui::CursorIcon::PointingHand,
                         EditTool::Blade => egui::CursorIcon::Crosshair,
-                        EditTool::Trim | EditTool::RippleTrim => egui::CursorIcon::ResizeHorizontal,
+                        EditTool::Trim | EditTool::RippleTrim | EditTool::Roll => {
+                            egui::CursorIcon::ResizeHorizontal
+                        }
+                        EditTool::Slip | EditTool::Slide => egui::CursorIcon::ResizeColumn,
                         EditTool::Hand if primary_down => egui::CursorIcon::Grabbing,
                         EditTool::Hand => egui::CursorIcon::Grab,
                         EditTool::Zoom => egui::CursorIcon::ZoomIn,
@@ -12933,9 +13244,10 @@ impl eframe::App for NovaCutWindows {
                             match self.edit_tool {
                                 EditTool::TrackSelect => egui::CursorIcon::PointingHand,
                                 EditTool::Blade => egui::CursorIcon::Crosshair,
-                                EditTool::Trim | EditTool::RippleTrim => {
+                                EditTool::Trim | EditTool::RippleTrim | EditTool::Roll => {
                                     egui::CursorIcon::ResizeHorizontal
                                 }
+                                EditTool::Slip | EditTool::Slide => egui::CursorIcon::ResizeColumn,
                                 EditTool::Hand if response.dragged() => egui::CursorIcon::Grabbing,
                                 EditTool::Hand => egui::CursorIcon::Grab,
                                 EditTool::Zoom => egui::CursorIcon::ZoomIn,
@@ -13139,6 +13451,26 @@ impl eframe::App for NovaCutWindows {
                             } else {
                                 DragKind::RippleTrimEnd
                             }
+                        } else if self.edit_tool == EditTool::Roll {
+                            // El corte más cercano al puntero: el de la
+                            // entrada o el de la salida del clip.
+                            let at = if pointer.x < rect.center().x {
+                                clip.timeline_start
+                            } else {
+                                clip.timeline_start + clip.duration()
+                            };
+                            match montaje::cut_at(&self.project.clips, index, at, 0.002) {
+                                Some((left, right)) => DragKind::Roll { left, right, cut: at },
+                                None => DragKind::Slip { grab: f64::NAN },
+                            }
+                        } else if self.edit_tool == EditTool::Slip {
+                            DragKind::Slip {
+                                grab: pointer_time(pointer.x),
+                            }
+                        } else if self.edit_tool == EditTool::Slide {
+                            DragKind::Slide {
+                                grab: pointer_time(pointer.x),
+                            }
                         } else if (pointer.x - rect.left()).abs() <= EDGE_GRAB {
                             DragKind::TrimStart
                         } else if (rect.right() - pointer.x).abs() <= EDGE_GRAB {
@@ -13146,7 +13478,13 @@ impl eframe::App for NovaCutWindows {
                         } else {
                             DragKind::Move
                         };
-                        self.drag_edit = Some((index, kind, self.project.clone()));
+                        if matches!(kind, DragKind::Slip { grab } if grab.is_nan()) {
+                            self.status =
+                                "Rodar necesita otro clip pegado a ese borde en la misma pista"
+                                    .to_owned();
+                        } else {
+                            self.drag_edit = Some((index, kind, self.project.clone()));
+                        }
                         // Arrastrar un clip no seleccionado pasa a moverlo solo
                         // a él; si ya estaba en la selección, se mueve el grupo.
                         if !self.selection.contains(&index) {
@@ -13187,6 +13525,14 @@ impl eframe::App for NovaCutWindows {
                                 }
                                 DragKind::TrimEnd | DragKind::RippleTrimEnd => {
                                     timeline_drag = Some(TimelineDragEvent::TrimEnd(
+                                        index,
+                                        pointer_time(pointer.x),
+                                    ));
+                                }
+                                DragKind::Roll { .. }
+                                | DragKind::Slip { .. }
+                                | DragKind::Slide { .. } => {
+                                    timeline_drag = Some(TimelineDragEvent::Tool(
                                         index,
                                         pointer_time(pointer.x),
                                     ));
@@ -13347,6 +13693,25 @@ impl eframe::App for NovaCutWindows {
                                         self.project.fps
                                     ),
                                     format_clock(current.duration())
+                                ),
+                                DragKind::Roll { left, .. } => format!(
+                                    "Corte {}",
+                                    timecode(
+                                        self.project.clips.get(*left).map_or(0.0, |clip| {
+                                            clip.timeline_start + clip.duration()
+                                        }),
+                                        self.project.fps
+                                    )
+                                ),
+                                DragKind::Slip { .. } => format!(
+                                    "Origen {} → {}",
+                                    timecode(current.in_seconds, self.project.fps),
+                                    timecode(current.out_seconds, self.project.fps)
+                                ),
+                                DragKind::Slide { .. } => format!(
+                                    "Δ {:+.2} s  ·  inicio {}",
+                                    current.timeline_start - original.timeline_start,
+                                    timecode(current.timeline_start, self.project.fps)
                                 ),
                             };
                             let info_rect = egui::Rect::from_min_size(
@@ -13583,9 +13948,12 @@ impl eframe::App for NovaCutWindows {
                         EditTool::Blade => egui::CursorIcon::Crosshair,
                         EditTool::Magic => egui::CursorIcon::PointingHand,
                         EditTool::TrackSelect => egui::CursorIcon::PointingHand,
-                        EditTool::Select | EditTool::Trim | EditTool::RippleTrim => {
-                            egui::CursorIcon::ResizeHorizontal
-                        }
+                        EditTool::Select
+                        | EditTool::Trim
+                        | EditTool::RippleTrim
+                        | EditTool::Roll
+                        | EditTool::Slip
+                        | EditTool::Slide => egui::CursorIcon::ResizeHorizontal,
                     });
                 }
                 // Caja de selección: arrastrar sobre el fondo marca todos los
@@ -14766,73 +15134,86 @@ fn build_render_filters(
     Ok(filters)
 }
 
-/// Exporta con la GPU si se pide y, si la GPU falla (driver viejo, sesión
-/// remota, límite de sesiones de NVENC…), repite con CPU en vez de fallar.
-#[allow(clippy::too_many_arguments)]
-fn run_export(
-    clips: &[RoughClip],
-    output: &Path,
-    cancel: &AtomicBool,
+/// Todo lo que define una exportación. Se construye en el hilo de la
+/// interfaz y viaja entero al hilo de render (y a la cola de exportación).
+#[derive(Clone)]
+struct RenderJob {
+    clips: Vec<RoughClip>,
+    output: PathBuf,
+    /// Codificación rápida para previsualizar.
     fast: bool,
     size: (u32, u32),
     audio_only: bool,
     format: ExportFormat,
-    track_gains: &[f64],
+    track_gains: Vec<f64>,
     master_gain_db: f64,
     normalize_loudness: bool,
     timebase: Timebase,
-    measured_loudness: Option<&LoudnessReport>,
+    measured_loudness: Option<LoudnessReport>,
     hw: Option<aceleracion::HwBackend>,
+    /// Segundos iniciales del grafo que se componen pero no se escriben: el
+    /// preroll de `montaje::window` cuando el rango empieza dentro de un
+    /// fundido, una transición o una secuencia anidada.
+    skip: f64,
+    /// Duración de la salida; `None` es hasta el final del último clip.
+    length: Option<f64>,
+}
+
+impl RenderJob {
+    /// Duración real del archivo que se escribe.
+    fn output_length(&self) -> f64 {
+        let total = self
+            .clips
+            .iter()
+            .map(|clip| clip.timeline_start + clip.duration())
+            .fold(0.0, f64::max);
+        let available = (total - self.skip).max(0.0);
+        self.length.map_or(available, |length| length.min(available))
+    }
+}
+
+/// Exporta con la GPU si se pide y, si la GPU falla (driver viejo, sesión
+/// remota, límite de sesiones de NVENC…), repite con CPU en vez de fallar.
+fn run_export(
+    job: &RenderJob,
+    cancel: &AtomicBool,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
-    let attempt = |hw| {
-        run_export_once(
-            clips,
-            output,
-            cancel,
-            fast,
-            size,
-            audio_only,
-            format,
-            track_gains,
-            master_gain_db,
-            normalize_loudness,
-            timebase,
-            measured_loudness,
-            hw,
-            progress,
-        )
-    };
-    let result = attempt(hw);
-    match (result, hw) {
+    let result = run_export_once(job, job.hw, cancel, progress);
+    match (result, job.hw) {
         (Err(_), Some(backend)) if !cancel.load(Ordering::Relaxed) => {
             if let Ok(mut state) = progress.lock() {
                 state.pct = 0.0;
                 state.note = Some(format!("{} falló; se exportó con CPU", backend.label()));
             }
-            attempt(None)
+            run_export_once(job, None, cancel, progress)
         }
         (result, _) => result,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_export_once(
-    clips: &[RoughClip],
-    output: &Path,
-    cancel: &AtomicBool,
-    fast: bool,
-    size: (u32, u32),
-    audio_only: bool,
-    format: ExportFormat,
-    track_gains: &[f64],
-    master_gain_db: f64,
-    normalize_loudness: bool,
-    timebase: Timebase,
-    measured_loudness: Option<&LoudnessReport>,
+    job: &RenderJob,
     hw: Option<aceleracion::HwBackend>,
+    cancel: &AtomicBool,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
+    let RenderJob {
+        output,
+        fast,
+        size,
+        audio_only,
+        format,
+        track_gains,
+        master_gain_db,
+        normalize_loudness,
+        timebase,
+        ..
+    } = job;
+    let (output, fast, size, audio_only, format) = (output.as_path(), *fast, *size, *audio_only, *format);
+    let (master_gain_db, normalize_loudness, timebase) = (*master_gain_db, *normalize_loudness, *timebase);
+    let measured_loudness = job.measured_loudness.as_ref();
+    let clips = job.clips.as_slice();
     let prepared = prepare_render_clips(clips);
     let clips: &[RoughClip] = &prepared;
     if let Some(missing) = clips
@@ -14877,10 +15258,7 @@ fn run_export_once(
         timebase,
         measured_loudness,
     )?;
-    let total = clips
-        .iter()
-        .map(|clip| clip.timeline_start + clip.duration())
-        .fold(0.0, f64::max);
+    let total = job.output_length();
 
     let log_file = std::fs::File::create(&error_log)
         .map_err(|error| format!("No se pudo crear el registro de exportación: {error}"))?;
@@ -14900,6 +15278,10 @@ fn run_export_once(
     }
     child.args(["-progress", "pipe:1", "-nostats"]);
     child.args(format.export_args(fast, hw));
+    if job.skip > 0.0005 {
+        // Búsqueda en la salida: exacta al fotograma, y el preroll es corto.
+        child.args(["-ss", &format_seconds(job.skip)]);
+    }
     let mut child = child
         .args(["-t", &format_seconds(total)])
         .arg(&temporary)
@@ -17296,6 +17678,19 @@ mod tests {
     }
 
     #[test]
+    fn jkl_shuttle_doubles_up_to_eight_and_flips_to_one() {
+        assert_eq!(next_shuttle_rate(None, true), 1);
+        assert_eq!(next_shuttle_rate(Some(1), true), 2);
+        assert_eq!(next_shuttle_rate(Some(4), true), 8);
+        assert_eq!(next_shuttle_rate(Some(8), true), 8);
+        assert_eq!(next_shuttle_rate(Some(4), false), -1);
+        assert_eq!(next_shuttle_rate(Some(-2), false), -4);
+        assert_eq!(next_shuttle_rate(Some(-8), true), 1);
+        assert_eq!(atempo_chain(1), "");
+        assert_eq!(atempo_chain(4), ",atempo=2,atempo=2");
+    }
+
+    #[test]
     fn work_range_trim_cuts_edges_and_moves_to_zero() {
         let clips = vec![
             RoughClip {
@@ -17313,12 +17708,13 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let trimmed = trim_clips_to_range(&clips, 4.0, 8.0);
+        let (trimmed, preroll) = montaje::window(&clips, 4.0, 8.0);
+        assert_eq!(preroll, 0.0);
         assert_eq!(trimmed.len(), 1, "el clip fuera de rango se descarta");
         assert!((trimmed[0].timeline_start - 0.0).abs() < 1e-9);
         assert!((trimmed[0].in_seconds - 4.0).abs() < 1e-9);
-        assert!((trimmed[0].out_seconds - 8.0).abs() < 1e-9);
-        assert!((trimmed[0].duration() - 4.0).abs() < 1e-9);
+        // La cola no se recorta: la corta la duración de salida del render.
+        assert!((trimmed[0].out_seconds - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -17349,11 +17745,13 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let trimmed = trim_clips_to_range(&clips, 1.0, 3.0);
+        let (trimmed, preroll) = montaje::window(&clips, 2.0, 3.0);
+        // La rampa empieza en 1 s: no se corta por dentro, se compone desde
+        // su inicio y ese segundo se descarta en la salida.
+        assert!((preroll - 1.0).abs() < 1e-9);
         // A doble velocidad, un segundo de montaje consume dos de origen.
         assert!((trimmed[0].in_seconds - 2.0).abs() < 1e-9);
-        assert!((trimmed[0].out_seconds - 6.0).abs() < 1e-9);
-        // La rampa no se recorta por dentro: solo se desplaza.
+        assert!((trimmed[0].out_seconds - 8.0).abs() < 1e-9);
         assert!(trimmed[1].speed_ramp.is_some());
         assert!((trimmed[1].timeline_start - 0.0).abs() < 1e-9);
     }
@@ -17841,6 +18239,30 @@ mod render_real_tests {
         export_with(clips, output, format, None)
     }
 
+    fn test_job(
+        clips: &[RoughClip],
+        output: &Path,
+        format: ExportFormat,
+        hw: Option<aceleracion::HwBackend>,
+    ) -> RenderJob {
+        RenderJob {
+            clips: clips.to_vec(),
+            output: output.to_path_buf(),
+            fast: false,
+            size: (640, 360),
+            audio_only: format.is_audio_only(),
+            format,
+            track_gains: Vec::new(),
+            master_gain_db: 0.0,
+            normalize_loudness: false,
+            timebase: Timebase::from_fps(25.0),
+            measured_loudness: None,
+            hw,
+            skip: 0.0,
+            length: None,
+        }
+    }
+
     fn export_with(
         clips: &[RoughClip],
         output: &Path,
@@ -17849,19 +18271,8 @@ mod render_real_tests {
     ) -> Result<(), String> {
         let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
         run_export(
-            clips,
-            output,
+            &test_job(clips, output, format, hw),
             &AtomicBool::new(false),
-            false,
-            (640, 360),
-            format.is_audio_only(),
-            format,
-            &[],
-            0.0,
-            false,
-            Timebase::from_fps(25.0),
-            None,
-            hw,
             &progress,
         )
     }
@@ -17998,19 +18409,8 @@ mod render_real_tests {
         let output = directory.join("fallback.mp4");
         let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
         run_export(
-            &clips,
-            &output,
+            &test_job(&clips, &output, ExportFormat::Mp4Video, Some(absent)),
             &AtomicBool::new(false),
-            false,
-            (640, 360),
-            false,
-            ExportFormat::Mp4Video,
-            &[],
-            0.0,
-            false,
-            Timebase::from_fps(25.0),
-            None,
-            Some(absent),
             &progress,
         )
         .unwrap();
@@ -18273,6 +18673,63 @@ mod render_real_tests {
         assert!(
             brightness(&raw, 320, 180) > 40.0,
             "la exportación tapa el vídeo con el título"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Brillo medio del fotograma en `at` segundos de un archivo.
+    fn mean_brightness_at(path: &Path, at: f64) -> f64 {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v", "1", "-vf", "scale=160:90", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(raw.len(), 160 * 90, "no hay fotograma en {at} s");
+        raw.iter().map(|&value| value as f64).sum::<f64>() / raw.len() as f64
+    }
+
+    #[test]
+    fn range_export_starting_mid_fade_matches_the_full_edit() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("rango");
+        let (video, _) = generate(&directory);
+        let clip = RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            fade_in_seconds: 2.0,
+            ..Default::default()
+        };
+        let full = directory.join("completo.mp4");
+        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        let (windowed, preroll) = montaje::window(&[clip], 1.0, 3.0);
+        assert!((preroll - 1.0).abs() < 1e-9, "el fundido obliga a componer desde 0");
+        let ranged = directory.join("rango.mp4");
+        let job = RenderJob {
+            skip: preroll,
+            length: Some(2.0),
+            ..test_job(&windowed, &ranged, ExportFormat::Mp4Video, None)
+        };
+        run_export(
+            &job,
+            &AtomicBool::new(false),
+            &Arc::new(std::sync::Mutex::new(RenderProgress::default())),
+        )
+        .unwrap();
+        assert!((probe_duration(&ranged) - 2.0).abs() < 0.1, "dura {}", probe_duration(&ranged));
+        let expected = mean_brightness_at(&full, 1.0);
+        let actual = mean_brightness_at(&ranged, 0.0);
+        let bright = mean_brightness_at(&full, 3.0);
+        assert!(expected < bright * 0.75, "a mitad del fundido debe verse más oscuro");
+        assert!(
+            (actual - expected).abs() < bright * 0.08,
+            "el rango arranca a {actual:.1} y el montaje completo a {expected:.1}"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
