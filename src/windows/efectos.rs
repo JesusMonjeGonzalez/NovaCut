@@ -118,6 +118,18 @@ impl ClipFx {
     /// Lumetri básico, detalle y textura. Va después de ruedas/curvas/LUT/eq
     /// del host y antes de pasar a RGBA.
     pub fn video_color_chain(&self) -> String {
+        self.video_color_chain_animated(&Animation::default(), &mut Vec::new())
+    }
+
+    /// Como `video_color_chain`, pero temperatura, tinte e intensidad siguen
+    /// sus keyframes: los filtros llevan nombre (`filtro@tag`) y las órdenes
+    /// `sendcmd` que los mueven se añaden a `commands`.
+    pub fn video_color_chain_animated(
+        &self,
+        animation: &Animation,
+        commands: &mut Vec<String>,
+    ) -> String {
+        use super::animacion::Param;
         let mut out = String::new();
         if self.denoise > 0.001 {
             let luma = self.denoise.clamp(0.0, 1.0) * 8.0;
@@ -128,25 +140,62 @@ impl ClipFx {
                 luma * 1.1
             ));
         }
-        if self.temperature.abs() > 0.001 {
-            let kelvin = 6500.0 - self.temperature.clamp(-1.0, 1.0) * 2500.0;
-            out.push_str(&format!(",colortemperature=temperature={kelvin:.0}"));
-        }
-        if self.tint.abs() > 0.001 {
-            let tint = self.tint.clamp(-1.0, 1.0);
-            let green = 1.0 - tint * 0.15;
-            let other = 1.0 + tint * 0.05;
+        let kelvin = |v: f64| 6500.0 - v.clamp(-1.0, 1.0) * 2500.0;
+        let green = |v: f64| 1.0 - v.clamp(-1.0, 1.0) * 0.15;
+        let other = |v: f64| 1.0 + v.clamp(-1.0, 1.0) * 0.05;
+        let vibrance = |v: f64| v.clamp(-1.0, 1.0);
+        if let Some(keys) = animation.varying(Param::Temperature) {
+            let target = format!("colortemperature@k{}", animation.tag);
             out.push_str(&format!(
-                ",colorchannelmixer=rr={other:.4}:gg={green:.4}:bb={other:.4}"
+                ",{target}=temperature={:.0}",
+                kelvin(keys[0].v)
             ));
+            commands.extend(animation.commands(&target, &[("temperature", &kelvin)], keys));
+        } else {
+            let temperature = animation.constant(Param::Temperature, self.temperature);
+            if temperature.abs() > 0.001 {
+                out.push_str(&format!(
+                    ",colortemperature=temperature={:.0}",
+                    kelvin(temperature)
+                ));
+            }
         }
-        if self.vibrance.abs() > 0.001 {
+        if let Some(keys) = animation.varying(Param::Tint) {
+            let target = format!("colorchannelmixer@t{}", animation.tag);
+            let first = keys[0].v;
             out.push_str(&format!(
-                ",vibrance=intensity={:.4}",
-                self.vibrance.clamp(-1.0, 1.0)
+                ",{target}=rr={:.4}:gg={:.4}:bb={:.4}",
+                other(first),
+                green(first),
+                other(first)
             ));
+            commands.extend(animation.commands(
+                &target,
+                &[("rr", &other), ("gg", &green), ("bb", &other)],
+                keys,
+            ));
+        } else {
+            let tint = animation.constant(Param::Tint, self.tint);
+            if tint.abs() > 0.001 {
+                out.push_str(&format!(
+                    ",colorchannelmixer=rr={:.4}:gg={:.4}:bb={:.4}",
+                    other(tint),
+                    green(tint),
+                    other(tint)
+                ));
+            }
         }
-        if self.shadows.abs() > 0.001 || self.highlights.abs() > 0.001 {
+        if let Some(keys) = animation.varying(Param::Vibrance) {
+            let target = format!("vibrance@i{}", animation.tag);
+            out.push_str(&format!(",{target}=intensity={:.4}", vibrance(keys[0].v)));
+            commands.extend(animation.commands(&target, &[("intensity", &vibrance)], keys));
+        } else {
+            let value = animation.constant(Param::Vibrance, self.vibrance);
+            if value.abs() > 0.001 {
+                out.push_str(&format!(",vibrance=intensity={:.4}", vibrance(value)));
+            }
+        }
+            if self.shadows.abs() > 0.001 || self.highlights.abs() > 0.001 {
             let shadow = (0.25 + self.shadows.clamp(-1.0, 1.0) * 0.12).clamp(0.02, 0.6);
             let light = (0.75 + self.highlights.clamp(-1.0, 1.0) * 0.12).clamp(0.4, 0.98);
             out.push_str(&format!(
@@ -578,13 +627,30 @@ fn slider(
     changed
 }
 
-/// Secciones de vídeo del inspector. Devuelve si algo cambió.
-pub fn inspector_video(ui: &mut egui::Ui, fx: &mut ClipFx, is_adjustment: bool) -> bool {
+/// Secciones de vídeo del inspector. Devuelve si algo cambió y, si se pidió
+/// saltar a un keyframe, su tiempo local.
+pub fn inspector_video(
+    ui: &mut egui::Ui,
+    fx: &mut ClipFx,
+    tracks: &mut super::animacion::Tracks,
+    local_t: f64,
+    is_adjustment: bool,
+) -> (bool, Option<f64>) {
+    use super::animacion::{animated_slider, KeyAction, Param};
     let mut changed = false;
+    let mut seek = None;
     ui.collapsing("Lumetri básico", |ui| {
-        changed |= slider(ui, &mut fx.temperature, -1.0..=1.0, "Temperatura");
-        changed |= slider(ui, &mut fx.tint, -1.0..=1.0, "Tinte");
-        changed |= slider(ui, &mut fx.vibrance, -1.0..=1.0, "Intensidad");
+        for (param, value, text) in [
+            (Param::Temperature, &mut fx.temperature, "Temperatura"),
+            (Param::Tint, &mut fx.tint, "Tinte"),
+            (Param::Vibrance, &mut fx.vibrance, "Intensidad"),
+        ] {
+            match animated_slider(ui, tracks, param, value, -1.0..=1.0, text, local_t, 0.0) {
+                KeyAction::Changed => changed = true,
+                KeyAction::Seek(t) => seek = Some(t),
+                KeyAction::None => {}
+            }
+        }
         changed |= slider(ui, &mut fx.shadows, -1.0..=1.0, "Sombras");
         changed |= slider(ui, &mut fx.highlights, -1.0..=1.0, "Iluminaciones");
     });
@@ -633,7 +699,7 @@ pub fn inspector_video(ui: &mut egui::Ui, fx: &mut ClipFx, is_adjustment: bool) 
                 .changed();
         });
     }
-    changed
+    (changed, seek)
 }
 
 /// Sección «Sonido esencial» del inspector. `duration` y `local_playhead`
@@ -768,6 +834,64 @@ pub fn inspector_audio(
         },
     );
     changed
+}
+
+/// Contexto de animación de un clip para construir su cadena de filtros.
+#[derive(Default)]
+pub struct Animation<'a> {
+    pub tracks: Option<&'a super::animacion::Tracks>,
+    /// Sufijo único de las instancias con nombre de este clip.
+    pub tag: String,
+    /// Duración de un fotograma del proyecto.
+    pub frame: f64,
+    /// Duración local del clip.
+    pub duration: f64,
+    /// Se suma a los tiempos de las órdenes: 0 si la cadena va en tiempo
+    /// local del clip, su inicio si va en tiempo de composición.
+    pub shift: f64,
+}
+
+impl Animation<'_> {
+    /// Keyframes del parámetro si su valor cambia a lo largo del clip.
+    pub fn varying(&self, param: super::animacion::Param) -> Option<&[super::animacion::Key]> {
+        self.tracks?
+            .get(&param)
+            .filter(|keys| super::animacion::varies(keys))
+            .map(|keys| keys.as_slice())
+    }
+
+    /// Valor constante: el del único keyframe si lo hay, o el estático.
+    pub fn constant(&self, param: super::animacion::Param, fallback: f64) -> f64 {
+        self.tracks
+            .and_then(|tracks| tracks.get(&param))
+            .and_then(|keys| keys.first())
+            .map_or(fallback, |key| key.v)
+    }
+
+    pub fn commands(
+        &self,
+        target: &str,
+        options: &[(&str, &dyn Fn(f64) -> f64)],
+        keys: &[super::animacion::Key],
+    ) -> Vec<String> {
+        super::animacion::commands(
+            target,
+            options,
+            keys,
+            self.frame.max(0.001),
+            self.duration,
+            self.shift,
+        )
+    }
+
+    /// Tiempo local del clip como expresión de FFmpeg.
+    pub fn time(&self) -> String {
+        if self.shift.abs() < 1e-9 {
+            "t".to_owned()
+        } else {
+            format!("(t-{:.6})", self.shift)
+        }
+    }
 }
 
 #[cfg(test)]

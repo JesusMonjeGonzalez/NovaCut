@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 mod aceleracion;
+mod animacion;
 mod batch;
 mod command_center;
 mod efectos;
@@ -188,6 +189,9 @@ struct RoughClip {
     /// ni se exporta, como el "enable/disable" de cualquier montador.
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    /// Keyframes de color, efectos y rotación (tiempo local del clip).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    anim: animacion::Tracks,
 }
 
 /// Modos de fusión; los nombres viajan igual que en macOS.
@@ -455,6 +459,48 @@ impl RoughClip {
                 (window[1] - window[0]) / self.speed_at_source_time(midpoint)
             })
             .sum()
+    }
+
+    /// Fija los valores animados en `local_t` y quita la animación: para el
+    /// fotograma fijo del monitor, que compone un único instante.
+    fn freeze_animation(&mut self, local_t: f64) {
+        use animacion::Param;
+        let (x, y, scale, opacity) = self.evaluate_transform(local_t);
+        self.position_x = x;
+        self.position_y = y;
+        self.scale_percent = scale.clamp(1.0, 800.0);
+        self.opacity = opacity.clamp(0.0, 100.0);
+        self.keyframes = None;
+        for (param, keys) in std::mem::take(&mut self.anim) {
+            let Some(value) = animacion::value_at(&keys, local_t) else {
+                continue;
+            };
+            let field = match param {
+                Param::Exposure => &mut self.exposure,
+                Param::Contrast => &mut self.contrast,
+                Param::Saturation => &mut self.saturation,
+                Param::Vignette => &mut self.vignette,
+                Param::Blur => &mut self.blur,
+                Param::Temperature => &mut self.fx.temperature,
+                Param::Tint => &mut self.fx.tint,
+                Param::Vibrance => &mut self.fx.vibrance,
+                Param::Rotation => &mut self.rotation,
+            };
+            *field = value;
+        }
+    }
+
+    /// Desplaza todos los keyframes `delta` segundos de tiempo local.
+    fn shift_animation(&mut self, delta: f64) {
+        if let Some(keyframes) = &mut self.keyframes {
+            for keyframe in keyframes.iter_mut() {
+                keyframe.t += delta;
+            }
+        }
+        for key in &mut self.fx.volume_keys {
+            key.t += delta;
+        }
+        animacion::shift(&mut self.anim, delta);
     }
 
     /// Transformación evaluada en `local_t` (s de timeline dentro del clip):
@@ -1249,9 +1295,9 @@ fn fit_segment_effects(
     first: bool,
     last: bool,
 ) {
-    for key in &mut segment.fx.volume_keys {
-        key.t -= local_start;
-    }
+    // Los keyframes siguen siendo los del clip entero, vistos desde el
+    // inicio de este tramo: la animación continúa sin saltos.
+    segment.shift_animation(-local_start);
     if !first {
         segment.runtime.audio_fade_in = 0.0;
         segment.runtime.white_in = false;
@@ -1291,18 +1337,11 @@ fn expand_speed_ramps(clips: Vec<RoughClip>) -> Vec<RoughClip> {
             let speed = clip.speed_at_source_time((source_start + source_end) / 2.0);
             let timeline_duration = (source_end - source_start) / speed;
             let mut segment = clip.clone();
-            let (x, y, scale, opacity) =
-                clip.evaluate_transform(timeline_offset + timeline_duration / 2.0);
             segment.in_seconds = clip.in_seconds + source_start;
             segment.out_seconds = clip.in_seconds + source_end;
             segment.timeline_start = clip.timeline_start + timeline_offset;
             segment.speed = speed;
             segment.speed_ramp = None;
-            segment.keyframes = None;
-            segment.position_x = x;
-            segment.position_y = y;
-            segment.scale_percent = scale;
-            segment.opacity = opacity;
             segment.fade_in_seconds = if timeline_offset < 0.001 {
                 clip.fade_in_seconds.min(timeline_duration)
             } else {
@@ -1325,75 +1364,10 @@ fn expand_speed_ramps(clips: Vec<RoughClip>) -> Vec<RoughClip> {
 
 /// Expande los clips con keyframes en segmentos constantes por tramo:
 /// cada segmento lleva la transformación evaluada en su punto medio.
-fn expand_keyframes(clips: Vec<RoughClip>) -> Vec<RoughClip> {
-    let mut out = Vec::with_capacity(clips.len());
-    for clip in clips {
-        let Some(keyframes) = &clip.keyframes else {
-            out.push(clip);
-            continue;
-        };
-        if !clip.has_video || keyframes.len() < 2 {
-            out.push(clip);
-            continue;
-        }
-        let duration = clip.duration();
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let (fade_in, fade_out) = clip.effective_fades();
-        let mut boundaries: Vec<f64> = vec![0.0];
-        for keyframe in keyframes {
-            let t = keyframe.t.clamp(0.0, duration);
-            if t > *boundaries.last().unwrap() + 0.01 && t < duration - 0.01 {
-                boundaries.push(t);
-            }
-        }
-        boundaries.push(duration);
-        let segments = boundaries.windows(2);
-        let segment_count = boundaries.len() - 1;
-        for (segment_index, window) in segments.enumerate() {
-            let (seg_start, seg_end) = (window[0], window[1]);
-            let seg_dur = seg_end - seg_start;
-            if seg_dur < 0.02 {
-                continue;
-            }
-            let mid = (seg_start + seg_end) / 2.0;
-            let (x, y, scale, opacity) = clip.evaluate_transform(mid);
-            let mut segment = clip.clone();
-            segment.keyframes = None;
-            segment.position_x = x;
-            segment.position_y = y;
-            segment.scale_percent = scale.clamp(1.0, 800.0);
-            segment.opacity = opacity.clamp(0.0, 100.0);
-            segment.in_seconds = clip.in_seconds + seg_start * speed;
-            segment.out_seconds = clip.in_seconds + seg_end * speed;
-            segment.timeline_start = clip.timeline_start + seg_start;
-            segment.fade_in_seconds = if segment_index == 0 {
-                fade_in.min(seg_dur)
-            } else {
-                0.0
-            };
-            segment.fade_out_seconds = if segment_index + 1 == segment_count {
-                fade_out.min(seg_dur)
-            } else {
-                0.0
-            };
-            fit_segment_effects(
-                &mut segment,
-                &clip,
-                seg_start,
-                segment_index == 0,
-                segment_index + 1 == segment_count,
-            );
-            out.push(segment);
-        }
-    }
-    out
-}
-
-/// Pipeline compartido de preparación para render: transiciones + keyframes.
+/// Pipeline compartido de preparación para render: anidados, transiciones y
+/// rampas. Los keyframes no se trocean: el grafo los anima por fotograma.
 fn prepare_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
-    expand_keyframes(expand_speed_ramps(resolve_render_clips(&flatten_nested(
-        clips,
-    ))))
+    expand_speed_ramps(resolve_render_clips(&flatten_nested(clips)))
 }
 
 fn flatten_nested(clips: &[RoughClip]) -> Vec<RoughClip> {
@@ -1652,6 +1626,109 @@ fn ripple_track_at(
     true
 }
 
+/// Pistas de transformación del clip si alguna cambia con el tiempo.
+fn moving_transform(clip: &RoughClip) -> Option<[Vec<animacion::Key>; 4]> {
+    let tracks = animacion::transform_tracks(clip.keyframes.as_deref()?);
+    tracks.iter().any(|track| animacion::varies(track)).then_some(tracks)
+}
+
+/// Posición animada como expresiones de `overlay` en tiempo de composición.
+fn moving_position(clip: &RoughClip) -> Option<(String, String)> {
+    let tracks = moving_transform(clip)?;
+    if !animacion::varies(&tracks[0]) && !animacion::varies(&tracks[1]) {
+        return None;
+    }
+    let time = format!("(t-{:.6})", clip.timeline_start.max(0.0));
+    Some((
+        format!("({})", animacion::expression(&tracks[0], &time)),
+        format!("({})", animacion::expression(&tracks[1], &time)),
+    ))
+}
+
+/// Exposición, contraste y saturación; animados por expresión si alguno
+/// tiene keyframes que cambian.
+fn animated_eq(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    use animacion::Param;
+    let params = [
+        (Param::Exposure, clip.exposure),
+        (Param::Contrast, clip.contrast),
+        (Param::Saturation, clip.saturation),
+    ];
+    if params.iter().all(|(param, _)| animation.varying(*param).is_none()) {
+        return color_eq_filter(
+            animation.constant(Param::Exposure, clip.exposure),
+            animation.constant(Param::Contrast, clip.contrast),
+            animation.constant(Param::Saturation, clip.saturation),
+        );
+    }
+    let maps: [fn(f64) -> f64; 3] = [
+        |v| v.clamp(-1.0, 1.0) / 2.0,
+        |v| 1.0 + v.clamp(-1.0, 1.0),
+        |v| (1.0 + v.clamp(-1.0, 1.0)).max(0.0),
+    ];
+    let time = animation.time();
+    let parts: Vec<String> = params
+        .iter()
+        .zip(maps)
+        .map(|((param, fallback), map)| match animation.varying(*param) {
+            Some(keys) => format!("'{}'", animacion::expression(&animacion::mapped(keys, map), &time)),
+            None => format!("{:.4}", map(animation.constant(*param, *fallback))),
+        })
+        .collect();
+    format!(
+        ",eq=brightness={}:contrast={}:saturation={}:eval=frame",
+        parts[0], parts[1], parts[2]
+    )
+}
+
+fn animated_vignette(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    let angle = |v: f64| std::f64::consts::PI / 4.0 * v.clamp(-1.0, 1.0);
+    match animation.varying(animacion::Param::Vignette) {
+        Some(keys) => format!(
+            ",vignette=angle='{}':eval=frame",
+            animacion::expression(&animacion::mapped(keys, angle), &animation.time())
+        ),
+        None => vignette_filter(animation.constant(animacion::Param::Vignette, clip.vignette)),
+    }
+}
+
+fn animated_blur(
+    clip: &RoughClip,
+    short_side_px: f64,
+    animation: &efectos::Animation,
+    commands: &mut Vec<String>,
+) -> String {
+    let sigma = |v: f64| (v.clamp(0.0, 1.0) * short_side_px.max(1.0) / 4.0).clamp(0.1, 250.0);
+    match animation.varying(animacion::Param::Blur) {
+        Some(keys) => {
+            let target = format!("gblur@b{}", animation.tag);
+            commands.extend(animation.commands(&target, &[("sigma", &sigma)], keys));
+            format!(",{target}=sigma={:.2}", sigma(keys[0].v))
+        }
+        None => blur_filter(
+            animation.constant(animacion::Param::Blur, clip.blur),
+            short_side_px,
+        ),
+    }
+}
+
+/// Giro de la capa. Animado, el lienzo de salida es la diagonal para que
+/// ningún ángulo recorte la imagen.
+fn rotate_filter(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    match animation.varying(animacion::Param::Rotation) {
+        Some(keys) => format!(
+            ",rotate=a='{}':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0",
+            animacion::expression(&animacion::mapped(keys, f64::to_radians), "t")
+        ),
+        None => format!(
+            ",rotate={:.8}:ow=rotw(iw):oh=roth(ih):c=black@0",
+            animation
+                .constant(animacion::Param::Rotation, clip.rotation)
+                .to_radians()
+        ),
+    }
+}
+
 fn color_eq_filter(exposure: f64, contrast: f64, saturation: f64) -> String {
     if exposure.abs() < 0.001 && contrast.abs() < 0.001 && saturation.abs() < 0.001 {
         return String::new();
@@ -1760,6 +1837,7 @@ impl Default for RoughClip {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         }
     }
 }
@@ -5404,6 +5482,7 @@ impl NovaCutWindows {
                         nested: None,
                         freeze_at: None,
                         enabled: true,
+                        anim: animacion::Tracks::new(),
                     };
                     if let Some(target) = target {
                         clip.timeline_start = target.timeline_start;
@@ -5737,6 +5816,7 @@ impl NovaCutWindows {
                     transition_duration: default_transition_duration(),
                     label: 0,
                     enabled: true,
+                    anim: animacion::Tracks::new(),
                 });
             }
         }
@@ -5927,14 +6007,8 @@ impl NovaCutWindows {
         }
         // Keyframes evaluados exactamente en el cabezal para el monitor.
         for (clip, _) in &mut sources {
-            if clip.keyframes.is_some() {
-                let local = (self.playhead - clip.timeline_start).max(0.0);
-                let (x, y, scale, opacity) = clip.evaluate_transform(local);
-                clip.position_x = x;
-                clip.position_y = y;
-                clip.scale_percent = scale.clamp(1.0, 800.0);
-                clip.opacity = opacity.clamp(0.0, 100.0);
-            }
+            let local = (self.playhead - clip.timeline_start).max(0.0);
+            clip.freeze_animation(local);
         }
         // Los fundidos se ven en el monitor multiplicando la opacidad efectiva.
         for (clip, _) in &mut sources {
@@ -10848,6 +10922,9 @@ impl eframe::App for NovaCutWindows {
 
         let project_before_inspector = self.project.clone();
         let mut trim_changed = false;
+        let playhead_now = self.playhead;
+        // Salto pedido desde los controles de keyframe (◀ ▶), en timeline.
+        let mut keyframe_seek: Option<f64> = None;
         let mut toggle_enabled = false;
         let mut label_request: Option<u8> = None;
         let mut relink_requested = false;
@@ -11472,37 +11549,45 @@ impl eframe::App for NovaCutWindows {
                         if clip.has_video && clip.title.is_none() {
                             ui.separator();
                             theme::section_label(ui, "Color");
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.exposure, -1.0..=1.0)
-                                        .text("Exposición"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.contrast, -1.0..=1.0)
-                                        .text("Contraste"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.saturation, -1.0..=1.0)
-                                        .text("Saturación"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.vignette, -1.0..=1.0)
-                                        .text("Viñeta"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.blur, 0.0..=1.0).text("Desenfoque"),
-                                )
-                                .changed();
-                            trim_changed |=
-                                efectos::inspector_video(ui, &mut clip.fx, clip.is_adjustment);
+                            // ◇ junto a cada deslizador lo anima con keyframes,
+                            // como el cronómetro de Premiere.
+                            let local_t =
+                                (playhead_now - clip.timeline_start).clamp(0.0, clip.duration());
+                            for (param, range, text) in [
+                                (animacion::Param::Exposure, -1.0..=1.0, "Exposición"),
+                                (animacion::Param::Contrast, -1.0..=1.0, "Contraste"),
+                                (animacion::Param::Saturation, -1.0..=1.0, "Saturación"),
+                                (animacion::Param::Vignette, -1.0..=1.0, "Viñeta"),
+                                (animacion::Param::Blur, 0.0..=1.0, "Desenfoque"),
+                            ] {
+                                let value = match param {
+                                    animacion::Param::Exposure => &mut clip.exposure,
+                                    animacion::Param::Contrast => &mut clip.contrast,
+                                    animacion::Param::Saturation => &mut clip.saturation,
+                                    animacion::Param::Vignette => &mut clip.vignette,
+                                    _ => &mut clip.blur,
+                                };
+                                match animacion::animated_slider(
+                                    ui, &mut clip.anim, param, value, range, text, local_t, 0.0,
+                                ) {
+                                    animacion::KeyAction::Changed => trim_changed = true,
+                                    animacion::KeyAction::Seek(t) => {
+                                        keyframe_seek = Some(clip.timeline_start + t)
+                                    }
+                                    animacion::KeyAction::None => {}
+                                }
+                            }
+                            let (fx_changed, fx_seek) = efectos::inspector_video(
+                                ui,
+                                &mut clip.fx,
+                                &mut clip.anim,
+                                local_t,
+                                clip.is_adjustment,
+                            );
+                            trim_changed |= fx_changed;
+                            if let Some(t) = fx_seek {
+                                keyframe_seek = Some(clip.timeline_start + t);
+                            }
                             if !clip.is_adjustment {
                                 ui.collapsing("Croma (pantalla verde/azul)", |ui| {
                                 if clip.chroma.is_none() {
@@ -11788,164 +11873,208 @@ impl eframe::App for NovaCutWindows {
                                 }
                             });
                             ui.separator();
-                            if clip.keyframes.is_some() {
-                                ui.separator();
-                                ui.label("Animación (keyframes)");
-                                ui.small("t local del clip; export e interpolan por tramos");
-                                let duration = clip.duration();
-                                let local_t =
-                                    (self.playhead - clip.timeline_start).clamp(0.0, duration);
-                                if ui.button("Añadir keyframe aquí").on_hover_text("Guarda posición, escala y opacidad donde está el cabezal").clicked() {
-                                    let keyframes = clip.keyframes.get_or_insert_with(Vec::new);
-                                    let keyframe = TransformKeyframe {
-                                        t: local_t,
-                                        x: clip.position_x,
-                                        y: clip.position_y,
-                                        scale: clip.scale_percent,
-                                        opacity: clip.opacity,
-                                    };
-                                    match keyframes
-                                        .iter_mut()
-                                        .find(|existing| (existing.t - local_t).abs() < 0.03)
-                                    {
-                                        Some(existing) => *existing = keyframe,
-                                        None => {
-                                            keyframes.push(keyframe);
-                                            keyframes
-                                                .sort_by(|left, right| left.t.total_cmp(&right.t));
-                                        }
-                                    }
-                                    trim_changed = true;
-                                }
-                                let Some(keyframes) = clip.keyframes.as_mut() else {
-                                    unreachable!()
-                                };
-                                let mut remove_keyframe: Option<usize> = None;
-                                for (keyframe_index, keyframe) in keyframes.iter_mut().enumerate() {
+                            // Transformación: con keyframes, los campos muestran el
+                            // valor en el cabezal y editarlos crea o actualiza el
+                            // keyframe ahí, como con el cronómetro de Premiere.
+                            let duration = clip.duration();
+                            let local_t = (playhead_now - clip.timeline_start).clamp(0.0, duration);
+                            let animated = clip.keyframes.as_ref().is_some_and(|keys| !keys.is_empty());
+                            let (mut x, mut y, mut scale, mut opacity) = clip.evaluate_transform(local_t);
+                            let mut transform_edit = false;
+                            theme::section_label(ui, "Transformación");
+                            egui::Grid::new("clip_transform")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Posición");
                                     ui.horizontal(|ui| {
-                                        ui.monospace(format!("kf{:02}", keyframe_index + 1));
-                                        trim_changed |= ui
+                                        transform_edit |= ui
                                             .add(
-                                                egui::DragValue::new(&mut keyframe.t)
-                                                    .speed(0.05)
-                                                    .range(0.0..=duration.max(0.01))
-                                                    .prefix("t "),
+                                                egui::DragValue::new(&mut x)
+                                                    .speed(1.0)
+                                                    .range(-7680.0..=7680.0)
+                                                    .prefix("X ")
+                                                    .suffix(" px"),
                                             )
                                             .changed();
-                                        trim_changed |= ui
+                                        transform_edit |= ui
                                             .add(
-                                                egui::DragValue::new(&mut keyframe.x)
+                                                egui::DragValue::new(&mut y)
                                                     .speed(1.0)
-                                                    .prefix("x "),
-                                            )
-                                            .changed();
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.y)
-                                                    .speed(1.0)
-                                                    .prefix("y "),
+                                                    .range(-4320.0..=4320.0)
+                                                    .prefix("Y ")
+                                                    .suffix(" px"),
                                             )
                                             .changed();
                                     });
-                                    ui.horizontal(|ui| {
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.scale)
-                                                    .speed(0.5)
-                                                    .range(1.0..=800.0)
-                                                    .prefix("esc "),
-                                            )
-                                            .changed();
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.opacity)
-                                                    .speed(0.5)
-                                                    .range(0.0..=100.0)
-                                                    .prefix("op "),
-                                            )
-                                            .changed();
-                                        if ui.button("×").on_hover_text("Quita este keyframe").clicked() {
-                                            remove_keyframe = Some(keyframe_index);
-                                        }
-                                    });
-                                }
-                                if let Some(index) = remove_keyframe {
-                                    keyframes.remove(index);
-                                    if keyframes.len() < 2 {
-                                        clip.keyframes = None;
-                                    }
-                                    trim_changed = true;
-                                }
-                                if ui.button("Quitar animación").on_hover_text("Borra todos los keyframes del clip").clicked() {
-                                    clip.keyframes = None;
-                                    trim_changed = true;
-                                }
-                            } else {
-                                theme::section_label(ui, "Transformación");
-                                egui::Grid::new("clip_transform")
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Posición");
-                                        ui.horizontal(|ui| {
-                                            trim_changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut clip.position_x)
-                                                        .speed(1.0)
-                                                        .range(-7680.0..=7680.0)
-                                                        .prefix("X ")
-                                                        .suffix(" px"),
-                                                )
-                                                .changed();
-                                            trim_changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut clip.position_y)
-                                                        .speed(1.0)
-                                                        .range(-4320.0..=4320.0)
-                                                        .prefix("Y ")
-                                                        .suffix(" px"),
-                                                )
-                                                .changed();
-                                        });
-                                        ui.end_row();
-                                        ui.label("Escala");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut clip.scale_percent)
-                                                    .speed(0.5)
-                                                    .range(1.0..=800.0)
-                                                    .suffix(" %"),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                        ui.label("Rotación");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut clip.rotation)
+                                    ui.end_row();
+                                    ui.label("Escala");
+                                    transform_edit |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut scale)
+                                                .speed(0.5)
+                                                .range(1.0..=800.0)
+                                                .suffix(" %"),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                    ui.label("Opacidad");
+                                    transform_edit |= ui
+                                        .add(egui::Slider::new(&mut opacity, 0.0..=100.0).suffix(" %"))
+                                        .changed();
+                                    ui.end_row();
+                                    ui.label("Rotación");
+                                    match animacion::animated_value(
+                                        ui,
+                                        &mut clip.anim,
+                                        animacion::Param::Rotation,
+                                        &mut clip.rotation,
+                                        local_t,
+                                        |ui, value| {
+                                            ui.add(
+                                                egui::DragValue::new(value)
                                                     .speed(0.25)
                                                     .range(-3600.0..=3600.0)
                                                     .suffix(" °"),
                                             )
-                                            .changed();
-                                        ui.end_row();
-                                        ui.label("Opacidad");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::Slider::new(&mut clip.opacity, 0.0..=100.0)
-                                                    .suffix(" %"),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                    });
-                                if ui.button("Animar (keyframes)").on_hover_text("Empieza a animar posición, escala y opacidad").clicked() {
-                                    clip.keyframes = Some(vec![TransformKeyframe {
-                                        t: 0.0,
-                                        x: clip.position_x,
-                                        y: clip.position_y,
-                                        scale: clip.scale_percent,
-                                        opacity: clip.opacity,
-                                    }]);
-                                    trim_changed = true;
+                                            .changed()
+                                        },
+                                    ) {
+                                        animacion::KeyAction::Changed => trim_changed = true,
+                                        animacion::KeyAction::Seek(t) => {
+                                            keyframe_seek = Some(clip.timeline_start + t)
+                                        }
+                                        animacion::KeyAction::None => {}
+                                    }
+                                    ui.end_row();
+                                });
+                            let here = TransformKeyframe { t: local_t, x, y, scale, opacity };
+                            if transform_edit {
+                                trim_changed = true;
+                                match clip.keyframes.as_mut().filter(|_| animated) {
+                                    Some(keyframes) => {
+                                        match keyframes
+                                            .iter_mut()
+                                            .find(|existing| (existing.t - local_t).abs() < animacion::SAME_KEY)
+                                        {
+                                            Some(existing) => *existing = here,
+                                            None => {
+                                                keyframes.push(here);
+                                                keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        clip.position_x = x;
+                                        clip.position_y = y;
+                                        clip.scale_percent = scale;
+                                        clip.opacity = opacity;
+                                    }
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if !animated {
+                                    if ui
+                                        .button("◇ Animar posición, escala y opacidad")
+                                        .on_hover_text("Crea un keyframe en el cabezal; después, cada cambio en otro instante crea otro")
+                                        .clicked()
+                                    {
+                                        clip.keyframes = Some(vec![here]);
+                                        trim_changed = true;
+                                    }
+                                    return;
+                                }
+                                ui.label("Keyframes");
+                                let times: Vec<f64> = clip
+                                    .keyframes
+                                    .iter()
+                                    .flatten()
+                                    .map(|keyframe| keyframe.t)
+                                    .collect();
+                                match animacion::key_buttons(ui, &times, local_t) {
+                                    animacion::KeyButton::Seek(t) => {
+                                        keyframe_seek = Some(clip.timeline_start + t)
+                                    }
+                                    animacion::KeyButton::Toggle => {
+                                        let keyframes = clip.keyframes.get_or_insert_with(Vec::new);
+                                        match keyframes.iter().position(|existing| {
+                                            (existing.t - local_t).abs() < animacion::SAME_KEY
+                                        }) {
+                                            Some(index) => {
+                                                keyframes.remove(index);
+                                            }
+                                            None => {
+                                                keyframes.push(here);
+                                                keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                            }
+                                        }
+                                        trim_changed = true;
+                                    }
+                                    animacion::KeyButton::Clear => {
+                                        clip.keyframes = Some(Vec::new());
+                                        trim_changed = true;
+                                    }
+                                    animacion::KeyButton::None => {}
+                                }
+                            });
+                            // Sin keyframes queda el estado del cabezal como fijo.
+                            if clip.keyframes.as_ref().is_some_and(|keys| keys.is_empty()) {
+                                clip.keyframes = None;
+                                clip.position_x = x;
+                                clip.position_y = y;
+                                clip.scale_percent = scale;
+                                clip.opacity = opacity;
+                            }
+                            if let Some(keyframes) = clip.keyframes.as_mut() {
+                                let count = keyframes.len();
+                                ui.collapsing(format!("Lista de keyframes ({count})"), |ui| {
+                                    let mut remove_keyframe: Option<usize> = None;
+                                    for (keyframe_index, keyframe) in keyframes.iter_mut().enumerate() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.t)
+                                                        .speed(0.05)
+                                                        .range(0.0..=duration.max(0.01))
+                                                        .prefix("t ")
+                                                        .suffix(" s"),
+                                                )
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(egui::DragValue::new(&mut keyframe.x).speed(1.0).prefix("x "))
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(egui::DragValue::new(&mut keyframe.y).speed(1.0).prefix("y "))
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.scale)
+                                                        .speed(0.5)
+                                                        .range(1.0..=800.0)
+                                                        .prefix("esc "),
+                                                )
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.opacity)
+                                                        .speed(0.5)
+                                                        .range(0.0..=100.0)
+                                                        .prefix("op "),
+                                                )
+                                                .changed();
+                                            if ui.small_button("×").on_hover_text("Quita este keyframe").clicked() {
+                                                remove_keyframe = Some(keyframe_index);
+                                            }
+                                        });
+                                    }
+                                    if let Some(index) = remove_keyframe {
+                                        keyframes.remove(index);
+                                        trim_changed = true;
+                                    }
+                                    keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                });
+                                if keyframes.is_empty() {
+                                    clip.keyframes = None;
                                 }
                             }
                         }
@@ -12181,6 +12310,10 @@ impl eframe::App for NovaCutWindows {
             // (ver poll_pending_edit), en vez de una por tecla o píxel.
             self.queue_edit(project_before_inspector);
             self.request_preview();
+        }
+        if let Some(time) = keyframe_seek {
+            self.stop_playback();
+            self.seek(time);
         }
         if relink_requested {
             self.relink_selected();
@@ -14385,7 +14518,7 @@ fn render_preview_frame(
                 Some(local.max(0.0)),
             );
             filters.push(format!(
-                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none,colorchannelmixer=aa={opacity:.6}[pv{index}]",
+                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0,colorchannelmixer=aa={opacity:.6}[pv{index}]",
             ));
         } else {
             let is_blend = clip.fusion.blend_mode().is_some();
@@ -14428,7 +14561,7 @@ fn render_preview_frame(
                 // `setpts=PTS-STARTPTS`: tras `-ss` el primer fotograma no
                 // empieza en 0 si el cabezal cae entre dos fotogramas del
                 // medio, y `overlay` componía el fondo negro sin él.
-                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
@@ -14856,8 +14989,30 @@ fn build_render_filters(
         let speed = clips[index].speed.clamp(0.1, 8.0);
         let start = clips[index].timeline_start.max(0.0);
         if clips[index].has_video && include_video {
-            let angle = clips[index].rotation.to_radians();
-            let opacity = (clips[index].opacity / 100.0).clamp(0.0, 1.0);
+            let (_, _, static_scale, static_opacity) = clips[index].evaluate_transform(0.0);
+            let opacity = (static_opacity / 100.0).clamp(0.0, 1.0);
+            let transform = moving_transform(&clips[index]);
+            let animation = efectos::Animation {
+                tracks: Some(&clips[index].anim),
+                tag: index.to_string(),
+                frame: timebase.seconds(1),
+                duration: clips[index].duration(),
+                // Los títulos y capas de ajuste se animan ya en tiempo de
+                // composición; los medios, en tiempo local del clip.
+                shift: if clips[index].is_adjustment { start } else { 0.0 },
+            };
+            let mut commands: Vec<String> = Vec::new();
+            let rotate = rotate_filter(&clips[index], &animation);
+            // Opacidad: constante o animada por órdenes sobre el mezclador.
+            let opacity_filter = match transform.as_ref().filter(|tracks| animacion::varies(&tracks[3])) {
+                Some(tracks) => {
+                    let target = format!("colorchannelmixer@o{index}");
+                    let to_alpha = |v: f64| (v / 100.0).clamp(0.0, 1.0);
+                    commands.extend(animation.commands(&target, &[("aa", &to_alpha)], &tracks[3]));
+                    format!("{target}=aa={:.6}", to_alpha(tracks[3][0].v))
+                }
+                None => format!("colorchannelmixer=aa={opacity:.6}"),
+            };
             let (fade_in, fade_out) = clips[index].effective_fades();
             let duration = clips[index].duration();
             let mut fade_filters = String::new();
@@ -14875,11 +15030,7 @@ fn build_render_filters(
                     white(clips[index].runtime.white_out)
                 ));
             }
-            let eq = color_eq_filter(
-                clips[index].exposure,
-                clips[index].contrast,
-                clips[index].saturation,
-            );
+            let eq = animated_eq(&clips[index], &animation);
             if clips[index].is_adjustment {
                 // Sin `[v{index}]`: la capa de ajuste no aporta imagen propia,
                 // se aplica directamente sobre lo compuesto debajo en el
@@ -14897,8 +15048,11 @@ fn build_render_filters(
                 // así un 720p o un 4K conservan la proporción que se ve.
                 let fontsize = title.size.max(8.0) * out_h as f64 / 1080.0;
                 let drawing = title_layer_filters(title, &font, fontsize, (out_w, out_h), None);
+                // Todo en tiempo local del título y el desplazamiento al final:
+                // los fundidos van en su tiempo, no en el segundo 0.
+                let sendcmd = animacion::sendcmd(&commands);
                 filters.push(format!(
-                    "[{media}:v:0]{drawing},format=rgba,setpts=(PTS-STARTPTS)+{start:.6}/TB,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none,colorchannelmixer=aa={opacity:.6}{fade_filters}[v{index}]",
+                    "[{media}:v:0]{drawing},format=rgba,setpts=PTS-STARTPTS{sendcmd}{rotate},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]",
                 ));
             } else {
                 let is_blend = clips[index].fusion.blend_mode().is_some();
@@ -14911,15 +15065,20 @@ fn build_render_filters(
                 let width = if cover_canvas {
                     out_w
                 } else {
-                    even_dimension(out_w as f64 * clips[index].scale_percent / 100.0)
+                    even_dimension(out_w as f64 * static_scale / 100.0)
                 };
                 let height = if cover_canvas {
                     out_h
                 } else {
-                    even_dimension(out_h as f64 * clips[index].scale_percent / 100.0)
+                    even_dimension(out_h as f64 * static_scale / 100.0)
                 };
-                let vig = vignette_filter(clips[index].vignette);
-                let blur = blur_filter(clips[index].blur, out_w.min(out_h) as f64);
+                let vig = animated_vignette(&clips[index], &animation);
+                let blur = animated_blur(
+                    &clips[index],
+                    out_w.min(out_h) as f64,
+                    &animation,
+                    &mut commands,
+                );
                 let wheels = wheels_filter(clips[index].wheels.as_ref());
                 let chroma = chroma_filter(clips[index].chroma.as_ref());
                 let curves = curves_filter(clips[index].curves.as_ref());
@@ -14949,11 +15108,48 @@ fn build_render_filters(
                 let fx = &clips[index].fx;
                 let prefix = fx.input_prefix(clips[index].freeze_at.is_some());
                 let geometry = fx.geometry_chain(true);
-                let fx_color = fx.video_color_chain();
+                let fx_color = fx.video_color_chain_animated(&animation, &mut commands);
                 let fx_alpha = fx.alpha_chain();
-                filters.push(format!(
-                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
-                ));
+                // Escala animada: el tamaño cambia por fotograma, y `rotate`
+                // fija el suyo con el primero, así que la capa se centra en un
+                // lienzo transparente del tamaño máximo antes de girar.
+                let zoom = transform
+                    .as_ref()
+                    .filter(|tracks| !cover_canvas && animacion::varies(&tracks[2]));
+                let size_filter = match zoom {
+                    Some(tracks) => {
+                        let percent = animacion::expression(&tracks[2], "t");
+                        format!(
+                            "scale=w='max(2,trunc({out_w}*({percent})/200)*2)':h='max(2,trunc({out_h}*({percent})/200)*2)':eval=frame:force_original_aspect_ratio={scale_mode}"
+                        )
+                    }
+                    None => format!(
+                        "scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop}"
+                    ),
+                };
+                let sendcmd = animacion::sendcmd(&commands);
+                let head = format!(
+                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}"
+                );
+                let tail = format!(
+                    "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
+                );
+                match zoom {
+                    Some(tracks) => {
+                        let largest = tracks[2].iter().map(|key| key.v).fold(1.0, f64::max);
+                        let canvas_w = even_dimension(out_w as f64 * largest / 100.0);
+                        let canvas_h = even_dimension(out_h as f64 * largest / 100.0);
+                        filters.push(format!("{head}[zoom{index}]"));
+                        filters.push(format!(
+                            "color=c=black@0.0:s={canvas_w}x{canvas_h}:r={frame_rate}:d={:.6},format=rgba[zoomcanvas{index}]",
+                            duration + timebase.seconds(1)
+                        ));
+                        filters.push(format!(
+                            "[zoomcanvas{index}][zoom{index}]overlay=x='(W-w)/2':y='(H-h)/2':eval=frame:shortest=1:format=auto{tail}"
+                        ));
+                    }
+                    None => filters.push(format!("{head}{tail}")),
+                }
             }
         }
         if clips[index].has_audio && include_audio && !clips[index].is_adjustment {
@@ -15022,8 +15218,7 @@ fn build_render_filters(
         } else {
             format!("overlay{layer}")
         };
-        let x = clips[index].position_x;
-        let y = clips[index].position_y;
+        let (x, y, _, _) = clips[index].evaluate_transform(0.0);
         if clips[index].is_adjustment {
             // Capa de ajuste: sin overlay de medio propio. Gradúa una copia
             // de todo lo compuesto debajo (`[previous]`) y la recompone solo
@@ -15038,13 +15233,22 @@ fn build_render_filters(
             let wheels = wheels_filter(clips[index].wheels.as_ref());
             let curves = curves_filter(clips[index].curves.as_ref());
             let lut = lut_filter(clips[index].lut.as_deref());
-            let eq = color_eq_filter(
-                clips[index].exposure,
-                clips[index].contrast,
-                clips[index].saturation,
+            let animation = efectos::Animation {
+                tracks: Some(&clips[index].anim),
+                tag: format!("adj{layer}"),
+                frame: timebase.seconds(1),
+                duration: clips[index].duration(),
+                shift: start,
+            };
+            let mut commands = Vec::new();
+            let eq = animated_eq(&clips[index], &animation);
+            let vig = animated_vignette(&clips[index], &animation);
+            let blur = animated_blur(
+                &clips[index],
+                out_w.min(out_h) as f64,
+                &animation,
+                &mut commands,
             );
-            let vig = vignette_filter(clips[index].vignette);
-            let blur = blur_filter(clips[index].blur, out_w.min(out_h) as f64);
             let spatial = clips[index]
                 .mask
                 .as_ref()
@@ -15056,9 +15260,12 @@ fn build_render_filters(
             filters.push(format!(
                 "[{previous}]split=2[adjbase{layer}][adjsrc{layer}]"
             ));
-            let fx_color = clips[index].fx.video_color_chain();
+            let fx_color = clips[index]
+                .fx
+                .video_color_chain_animated(&animation, &mut commands);
+            let sendcmd = animacion::sendcmd(&commands);
             filters.push(format!(
-                "[adjsrc{layer}]null{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba,geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':a='{alpha_expr}'[adjfx{layer}]"
+                "[adjsrc{layer}]null{sendcmd}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba,geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':a='{alpha_expr}'[adjfx{layer}]"
             ));
             filters.push(format!(
                 "[adjbase{layer}][adjfx{layer}]overlay=eof_action=pass:shortest=0:format=auto[{output_label}]"
@@ -15088,7 +15295,15 @@ fn build_render_filters(
             filters.push(format!(
                 "[base{layer}b][blenda{layer}]overlay=eof_action=pass:shortest=0:format=auto[{output_label}]"
             ));
-        } else if let Some((dx, dy)) = clips[index].runtime.offset_expressions() {
+        } else if let Some(((dx, dy), (px, py))) = clips[index]
+            .runtime
+            .offset_expressions()
+            .map(|offsets| (offsets, (format!("{x:.3}"), format!("{y:.3}"))))
+            .or_else(|| {
+                moving_position(&clips[index])
+                    .map(|position| ((String::new(), String::new()), position))
+            })
+        {
             let term = |expression: String| {
                 if expression.is_empty() {
                     String::new()
@@ -15096,8 +15311,9 @@ fn build_render_filters(
                     format!("+{expression}")
                 }
             };
+            let (px, py) = moving_position(&clips[index]).unwrap_or((px, py));
             filters.push(format!(
-                "[{previous}][v{index}]overlay=x='(W-w)/2+{x:.3}{}':y='(H-h)/2+{y:.3}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
+                "[{previous}][v{index}]overlay=x='(W-w)/2+{px}{}':y='(H-h)/2+{py}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
                 term(dx),
                 term(dy)
             ));
@@ -16455,6 +16671,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         assert_eq!(clip.duration(), 0.0);
     }
@@ -16517,6 +16734,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             }],
             markers: vec![],
             subtitles: vec![],
@@ -16630,6 +16848,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         clip.fade_in_seconds = clip.fade_in_seconds.max(0.0).min(clip.duration() / 2.0);
         clip.fade_out_seconds = clip.fade_out_seconds.max(0.0).min(clip.duration() / 2.0);
@@ -16687,6 +16906,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         assert_eq!(clip.duration(), 4.0);
         assert_eq!(atempo_filter(4.0), "atempo=2.0,atempo=2.000000");
@@ -16897,6 +17117,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             },
             RoughClip {
                 path: PathBuf::from("overlay.mp4"),
@@ -16945,6 +17166,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             },
         ];
         let project = RoughProject {
@@ -17362,7 +17584,7 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_interpolate_linearly_and_expand() {
+    fn keyframes_interpolate_linearly_and_render_per_frame() {
         let mut clip = RoughClip {
             out_seconds: 10.0,
             position_x: 0.0,
@@ -17392,14 +17614,13 @@ mod tests {
         assert_eq!(clip.evaluate_transform(-1.0).0, 0.0);
         assert_eq!(clip.evaluate_transform(99.0).0, 400.0);
 
-        let expanded = expand_keyframes(vec![clip]);
-        // Tramos: [0,8] y [8,10].
-        assert_eq!(expanded.len(), 2);
-        let first = &expanded[0];
-        assert_eq!(first.timeline_start, 0.0);
-        assert!((first.duration() - 8.0).abs() < 1e-9);
-        assert!((first.position_x - 200.0).abs() < 1e-9);
-        assert!(first.keyframes.is_none());
+        // El render no trocea: el clip sigue entero y la posición viaja
+        // como expresión por fotograma.
+        let prepared = prepare_render_clips(&[clip.clone()]);
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].keyframes.is_some());
+        let (x, _) = moving_position(&clip).unwrap();
+        assert!(x.contains("if(lt((t-0.000000),8.000000)"), "{x}");
     }
 
     #[test]
@@ -18770,6 +18991,153 @@ mod render_real_tests {
             .stdout;
         assert_eq!(raw.len(), 160 * 90, "no hay fotograma en {at} s");
         raw.iter().map(|&value| value as f64).sum::<f64>() / raw.len() as f64
+    }
+
+    /// Fotograma RGB de 160×90 en `at` segundos.
+    fn frame_rgb(path: &Path, at: f64) -> Vec<u8> {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v", "1", "-vf", "scale=160:90", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(raw.len(), 160 * 90 * 3, "no hay fotograma en {at} s");
+        raw
+    }
+
+    /// Fracción de píxeles que no son negro del lienzo.
+    fn covered(pixels: &[u8]) -> f64 {
+        let lit = pixels
+            .chunks_exact(3)
+            .filter(|pixel| pixel.iter().any(|&value| value > 24))
+            .count();
+        lit as f64 / (pixels.len() / 3) as f64
+    }
+
+    fn mean_channel(pixels: &[u8], channel: usize) -> f64 {
+        let values: Vec<f64> = pixels.chunks_exact(3).map(|pixel| pixel[channel] as f64).collect();
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+
+    fn camera_clip(directory: &Path) -> RoughClip {
+        let (video, _) = generate(directory);
+        RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            ..Default::default()
+        }
+    }
+
+    fn export_and_read(clip: RoughClip, directory: &Path, name: &str) -> PathBuf {
+        let output = directory.join(name);
+        export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
+        output
+    }
+
+    #[test]
+    fn keyframed_zoom_and_fade_animate_every_frame_on_export() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("zoom");
+        let mut clip = camera_clip(&directory);
+        let keyframe = |t: f64, scale: f64, opacity: f64| TransformKeyframe {
+            t,
+            x: 0.0,
+            y: 0.0,
+            scale,
+            opacity,
+        };
+        clip.keyframes = Some(vec![keyframe(0.0, 40.0, 100.0), keyframe(4.0, 100.0, 100.0)]);
+        let output = export_and_read(clip.clone(), &directory, "zoom.mp4");
+        let coverage: Vec<f64> = [0.2, 1.5, 2.8, 3.8]
+            .iter()
+            .map(|&at| covered(&frame_rgb(&output, at)))
+            .collect();
+        // Antes el export usaba el valor del punto medio: todo al 70 %.
+        assert!(coverage[0] < 0.3, "cobertura {coverage:?}");
+        assert!(coverage[3] > 0.85, "cobertura {coverage:?}");
+        assert!(
+            coverage.windows(2).all(|pair| pair[1] > pair[0] + 0.05),
+            "el zoom no avanza: {coverage:?}"
+        );
+        // Opacidad animada: de 0 a 100 el brillo crece con ella.
+        clip.keyframes = Some(vec![keyframe(0.0, 100.0, 0.0), keyframe(4.0, 100.0, 100.0)]);
+        let output = export_and_read(clip, &directory, "opacidad.mp4");
+        let early = mean_channel(&frame_rgb(&output, 0.4), 1);
+        let middle = mean_channel(&frame_rgb(&output, 2.0), 1);
+        let late = mean_channel(&frame_rgb(&output, 3.8), 1);
+        assert!(early < middle * 0.5 && middle < late * 0.8, "{early} {middle} {late}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn keyframed_color_and_effects_change_over_the_clip() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("colorkf");
+        let mut clip = camera_clip(&directory);
+        let keys = |a: f64, b: f64| {
+            vec![animacion::Key { t: 0.0, v: a }, animacion::Key { t: 4.0, v: b }]
+        };
+        clip.anim.insert(animacion::Param::Exposure, keys(-0.8, 0.3));
+        clip.anim.insert(animacion::Param::Temperature, keys(-1.0, 1.0));
+        clip.anim.insert(animacion::Param::Blur, keys(0.0, 0.2));
+        clip.anim.insert(animacion::Param::Rotation, keys(0.0, 20.0));
+        clip.anim.insert(animacion::Param::Vignette, keys(0.0, 0.8));
+        let output = export_and_read(clip, &directory, "color.mp4");
+        assert!((probe_duration(&output) - 4.0).abs() < 0.15);
+        let early = frame_rgb(&output, 0.3);
+        let late = frame_rgb(&output, 3.7);
+        let luma = |pixels: &[u8]| (0..3).map(|c| mean_channel(pixels, c)).sum::<f64>() / 3.0;
+        assert!(luma(&late) > luma(&early) + 15.0, "la exposición no sube");
+        // Temperatura: fría (azul) al principio, cálida (roja) al final.
+        let warmth = |pixels: &[u8]| mean_channel(pixels, 0) - mean_channel(pixels, 2);
+        assert!(
+            warmth(&late) > warmth(&early) + 8.0,
+            "temperatura {} → {}",
+            warmth(&early),
+            warmth(&late)
+        );
+        // El giro deja esquinas negras al final, no al principio.
+        assert!(covered(&early) > covered(&late) + 0.05);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn title_fade_in_happens_when_the_title_starts() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("titulofundido");
+        let title = RoughClip {
+            out_seconds: 3.0,
+            timeline_start: 2.0,
+            fade_in_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "HOLA HOLA HOLA".to_owned(),
+                size: 160.0,
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let output = directory.join("titulo.mp4");
+        export(&[title], &output, ExportFormat::Mp4Video).unwrap();
+        let luma = |at: f64| {
+            let pixels = frame_rgb(&output, at);
+            pixels.iter().map(|&value| value as f64).fold(0.0, f64::max)
+        };
+        let (start, middle, full) = (luma(2.05), luma(2.5), luma(3.5));
+        assert!(full > 200.0, "el título no se ve: {full}");
+        assert!(start < full * 0.35, "sin fundido: {start} vs {full}");
+        assert!(middle > start && middle < full, "{start} {middle} {full}");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

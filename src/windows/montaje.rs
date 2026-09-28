@@ -99,6 +99,9 @@ pub fn retime(clip: &RoughClip, head: f64, tail: f64) -> Option<RoughClip> {
 /// Reancla keyframes y banda de volumen cuando la cabeza se mueve `head`
 /// segundos: el valor en el nuevo inicio se conserva como keyframe 0.
 fn shift_local_time(out: &mut RoughClip, original: &RoughClip, head: f64) {
+    // Las pistas de color y efectos conservan sus keyframes aunque queden
+    // fuera del clip: así la curva visible no cambia en absoluto.
+    super::animacion::shift(&mut out.anim, -head);
     let new_duration = out.duration();
     if let Some(keyframes) = &original.keyframes {
         if !keyframes.is_empty() {
