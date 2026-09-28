@@ -24,6 +24,7 @@ mod animacion;
 mod batch;
 mod command_center;
 mod efectos;
+mod estabilizar;
 mod exportacion;
 mod montaje;
 mod navigation;
@@ -2979,6 +2980,8 @@ struct NovaCutWindows {
     project_rename: Option<(ProjectItem, String)>,
     /// Plano de referencia elegido para «Igualar color».
     match_reference: Option<usize>,
+    /// Análisis de vidstab en curso: archivo destino y resultado.
+    stabilization: Option<(PathBuf, Receiver<Result<PathBuf, String>>)>,
     media_file_status: media_browser::FileStatus,
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
@@ -4105,6 +4108,7 @@ impl NovaCutWindows {
             import_library_only: false,
             project_rename: None,
             match_reference: None,
+            stabilization: None,
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Mixer,
             subtitle_query: String::new(),
@@ -8582,6 +8586,40 @@ impl NovaCutWindows {
         }
     }
 
+    /// Analiza en segundo plano el movimiento del clip seleccionado para el
+    /// estabilizador de deformación.
+    fn start_stabilization(&mut self) {
+        if self.stabilization.is_some() || !estabilizar::vidstab_available() {
+            return;
+        }
+        let Some(clip) = self.selected.and_then(|index| self.project.clips.get(index)).cloned() else {
+            return;
+        };
+        if !estabilizar::wants_warp(&clip) || estabilizar::ready(&clip) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.stabilization = Some((estabilizar::analysis_path(&clip), receiver));
+        self.status = format!("Analizando el movimiento de {}…", clip.name());
+        std::thread::spawn(move || {
+            let _ = sender.send(estabilizar::analyze(&clip));
+        });
+    }
+
+    fn poll_stabilization(&mut self) {
+        let Some((_, receiver)) = &self.stabilization else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.stabilization = None;
+            self.status = match result {
+                Ok(_) => "Análisis de estabilización listo".to_owned(),
+                Err(error) => format!("No se pudo analizar el movimiento: {error}"),
+            };
+            self.request_preview();
+        }
+    }
+
     /// «Igualar color»: corrige el clip `target` para parecerse a `reference`.
     fn match_color(&mut self, target: usize, reference: usize) {
         let (Some(target_clip), Some(reference_clip)) = (
@@ -10421,7 +10459,10 @@ impl NovaCutWindows {
         let start_playhead = timebase.seconds(timebase.frames(self.playhead));
         let (windowed, preroll) =
             montaje::window(&self.effective_clips(), start_playhead, f64::INFINITY);
-        let prepared = prepare_render_clips(&windowed);
+        let mut prepared = prepare_render_clips(&windowed);
+        if self.use_proxies {
+            use_proxy_paths(&mut prepared);
+        }
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error"]);
         let (input_indices, is_title_input) = push_render_inputs(
@@ -10662,7 +10703,10 @@ impl NovaCutWindows {
                 let begin_frame = (end_frame - chunk_frames).max(0);
                 let (begin, end) = (timebase.seconds(begin_frame), timebase.seconds(end_frame));
                 let (windowed, preroll) = montaje::window(&clips, begin, end);
-                let prepared = prepare_render_clips(&windowed);
+                let mut prepared = prepare_render_clips(&windowed);
+                if use_proxies {
+                    use_proxy_paths(&mut prepared);
+                }
                 let mut command = Command::new(tool_path("ffmpeg.exe"));
                 command.args(["-v", "error"]);
                 let (indices, titles) =
@@ -11033,6 +11077,7 @@ impl eframe::App for NovaCutWindows {
         self.pump_thumbnails(context);
         self.pump_waveforms(context);
         self.poll_hw_detection();
+        self.poll_stabilization();
         // Primer arranque: en pantallas muy grandes en puntos (un 4K al
         // 100 %, un 1440p al 100 %) la interfaz se agranda sola; después
         // manda lo que elija el usuario.
@@ -12174,6 +12219,20 @@ impl eframe::App for NovaCutWindows {
             .match_reference
             .filter(|index| match_candidates.iter().any(|(candidate, _)| candidate == index));
         let mut color_match_request = false;
+        let mut stabilize_requested = false;
+        let stab_status = match self.selected.and_then(|index| self.project.clips.get(index)) {
+            _ if !estabilizar::vidstab_available() => efectos::StabStatus::Unavailable,
+            Some(clip)
+                if self
+                    .stabilization
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == estabilizar::analysis_path(clip)) =>
+            {
+                efectos::StabStatus::Analyzing
+            }
+            Some(clip) if estabilizar::analysis_path(clip).is_file() => efectos::StabStatus::Ready,
+            _ => efectos::StabStatus::Pending,
+        };
         let mut unnest_requested = false;
         // Panel de medios a la izquierda, como el "MEDIOS" de la app macOS:
         // lista de clips del proyecto; un clic selecciona y centra el cabezal.
@@ -12824,15 +12883,17 @@ impl eframe::App for NovaCutWindows {
                                     animacion::KeyAction::None => {}
                                 }
                             }
-                            let (fx_changed, fx_seek) = efectos::inspector_video(
+                            let video = efectos::inspector_video(
                                 ui,
                                 &mut clip.fx,
                                 &mut clip.anim,
                                 local_t,
                                 clip.is_adjustment,
+                                stab_status,
                             );
-                            trim_changed |= fx_changed;
-                            if let Some(t) = fx_seek {
+                            trim_changed |= video.changed;
+                            stabilize_requested |= video.analyze;
+                            if let Some(t) = video.seek {
                                 keyframe_seek = Some(clip.timeline_start + t);
                             }
                             if !clip.is_adjustment {
@@ -13598,6 +13659,9 @@ impl eframe::App for NovaCutWindows {
             self.seek(time);
         }
         self.match_reference = match_reference;
+        if stabilize_requested {
+            self.start_stabilization();
+        }
         if let (true, Some(target), Some(reference)) =
             (color_match_request, self.selected, match_reference)
         {
@@ -15904,7 +15968,7 @@ fn render_preview_frame(
             let lut = lut_filter(clip.lut.as_deref());
             let mask = mask_filter(clip.mask.as_ref(), width as f64, height as f64);
             let cadence = conform_video_filter(clip, &frame_rate);
-            let geometry = clip.fx.geometry_chain(false);
+            let geometry = clip.fx.geometry_chain(false, false);
             let fx_color = clip.fx.video_color_chain();
             let fx_alpha = clip.fx.alpha_chain();
             let scale_mode = if is_blend { "increase" } else { "decrease" };
@@ -16470,7 +16534,18 @@ fn build_render_filters(
                 let cadence = conform_video_filter(&clips[index], &frame_rate);
                 let fx = &clips[index].fx;
                 let prefix = fx.input_prefix(clips[index].freeze_at.is_some());
-                let geometry = fx.geometry_chain(true);
+                // Pasada 2 de vidstab sobre los fotogramas tal como se leen,
+                // antes de invertir o conformar cadencia (como en el análisis).
+                let warp = if estabilizar::ready(&clips[index]) {
+                    estabilizar::transform_filter(&clips[index])
+                } else {
+                    String::new()
+                };
+                let geometry = fx.geometry_chain(true, !warp.is_empty());
+                let cadence = match clips[index].freeze_at {
+                    None => fx.interpolation.filter(&frame_rate).unwrap_or(cadence),
+                    Some(_) => cadence,
+                };
                 let fx_color = fx.video_color_chain_animated(&animation, &mut commands);
                 let fx_alpha = fx.alpha_chain();
                 // Escala animada: el tamaño cambia por fotograma, y `rotate`
@@ -16493,7 +16568,7 @@ fn build_render_filters(
                 let sendcmd = animacion::sendcmd(&commands);
                 let wipe = clips[index].runtime.wipe_filter();
                 let head = format!(
-                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
+                    "[{media}:v:0]{warp}{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
                 );
                 let tail = format!(
                     "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
@@ -16865,6 +16940,25 @@ fn run_export_once(
     let measured_loudness = job.measured_loudness.as_ref();
     let clips = job.clips.as_slice();
     let prepared = prepare_render_clips(clips);
+    // El estabilizador de deformación necesita su análisis antes de
+    // renderizar; si falla, ese clip cae al estabilizador rápido.
+    if estabilizar::vidstab_available() {
+        for clip in prepared.iter().filter(|clip| estabilizar::wants_warp(clip)) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Exportación cancelada".to_owned());
+            }
+            if !estabilizar::ready(clip) {
+                if let Ok(mut state) = progress.lock() {
+                    state.note = Some(format!("analizando movimiento de {}", clip.name()));
+                }
+                if let Err(error) = estabilizar::analyze(clip) {
+                    if let Ok(mut state) = progress.lock() {
+                        state.note = Some(format!("{}: estabilización rápida ({error})", clip.name()));
+                    }
+                }
+            }
+        }
+    }
     let clips: &[RoughClip] = &prepared;
     if let Some(missing) = clips
         .iter()
@@ -17047,6 +17141,16 @@ fn compute_color_match(
         efectos::ColorMatch::stats(&target_frame.pixels, 4),
         efectos::ColorMatch::stats(&reference_frame.pixels, 4),
     ))
+}
+
+/// Con proxies, el clip pasa a leer su proxy: así todo lo que depende del
+/// archivo (el análisis de estabilización) ve el medio que de verdad se lee.
+fn use_proxy_paths(clips: &mut [RoughClip]) {
+    for clip in clips {
+        if let Some(proxy) = clip.proxy.clone().filter(|path| path.is_file()) {
+            clip.path = proxy;
+        }
+    }
 }
 
 /// Muestra el archivo seleccionado en el Explorador (o en Finder en el
@@ -20689,6 +20793,92 @@ mod render_real_tests {
             let end = frame_rgb(&output, 3.8);
             assert!(mean_channel(&end, 1) > 60.0, "{transition}: no termina en la cámara");
         }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `count` fotogramas seguidos en gris de 64×36 desde `at`.
+    fn gray_frames(path: &Path, at: f64, count: usize) -> Vec<Vec<u8>> {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args(["-frames:v", &count.to_string(), "-vf", "scale=64:36", "-pix_fmt", "gray"])
+            .args(["-f", "rawvideo", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        raw.chunks_exact(64 * 36).map(<[u8]>::to_vec).collect()
+    }
+
+    fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / a.len() as f64
+    }
+
+    #[test]
+    fn warp_stabilizer_and_optical_flow_render() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("estabilizar");
+        // Imagen fija con el encuadre vibrando: todo el movimiento es temblor.
+        let shaky_path = directory.join("temblor.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "smptehdbars=s=640x360:r=25:d=4"])
+            .args([
+                "-vf",
+                "crop=560:315:x='40+30*sin(t*13)':y='22+18*cos(t*11)',scale=640:360",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&shaky_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let shaky = RoughClip {
+            path: shaky_path,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let jitter = |path: &Path| {
+            let frames = gray_frames(path, 1.0, 40);
+            frames.windows(2).map(|pair| frame_difference(&pair[0], &pair[1])).sum::<f64>()
+                / (frames.len() - 1) as f64
+        };
+        let raw = jitter(&export_and_read(shaky.clone(), &directory, "sin.mp4"));
+        if estabilizar::vidstab_available() {
+            let mut warp = shaky.clone();
+            warp.fx.stabilize = true;
+            warp.fx.stabilizer = estabilizar::Stabilizer::Deformacion;
+            let steady = jitter(&export_and_read(warp.clone(), &directory, "deformacion.mp4"));
+            assert!(estabilizar::ready(&warp), "la exportación debe dejar el análisis hecho");
+            assert!(steady < raw * 0.5, "con deformación {steady:.2} vs sin estabilizar {raw:.2}");
+            let _ = std::fs::remove_file(estabilizar::analysis_path(&warp));
+        } else if std::env::var_os("NOVACUT_REQUIRE_REAL").is_some() {
+            panic!("prueba real saltada: FFmpeg sin libvidstab");
+        }
+        // Cámara lenta al 50 %: el muestreo repite cada fotograma; el flujo
+        // óptico inventa los intermedios.
+        let camera = camera_clip(&directory);
+        let duplicates = |interpolation| {
+            let clip = RoughClip {
+                speed: 0.5,
+                fx: efectos::ClipFx {
+                    interpolation,
+                    ..Default::default()
+                },
+                ..camera.clone()
+            };
+            let name = format!("lento-{interpolation:?}.mp4");
+            let frames = gray_frames(&export_and_read(clip, &directory, &name), 2.0, 20);
+            frames
+                .windows(2)
+                .filter(|pair| frame_difference(&pair[0], &pair[1]) < 0.3)
+                .count()
+        };
+        let sampled = duplicates(estabilizar::TimeInterpolation::Muestreo);
+        let flow = duplicates(estabilizar::TimeInterpolation::FlujoOptico);
+        assert!(sampled >= 7, "el muestreo debería repetir fotogramas: {sampled}");
+        assert!(flow <= 1, "el flujo óptico no debería repetir: {flow}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

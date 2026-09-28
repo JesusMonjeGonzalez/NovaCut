@@ -40,8 +40,13 @@ pub struct ClipFx {
     pub crop_bottom: f64,
     /// Reproduce el clip hacia atrás (vídeo y audio).
     pub reverse: bool,
-    /// Estabilizador de un paso (el «Warp Stabilizer» barato).
+    /// Estabilizar el clip; `stabilizer` dice cómo.
     pub stabilize: bool,
+    pub stabilizer: super::estabilizar::Stabilizer,
+    /// Suavizado de la trayectoria (0 … 1); `None` es el valor medio.
+    pub stabilize_smoothing: Option<f64>,
+    /// Cómo se inventan los fotogramas al cambiar la velocidad o la cadencia.
+    pub interpolation: super::estabilizar::TimeInterpolation,
     // --- Lumetri básico
     /// -1 frío … +1 cálido.
     pub temperature: f64,
@@ -228,9 +233,11 @@ impl ClipFx {
     }
 
     /// Geometría previa al escalado: estabilizar y voltear.
-    pub fn geometry_chain(&self, allow_temporal: bool) -> String {
+    /// `warp` indica que la cadena ya lleva la pasada 2 de vidstab: entonces
+    /// no se añade el estabilizador rápido.
+    pub fn geometry_chain(&self, allow_temporal: bool, warp: bool) -> String {
         let mut out = String::new();
-        if self.stabilize && allow_temporal {
+        if self.stabilize && allow_temporal && !warp {
             out.push_str(",deshake=rx=32:ry=32:edge=mirror");
         }
         if self.flip_h {
@@ -833,13 +840,33 @@ fn slider(
 
 /// Secciones de vídeo del inspector. Devuelve si algo cambió y, si se pidió
 /// saltar a un keyframe, su tiempo local.
+/// Estado del análisis de estabilización del clip, para el inspector.
+#[derive(Clone, Copy, PartialEq)]
+pub enum StabStatus {
+    /// Este FFmpeg no trae libvidstab.
+    Unavailable,
+    Pending,
+    Analyzing,
+    Ready,
+}
+
+/// Lo que el inspector de vídeo pide al host.
+pub struct VideoInspector {
+    pub changed: bool,
+    pub seek: Option<f64>,
+    pub analyze: bool,
+}
+
 pub fn inspector_video(
     ui: &mut egui::Ui,
     fx: &mut ClipFx,
     tracks: &mut super::animacion::Tracks,
     local_t: f64,
     is_adjustment: bool,
-) -> (bool, Option<f64>) {
+    stab: StabStatus,
+) -> VideoInspector {
+    use super::estabilizar::{Stabilizer, TimeInterpolation};
+    let mut analyze = false;
     use super::animacion::{animated_slider, KeyAction, Param};
     let mut changed = false;
     let mut seek = None;
@@ -940,13 +967,69 @@ pub fn inspector_video(
                 .checkbox(&mut fx.reverse, "Reproducir hacia atrás")
                 .on_hover_text("Invierte imagen y sonido del recorte. Conviene en clips cortos: FFmpeg carga el tramo entero en memoria.")
                 .changed();
-            changed |= ui
-                .checkbox(&mut fx.stabilize, "Estabilizar (deshake)")
-                .on_hover_text("Compensa la vibración de cámara en mano. Se aplica en la exportación y en la reproducción; el fotograma fijo del monitor no puede mostrarlo.")
-                .changed();
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .checkbox(&mut fx.stabilize, "Estabilizar")
+                    .on_hover_text("Compensa la vibración de cámara en mano. Se ve al reproducir y al exportar; el fotograma fijo del monitor no puede mostrarlo.")
+                    .changed();
+                ui.add_enabled_ui(fx.stabilize, |ui| {
+                    let before = fx.stabilizer;
+                    ui.selectable_value(&mut fx.stabilizer, Stabilizer::Rapido, "Rápido")
+                        .on_hover_text("Un paso, sin análisis. Para vibraciones leves");
+                    ui.add_enabled(
+                        stab != StabStatus::Unavailable,
+                        egui::SelectableLabel::new(fx.stabilizer == Stabilizer::Deformacion, "Deformación"),
+                    )
+                    .on_hover_text("Dos pasadas: analiza el movimiento y suaviza la trayectoria, como el Warp Stabilizer")
+                    .on_disabled_hover_text("Este FFmpeg no trae libvidstab; el de Windows sí")
+                    .clicked()
+                    .then(|| fx.stabilizer = Stabilizer::Deformacion);
+                    if fx.stabilizer != before {
+                        changed = true;
+                        analyze = fx.stabilizer == Stabilizer::Deformacion;
+                    }
+                });
+            });
+            if fx.stabilize && fx.stabilizer == Stabilizer::Deformacion {
+                let mut smoothing = fx.stabilize_smoothing.unwrap_or(0.5);
+                if ui
+                    .add(egui::Slider::new(&mut smoothing, 0.0..=1.0).text("Suavizado"))
+                    .on_hover_text("Más suavizado sigue menos a la cámara y recorta un poco más los bordes")
+                    .changed()
+                {
+                    fx.stabilize_smoothing = Some(smoothing);
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    let (text, color) = match stab {
+                        StabStatus::Ready => ("Análisis listo", egui::Color32::from_rgb(90, 200, 150)),
+                        StabStatus::Analyzing => ("Analizando movimiento…", egui::Color32::from_rgb(240, 200, 90)),
+                        StabStatus::Pending => ("Sin analizar: se hará al exportar", egui::Color32::GRAY),
+                        StabStatus::Unavailable => ("No disponible con este FFmpeg", egui::Color32::GRAY),
+                    };
+                    ui.label(egui::RichText::new(text).size(11.0).color(color));
+                    if stab == StabStatus::Pending && ui.small_button("Analizar ahora").clicked() {
+                        analyze = true;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Interpolación");
+                egui::ComboBox::from_id_salt("time-interpolation")
+                    .selected_text(fx.interpolation.label())
+                    .show_ui(ui, |ui| {
+                        for mode in TimeInterpolation::ALL {
+                            changed |= ui
+                                .selectable_value(&mut fx.interpolation, mode, mode.label())
+                                .changed();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Para cámara lenta o cadencias distintas: el flujo óptico inventa fotogramas intermedios (lento de calcular)");
+            });
         });
     }
-    (changed, seek)
+    VideoInspector { changed, seek, analyze }
 }
 
 /// Sección «Sonido esencial» del inspector. `duration` y `local_playhead`
@@ -1150,7 +1233,7 @@ mod tests {
         let fx = ClipFx::default();
         assert!(!fx.has_video_effects());
         assert_eq!(fx.input_prefix(false), "");
-        assert_eq!(fx.geometry_chain(true), "");
+        assert_eq!(fx.geometry_chain(true, false), "");
         assert_eq!(fx.video_color_chain(), "");
         assert_eq!(fx.alpha_chain(), "");
         assert_eq!(fx.audio_prefix(), "");
@@ -1185,10 +1268,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            fx.geometry_chain(true),
+            fx.geometry_chain(true, false),
             ",deshake=rx=32:ry=32:edge=mirror,hflip"
         );
-        assert_eq!(fx.geometry_chain(false), ",hflip");
+        assert_eq!(fx.geometry_chain(false, false), ",hflip");
     }
 
     #[test]
