@@ -576,7 +576,34 @@ pub const TRANSITIONS: &[(&str, &str)] = &[
     ("deslizar_abajo", "Deslizar desde arriba"),
     ("empujar_izq", "Empujar a la izquierda"),
     ("empujar_der", "Empujar a la derecha"),
+    ("barrido_der", "Barrido hacia la derecha"),
+    ("barrido_izq", "Barrido hacia la izquierda"),
+    ("barrido_abajo", "Barrido hacia abajo"),
+    ("barrido_arriba", "Barrido hacia arriba"),
+    ("iris", "Iris redondo"),
+    ("zoom", "Zoom de entrada"),
 ];
+
+/// Forma en que un barrido descubre el clip entrante.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Wipe {
+    Right,
+    Left,
+    Down,
+    Up,
+    Iris,
+}
+
+pub fn wipe_of(id: &str) -> Option<Wipe> {
+    match id {
+        "barrido_der" => Some(Wipe::Right),
+        "barrido_izq" => Some(Wipe::Left),
+        "barrido_abajo" => Some(Wipe::Down),
+        "barrido_arriba" => Some(Wipe::Up),
+        "iris" => Some(Wipe::Iris),
+        _ => None,
+    }
+}
 
 pub fn transition_label(id: &str) -> &'static str {
     TRANSITIONS
@@ -615,6 +642,11 @@ pub struct TransitionRuntime {
     /// Fundidos solo de audio (la imagen entra en movimiento, sin alfa).
     pub audio_fade_in: f64,
     pub audio_fade_out: f64,
+    /// Los fundidos de audio de este clip son la mitad de un fundido
+    /// cruzado: curva de potencia constante, como en Premiere.
+    pub audio_crossfade: bool,
+    /// Barrido de entrada y su duración (tiempo local desde 0).
+    pub wipe_in: Option<(Wipe, f64)>,
 }
 
 impl TransitionRuntime {
@@ -649,6 +681,30 @@ impl TransitionRuntime {
         } else {
             Some((x, y))
         }
+    }
+
+    /// Máscara del barrido de entrada sobre la capa (ya en RGBA, tiempo
+    /// local). Borde suave del 6 %; fuera de la transición no se evalúa.
+    pub fn wipe_filter(&self) -> String {
+        let Some((wipe, duration)) = self.wipe_in else {
+            return String::new();
+        };
+        let d = duration.max(0.04);
+        let progress = format!("clip(T/{d:.6},0,1)");
+        let feather = 0.06;
+        let reveal = match wipe {
+            Wipe::Right => format!("clip((W*{:.4}*{progress}-X)/(W*{feather}),0,1)", 1.0 + feather),
+            Wipe::Left => format!("clip((W*{:.4}*{progress}-(W-X))/(W*{feather}),0,1)", 1.0 + feather),
+            Wipe::Down => format!("clip((H*{:.4}*{progress}-Y)/(H*{feather}),0,1)", 1.0 + feather),
+            Wipe::Up => format!("clip((H*{:.4}*{progress}-(H-Y))/(H*{feather}),0,1)", 1.0 + feather),
+            Wipe::Iris => format!(
+                "clip((hypot(W,H)/2*{:.4}*{progress}-hypot(X-W/2,Y-H/2))/(hypot(W,H)/2*{feather}),0,1)",
+                1.0 + feather
+            ),
+        };
+        format!(
+            ",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*{reveal}':enable='lt(t,{d:.6})'"
+        )
     }
 
     /// Desplazamiento en fracciones de lienzo en un instante de timeline,

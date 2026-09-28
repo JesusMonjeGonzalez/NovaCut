@@ -1454,22 +1454,46 @@ fn resolve_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
                 .min(out[j].duration() / 2.0)
                 .min(out[i].duration() / 2.0);
             let extendable = clip_can_extend_by(&out[j], d);
+            // Todo lo que solapa los dos clips cruza también su audio con
+            // potencia constante: el saliente baja lo que el entrante sube.
+            let overlap = |out: &mut Vec<RoughClip>| {
+                let speed = out[j].speed.clamp(0.1, 8.0);
+                out[j].out_seconds += d * speed;
+                out[j].runtime.audio_fade_out = d;
+                out[j].runtime.audio_crossfade = true;
+                out[i].runtime.audio_fade_in = d;
+                out[i].runtime.audio_crossfade = true;
+            };
             if let Some((dx, dy, push)) = efectos::motion_of(&transition) {
                 out[i].runtime.slide_in = Some((dx, dy, start_i, d));
                 out[i].runtime.audio_fade_in = d;
                 if extendable {
-                    let speed = out[j].speed.clamp(0.1, 8.0);
-                    out[j].out_seconds += d * speed;
-                    out[j].runtime.audio_fade_out = d;
+                    overlap(&mut out);
                     if push {
                         out[j].runtime.slide_out = Some((dx, dy, start_i, d));
                     }
                 }
             } else if transition == "dissolve" && extendable {
-                let speed = out[j].speed.clamp(0.1, 8.0);
-                out[j].out_seconds += d * speed;
+                overlap(&mut out);
                 out[j].fade_out_seconds = 0.0;
                 out[i].fade_in_seconds = d;
+            } else if let (Some(wipe), true) = (efectos::wipe_of(&transition), extendable) {
+                overlap(&mut out);
+                out[j].fade_out_seconds = 0.0;
+                out[i].runtime.wipe_in = Some((wipe, d));
+            } else if transition == "zoom" && extendable {
+                overlap(&mut out);
+                out[j].fade_out_seconds = 0.0;
+                if out[i].keyframes.is_none() {
+                    // El entrante crece desde el 60 % mientras aparece.
+                    let (x, y, scale, opacity) = out[i].evaluate_transform(0.0);
+                    out[i].keyframes = Some(vec![
+                        TransformKeyframe { t: 0.0, x, y, scale: scale * 0.6, opacity: 0.0 },
+                        TransformKeyframe { t: d, x, y, scale, opacity },
+                    ]);
+                } else {
+                    out[i].fade_in_seconds = d;
+                }
             } else {
                 out[j].fade_out_seconds = d;
                 out[i].fade_in_seconds = d;
@@ -16467,8 +16491,9 @@ fn build_render_filters(
                     ),
                 };
                 let sendcmd = animacion::sendcmd(&commands);
+                let wipe = clips[index].runtime.wipe_filter();
                 let head = format!(
-                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}"
+                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
                 );
                 let tail = format!(
                     "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
@@ -16504,12 +16529,17 @@ fn build_render_filters(
             let fade_out_audio = fade_out_audio.max(clips[index].runtime.audio_fade_out);
             let audio_duration = clips[index].duration();
             let mut afade_filters = String::new();
+            let curve = if clips[index].runtime.audio_crossfade {
+                ":curve=qsin"
+            } else {
+                ""
+            };
             if fade_in_audio > 0.004 {
-                afade_filters.push_str(&format!(",afade=t=in:st=0:d={fade_in_audio:.3}"));
+                afade_filters.push_str(&format!(",afade=t=in:st=0:d={fade_in_audio:.3}{curve}"));
             }
             if fade_out_audio > 0.004 {
                 afade_filters.push_str(&format!(
-                    ",afade=t=out:st={:.3}:d={fade_out_audio:.3}",
+                    ",afade=t=out:st={:.3}:d={fade_out_audio:.3}{curve}",
                     (audio_duration - fade_out_audio)
                 ));
             }
@@ -20569,6 +20599,96 @@ mod render_real_tests {
         assert!(full > 200.0, "el título no se ve: {full}");
         assert!(start < full * 0.35, "sin fundido: {start} vs {full}");
         assert!(middle > start && middle < full, "{start} {middle} {full}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Nivel RMS en dB de `[at, at+length]` del audio de un archivo.
+    fn rms_db(path: &Path, at: f64, length: f64) -> f64 {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-t", &format_seconds(length), "-i"])
+            .arg(path)
+            .args(["-ac", "1", "-f", "f32le", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let samples: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        let power = samples.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / samples.len().max(1) as f64;
+        10.0 * power.max(1e-12).log10()
+    }
+
+    #[test]
+    fn transitions_crossfade_audio_at_constant_power_and_wipe_the_picture() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("transiciones");
+        let camera = camera_clip(&directory);
+        let red_path = directory.join("rojo.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=640x360:r=25:d=4"])
+            .args(["-f", "lavfi", "-i", "sine=f=660:d=4:sample_rate=48000"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&red_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let red = RoughClip {
+            path: red_path,
+            out_seconds: 2.0,
+            source_duration_seconds: Some(4.0),
+            ..Default::default()
+        };
+        let incoming = |transition: &str| RoughClip {
+            timeline_start: 2.0,
+            out_seconds: 2.0,
+            transition: Some(transition.to_owned()),
+            transition_duration: 1.0,
+            ..camera.clone()
+        };
+        // Audio: 660 Hz sale mientras 300 Hz entra; el nivel no debe subir
+        // ni caer en mitad del cruce.
+        let output = directory.join("disolucion.mp4");
+        export(&[red.clone(), incoming("dissolve")], &output, ExportFormat::Mp4Video).unwrap();
+        let steady = rms_db(&output, 1.0, 0.5);
+        // Sin cruzar el saliente, al final del cruce sumaba +2,4 dB; con un
+        // fundido lineal en ambos, el centro caía 3 dB.
+        for at in [2.1, 2.4, 2.7] {
+            let level = rms_db(&output, at, 0.2);
+            assert!(
+                (level - steady).abs() < 1.0,
+                "en {at} s {level:.1} dB, fuera {steady:.1} dB"
+            );
+        }
+        // Barrido hacia la derecha a mitad: izquierda ya es la cámara,
+        // derecha sigue siendo rojo.
+        let output = directory.join("barrido.mp4");
+        export(&[red.clone(), incoming("barrido_der")], &output, ExportFormat::Mp4Video).unwrap();
+        let frame = frame_rgb(&output, 2.5);
+        // Blancura: el canal más bajo; el blanco la tiene alta y la carta no.
+        let whiteness = |from: usize, to: usize| {
+            let mut sum = 0.0;
+            let mut count = 0.0;
+            for y in 0..90 {
+                for x in from..to {
+                    let pixel = &frame[(y * 160 + x) * 3..][..3];
+                    sum += *pixel.iter().min().unwrap() as f64;
+                    count += 1.0;
+                }
+            }
+            sum / count
+        };
+        assert!(whiteness(120, 160) > 200.0, "la derecha debería seguir en blanco");
+        assert!(whiteness(0, 40) < 120.0, "la izquierda debería mostrar la cámara");
+        // Iris y zoom renderizan sin errores y terminan en la cámara.
+        for transition in ["iris", "zoom"] {
+            let output = directory.join(format!("{transition}.mp4"));
+            export(&[red.clone(), incoming(transition)], &output, ExportFormat::Mp4Video).unwrap();
+            let end = frame_rgb(&output, 3.8);
+            assert!(mean_channel(&end, 1) > 60.0, "{transition}: no termina en la cámara");
+        }
         let _ = std::fs::remove_dir_all(&directory);
     }
 
