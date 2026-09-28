@@ -20,10 +20,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 mod aceleracion;
+mod animacion;
 mod batch;
 mod command_center;
 mod efectos;
+mod fuentes;
+mod estabilizar;
+mod exportacion;
+mod montaje;
 mod navigation;
+mod proyecto;
 mod subtitulos_animados;
 mod transcripcion;
 
@@ -187,6 +193,9 @@ struct RoughClip {
     /// ni se exporta, como el "enable/disable" de cualquier montador.
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    /// Keyframes de color, efectos y rotación (tiempo local del clip).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    anim: animacion::Tracks,
 }
 
 /// Modos de fusión; los nombres viajan igual que en macOS.
@@ -456,6 +465,48 @@ impl RoughClip {
             .sum()
     }
 
+    /// Fija los valores animados en `local_t` y quita la animación: para el
+    /// fotograma fijo del monitor, que compone un único instante.
+    fn freeze_animation(&mut self, local_t: f64) {
+        use animacion::Param;
+        let (x, y, scale, opacity) = self.evaluate_transform(local_t);
+        self.position_x = x;
+        self.position_y = y;
+        self.scale_percent = scale.clamp(1.0, 800.0);
+        self.opacity = opacity.clamp(0.0, 100.0);
+        self.keyframes = None;
+        for (param, keys) in std::mem::take(&mut self.anim) {
+            let Some(value) = animacion::value_at(&keys, local_t) else {
+                continue;
+            };
+            let field = match param {
+                Param::Exposure => &mut self.exposure,
+                Param::Contrast => &mut self.contrast,
+                Param::Saturation => &mut self.saturation,
+                Param::Vignette => &mut self.vignette,
+                Param::Blur => &mut self.blur,
+                Param::Temperature => &mut self.fx.temperature,
+                Param::Tint => &mut self.fx.tint,
+                Param::Vibrance => &mut self.fx.vibrance,
+                Param::Rotation => &mut self.rotation,
+            };
+            *field = value;
+        }
+    }
+
+    /// Desplaza todos los keyframes `delta` segundos de tiempo local.
+    fn shift_animation(&mut self, delta: f64) {
+        if let Some(keyframes) = &mut self.keyframes {
+            for keyframe in keyframes.iter_mut() {
+                keyframe.t += delta;
+            }
+        }
+        for key in &mut self.fx.volume_keys {
+            key.t += delta;
+        }
+        animacion::shift(&mut self.anim, delta);
+    }
+
     /// Transformación evaluada en `local_t` (s de timeline dentro del clip):
     /// interpolación lineal entre keyframes; fuera de rango, el más cercano.
     fn evaluate_transform(&self, local_t: f64) -> (f64, f64, f64, f64) {
@@ -629,6 +680,12 @@ enum DragKind {
     TrimEnd,
     RippleTrimStart,
     RippleTrimEnd,
+    /// Rodar el corte entre `left` y `right`, que estaba en `cut`.
+    Roll { left: usize, right: usize, cut: f64 },
+    /// Desplazar el contenido; `grab` es el instante donde empezó el gesto.
+    Slip { grab: f64 },
+    /// Deslizar el clip entre sus vecinos.
+    Slide { grab: f64 },
 }
 
 /// Herramienta activa del montaje. Cambia tanto el cursor como el significado
@@ -640,18 +697,24 @@ enum EditTool {
     Blade,
     Trim,
     RippleTrim,
+    Roll,
+    Slip,
+    Slide,
     Hand,
     Zoom,
     Magic,
 }
 
 impl EditTool {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 11] = [
         Self::Select,
         Self::TrackSelect,
         Self::Blade,
         Self::Trim,
         Self::RippleTrim,
+        Self::Roll,
+        Self::Slip,
+        Self::Slide,
         Self::Hand,
         Self::Zoom,
         Self::Magic,
@@ -664,6 +727,9 @@ impl EditTool {
             Self::Blade => "✂",
             Self::Trim => "↔",
             Self::RippleTrim => "⇤",
+            Self::Roll => "⇹",
+            Self::Slip => "⇆",
+            Self::Slide => "⇄",
             Self::Hand => "✋",
             Self::Zoom => "🔍",
             Self::Magic => "✨",
@@ -677,6 +743,9 @@ impl EditTool {
             Self::Blade => "Tijeras",
             Self::Trim => "Recortar",
             Self::RippleTrim => "Ripple",
+            Self::Roll => "Rodar",
+            Self::Slip => "Desplazar",
+            Self::Slide => "Deslizar",
             Self::Hand => "Mano",
             Self::Zoom => "Zoom",
             Self::Magic => "Varita",
@@ -690,6 +759,9 @@ impl EditTool {
             Self::Blade => "C",
             Self::Trim => "R",
             Self::RippleTrim => "T",
+            Self::Roll => "N",
+            Self::Slip => "Y",
+            Self::Slide => "Mayús+Y",
             Self::Hand => "H",
             Self::Zoom => "Z",
             Self::Magic => "G",
@@ -703,6 +775,9 @@ impl EditTool {
             Self::Blade => "Partir el clip exactamente donde pulses",
             Self::Trim => "Arrastrar cualquier mitad del clip para recortar ese borde",
             Self::RippleTrim => "Recortar y cerrar o abrir el montaje automáticamente",
+            Self::Roll => "Mover un corte: un clip gana lo que pierde el vecino",
+            Self::Slip => "Cambiar qué parte del medio muestra el clip sin moverlo",
+            Self::Slide => "Mover el clip entre sus vecinos, que ceden o ganan tiempo",
             Self::Hand => "Arrastrar la timeline horizontalmente",
             Self::Zoom => "Clic para acercar; Mayús+clic para alejar",
             Self::Magic => "Detectar escenas en vídeo o silencios en audio",
@@ -750,28 +825,78 @@ fn is_image_file(path: &Path) -> bool {
     )
 }
 
-/// Reproducción en curso del monitor: proceso FFmpeg + reloj local.
+/// Reproducción en curso del monitor: procesos FFmpeg + reloj.
 struct Playback {
-    child: std::process::Child,
-    audio_child: std::process::Child,
+    /// FFmpeg de vídeo hacia delante. Hacia atrás, los procesos viven en el
+    /// hilo lector, que compone tramo a tramo.
+    child: Option<std::process::Child>,
+    audio_child: Option<std::process::Child>,
     rx: Receiver<Option<PreviewFrame>>,
     start_playhead: f64,
     last_consumed: u64,
     timebase: Timebase,
+    /// Velocidad JKL: 1, 2, 4 u 8 hacia delante; negativa hacia atrás.
+    rate: i32,
+    /// Reloj de pared para cuando no hay audio que marque el tiempo.
+    started: std::time::Instant,
     /// RMS de audio por canal, actualizado por el hilo lector.
     meter: Arc<std::sync::Mutex<(f32, f32)>>,
     /// Mantiene vivo el dispositivo de audio mientras se reproduce.
-    _stream: rodio::OutputStream,
-    sink: Arc<rodio::Sink>,
+    _stream: Option<rodio::OutputStream>,
+    sink: Option<Arc<rodio::Sink>>,
+    /// Grafos de los procesos en curso; se borran al parar.
+    _graphs: Vec<GraphFile>,
+}
+
+impl Playback {
+    /// Segundos reales transcurridos: el audio es el reloj maestro para
+    /// evitar deriva; sin audio, el reloj de pared.
+    fn elapsed(&self) -> f64 {
+        match &self.sink {
+            Some(sink) => sink.get_pos().as_secs_f64(),
+            None => self.started.elapsed().as_secs_f64(),
+        }
+    }
+
+    /// Instante de timeline del fotograma entregado número `consumed`: cada
+    /// fotograma entregado avanza `|rate|` fotogramas del montaje.
+    fn time_of(&self, consumed: u64) -> f64 {
+        let frames = consumed as i64 * self.rate.unsigned_abs() as i64;
+        self.start_playhead + self.rate.signum() as f64 * self.timebase.seconds(frames)
+    }
 }
 
 impl Drop for Playback {
     fn drop(&mut self) {
-        self.sink.stop();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = self.audio_child.kill();
-        let _ = self.audio_child.wait();
+        if let Some(sink) = &self.sink {
+            sink.stop();
+        }
+        for child in [&mut self.child, &mut self.audio_child].into_iter().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Cadena `atempo` para reproducir el audio a `rate`× sin cambiar el tono.
+fn atempo_chain(rate: u32) -> String {
+    let mut chain = String::new();
+    let mut remaining = rate.max(1);
+    while remaining > 1 {
+        chain.push_str(",atempo=2");
+        remaining /= 2;
+    }
+    chain
+}
+
+/// Siguiente velocidad al pulsar L (`forward`) o J con la reproducción a
+/// `current`: arranca a 1× y cada pulsación en el mismo sentido duplica
+/// hasta 8×; cambiar de sentido vuelve a 1×.
+fn next_shuttle_rate(current: Option<i32>, forward: bool) -> i32 {
+    let sign = if forward { 1 } else { -1 };
+    match current {
+        Some(rate) if rate.signum() == sign => sign * (rate.abs() * 2).min(8),
+        _ => sign,
     }
 }
 
@@ -828,6 +953,8 @@ enum TimelineDragEvent {
     Move(usize, f64, usize),
     TrimStart(usize, f64),
     TrimEnd(usize, f64),
+    /// Rodar, desplazar o deslizar: instante bajo el puntero.
+    Tool(usize, f64),
     Commit(usize),
     Select(usize, SelectionMode),
 }
@@ -1172,9 +1299,9 @@ fn fit_segment_effects(
     first: bool,
     last: bool,
 ) {
-    for key in &mut segment.fx.volume_keys {
-        key.t -= local_start;
-    }
+    // Los keyframes siguen siendo los del clip entero, vistos desde el
+    // inicio de este tramo: la animación continúa sin saltos.
+    segment.shift_animation(-local_start);
     if !first {
         segment.runtime.audio_fade_in = 0.0;
         segment.runtime.white_in = false;
@@ -1214,18 +1341,11 @@ fn expand_speed_ramps(clips: Vec<RoughClip>) -> Vec<RoughClip> {
             let speed = clip.speed_at_source_time((source_start + source_end) / 2.0);
             let timeline_duration = (source_end - source_start) / speed;
             let mut segment = clip.clone();
-            let (x, y, scale, opacity) =
-                clip.evaluate_transform(timeline_offset + timeline_duration / 2.0);
             segment.in_seconds = clip.in_seconds + source_start;
             segment.out_seconds = clip.in_seconds + source_end;
             segment.timeline_start = clip.timeline_start + timeline_offset;
             segment.speed = speed;
             segment.speed_ramp = None;
-            segment.keyframes = None;
-            segment.position_x = x;
-            segment.position_y = y;
-            segment.scale_percent = scale;
-            segment.opacity = opacity;
             segment.fade_in_seconds = if timeline_offset < 0.001 {
                 clip.fade_in_seconds.min(timeline_duration)
             } else {
@@ -1248,75 +1368,10 @@ fn expand_speed_ramps(clips: Vec<RoughClip>) -> Vec<RoughClip> {
 
 /// Expande los clips con keyframes en segmentos constantes por tramo:
 /// cada segmento lleva la transformación evaluada en su punto medio.
-fn expand_keyframes(clips: Vec<RoughClip>) -> Vec<RoughClip> {
-    let mut out = Vec::with_capacity(clips.len());
-    for clip in clips {
-        let Some(keyframes) = &clip.keyframes else {
-            out.push(clip);
-            continue;
-        };
-        if !clip.has_video || keyframes.len() < 2 {
-            out.push(clip);
-            continue;
-        }
-        let duration = clip.duration();
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let (fade_in, fade_out) = clip.effective_fades();
-        let mut boundaries: Vec<f64> = vec![0.0];
-        for keyframe in keyframes {
-            let t = keyframe.t.clamp(0.0, duration);
-            if t > *boundaries.last().unwrap() + 0.01 && t < duration - 0.01 {
-                boundaries.push(t);
-            }
-        }
-        boundaries.push(duration);
-        let segments = boundaries.windows(2);
-        let segment_count = boundaries.len() - 1;
-        for (segment_index, window) in segments.enumerate() {
-            let (seg_start, seg_end) = (window[0], window[1]);
-            let seg_dur = seg_end - seg_start;
-            if seg_dur < 0.02 {
-                continue;
-            }
-            let mid = (seg_start + seg_end) / 2.0;
-            let (x, y, scale, opacity) = clip.evaluate_transform(mid);
-            let mut segment = clip.clone();
-            segment.keyframes = None;
-            segment.position_x = x;
-            segment.position_y = y;
-            segment.scale_percent = scale.clamp(1.0, 800.0);
-            segment.opacity = opacity.clamp(0.0, 100.0);
-            segment.in_seconds = clip.in_seconds + seg_start * speed;
-            segment.out_seconds = clip.in_seconds + seg_end * speed;
-            segment.timeline_start = clip.timeline_start + seg_start;
-            segment.fade_in_seconds = if segment_index == 0 {
-                fade_in.min(seg_dur)
-            } else {
-                0.0
-            };
-            segment.fade_out_seconds = if segment_index + 1 == segment_count {
-                fade_out.min(seg_dur)
-            } else {
-                0.0
-            };
-            fit_segment_effects(
-                &mut segment,
-                &clip,
-                seg_start,
-                segment_index == 0,
-                segment_index + 1 == segment_count,
-            );
-            out.push(segment);
-        }
-    }
-    out
-}
-
-/// Pipeline compartido de preparación para render: transiciones + keyframes.
+/// Pipeline compartido de preparación para render: anidados, transiciones y
+/// rampas. Los keyframes no se trocean: el grafo los anima por fotograma.
 fn prepare_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
-    expand_keyframes(expand_speed_ramps(resolve_render_clips(&flatten_nested(
-        clips,
-    ))))
+    expand_speed_ramps(resolve_render_clips(&flatten_nested(clips)))
 }
 
 fn flatten_nested(clips: &[RoughClip]) -> Vec<RoughClip> {
@@ -1401,22 +1456,46 @@ fn resolve_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
                 .min(out[j].duration() / 2.0)
                 .min(out[i].duration() / 2.0);
             let extendable = clip_can_extend_by(&out[j], d);
+            // Todo lo que solapa los dos clips cruza también su audio con
+            // potencia constante: el saliente baja lo que el entrante sube.
+            let overlap = |out: &mut Vec<RoughClip>| {
+                let speed = out[j].speed.clamp(0.1, 8.0);
+                out[j].out_seconds += d * speed;
+                out[j].runtime.audio_fade_out = d;
+                out[j].runtime.audio_crossfade = true;
+                out[i].runtime.audio_fade_in = d;
+                out[i].runtime.audio_crossfade = true;
+            };
             if let Some((dx, dy, push)) = efectos::motion_of(&transition) {
                 out[i].runtime.slide_in = Some((dx, dy, start_i, d));
                 out[i].runtime.audio_fade_in = d;
                 if extendable {
-                    let speed = out[j].speed.clamp(0.1, 8.0);
-                    out[j].out_seconds += d * speed;
-                    out[j].runtime.audio_fade_out = d;
+                    overlap(&mut out);
                     if push {
                         out[j].runtime.slide_out = Some((dx, dy, start_i, d));
                     }
                 }
             } else if transition == "dissolve" && extendable {
-                let speed = out[j].speed.clamp(0.1, 8.0);
-                out[j].out_seconds += d * speed;
+                overlap(&mut out);
                 out[j].fade_out_seconds = 0.0;
                 out[i].fade_in_seconds = d;
+            } else if let (Some(wipe), true) = (efectos::wipe_of(&transition), extendable) {
+                overlap(&mut out);
+                out[j].fade_out_seconds = 0.0;
+                out[i].runtime.wipe_in = Some((wipe, d));
+            } else if transition == "zoom" && extendable {
+                overlap(&mut out);
+                out[j].fade_out_seconds = 0.0;
+                if out[i].keyframes.is_none() {
+                    // El entrante crece desde el 60 % mientras aparece.
+                    let (x, y, scale, opacity) = out[i].evaluate_transform(0.0);
+                    out[i].keyframes = Some(vec![
+                        TransformKeyframe { t: 0.0, x, y, scale: scale * 0.6, opacity: 0.0 },
+                        TransformKeyframe { t: d, x, y, scale, opacity },
+                    ]);
+                } else {
+                    out[i].fade_in_seconds = d;
+                }
             } else {
                 out[j].fade_out_seconds = d;
                 out[i].fade_in_seconds = d;
@@ -1555,18 +1634,14 @@ fn ripple_track_at(
             continue;
         }
         if crosses(clip) {
-            let speed = clip.speed.clamp(0.1, 8.0);
-            let source_cut = clip.in_seconds + (at - clip.timeline_start) * speed;
-            let mut head = clip.clone();
-            head.out_seconds = source_cut;
-            head.fade_out_seconds = 0.0;
-            let mut tail = clip.clone();
-            tail.timeline_start = at + span;
-            tail.in_seconds = source_cut;
-            tail.fade_in_seconds = 0.0;
-            tail.transition = None;
-            result.push(head);
-            result.push(tail);
+            let local = at - clip.timeline_start;
+            let head = montaje::clip_portion(clip, 0.0, local);
+            let tail = montaje::clip_portion(clip, local, clip.duration());
+            result.extend(head);
+            if let Some(mut tail) = tail {
+                tail.timeline_start = at + span;
+                result.push(tail);
+            }
         } else {
             let mut shifted = clip.clone();
             if shifted.timeline_start >= at - 0.001 {
@@ -1579,43 +1654,107 @@ fn ripple_track_at(
     true
 }
 
-/// Recorta el montaje al rango [start, end] y lo desplaza al origen. Los clips
-/// con rampa o secuencia anidada no se recortan por dentro: se conservan
-/// enteros si tocan el rango, porque su tiempo de origen no es lineal.
-fn trim_clips_to_range(clips: &[RoughClip], start: f64, end: f64) -> Vec<RoughClip> {
-    let mut result = Vec::new();
-    for clip in clips {
-        let clip_start = clip.timeline_start;
-        let clip_end = clip.timeline_start + clip.duration();
-        if clip_end <= start + 0.001 || clip_start >= end - 0.001 {
-            continue;
-        }
-        let mut trimmed = clip.clone();
-        let complex = clip.nested.is_some()
-            || clip
-                .speed_ramp
-                .as_ref()
-                .is_some_and(|points| !points.is_empty());
-        if complex {
-            trimmed.timeline_start = clip_start - start;
-            result.push(trimmed);
-            continue;
-        }
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let head = (start - clip_start).max(0.0);
-        let tail = (clip_end - end).max(0.0);
-        trimmed.timeline_start = (clip_start + head) - start;
-        trimmed.in_seconds = clip.in_seconds + head * speed;
-        trimmed.out_seconds = clip.out_seconds - tail * speed;
-        if trimmed.out_seconds - trimmed.in_seconds <= 0.001 {
-            continue;
-        }
-        let half = trimmed.duration() / 2.0;
-        trimmed.fade_in_seconds = trimmed.fade_in_seconds.min(half).max(0.0);
-        trimmed.fade_out_seconds = trimmed.fade_out_seconds.min(half).max(0.0);
-        result.push(trimmed);
+/// Pistas de transformación del clip si alguna cambia con el tiempo.
+fn moving_transform(clip: &RoughClip) -> Option<[Vec<animacion::Key>; 4]> {
+    let tracks = animacion::transform_tracks(clip.keyframes.as_deref()?);
+    tracks.iter().any(|track| animacion::varies(track)).then_some(tracks)
+}
+
+/// Posición animada como expresiones de `overlay` en tiempo de composición.
+fn moving_position(clip: &RoughClip) -> Option<(String, String)> {
+    let tracks = moving_transform(clip)?;
+    if !animacion::varies(&tracks[0]) && !animacion::varies(&tracks[1]) {
+        return None;
     }
-    result
+    let time = format!("(t-{:.6})", clip.timeline_start.max(0.0));
+    Some((
+        format!("({})", animacion::expression(&tracks[0], &time)),
+        format!("({})", animacion::expression(&tracks[1], &time)),
+    ))
+}
+
+/// Exposición, contraste y saturación; animados por expresión si alguno
+/// tiene keyframes que cambian.
+fn animated_eq(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    use animacion::Param;
+    let params = [
+        (Param::Exposure, clip.exposure),
+        (Param::Contrast, clip.contrast),
+        (Param::Saturation, clip.saturation),
+    ];
+    if params.iter().all(|(param, _)| animation.varying(*param).is_none()) {
+        return color_eq_filter(
+            animation.constant(Param::Exposure, clip.exposure),
+            animation.constant(Param::Contrast, clip.contrast),
+            animation.constant(Param::Saturation, clip.saturation),
+        );
+    }
+    let maps: [fn(f64) -> f64; 3] = [
+        |v| v.clamp(-1.0, 1.0) / 2.0,
+        |v| 1.0 + v.clamp(-1.0, 1.0),
+        |v| (1.0 + v.clamp(-1.0, 1.0)).max(0.0),
+    ];
+    let time = animation.time();
+    let parts: Vec<String> = params
+        .iter()
+        .zip(maps)
+        .map(|((param, fallback), map)| match animation.varying(*param) {
+            Some(keys) => format!("'{}'", animacion::expression(&animacion::mapped(keys, map), &time)),
+            None => format!("{:.4}", map(animation.constant(*param, *fallback))),
+        })
+        .collect();
+    format!(
+        ",eq=brightness={}:contrast={}:saturation={}:eval=frame",
+        parts[0], parts[1], parts[2]
+    )
+}
+
+fn animated_vignette(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    let angle = |v: f64| std::f64::consts::PI / 4.0 * v.clamp(-1.0, 1.0);
+    match animation.varying(animacion::Param::Vignette) {
+        Some(keys) => format!(
+            ",vignette=angle='{}':eval=frame",
+            animacion::expression(&animacion::mapped(keys, angle), &animation.time())
+        ),
+        None => vignette_filter(animation.constant(animacion::Param::Vignette, clip.vignette)),
+    }
+}
+
+fn animated_blur(
+    clip: &RoughClip,
+    short_side_px: f64,
+    animation: &efectos::Animation,
+    commands: &mut Vec<String>,
+) -> String {
+    let sigma = |v: f64| (v.clamp(0.0, 1.0) * short_side_px.max(1.0) / 4.0).clamp(0.1, 250.0);
+    match animation.varying(animacion::Param::Blur) {
+        Some(keys) => {
+            let target = format!("gblur@b{}", animation.tag);
+            commands.extend(animation.commands(&target, &[("sigma", &sigma)], keys));
+            format!(",{target}=sigma={:.2}", sigma(keys[0].v))
+        }
+        None => blur_filter(
+            animation.constant(animacion::Param::Blur, clip.blur),
+            short_side_px,
+        ),
+    }
+}
+
+/// Giro de la capa. Animado, el lienzo de salida es la diagonal para que
+/// ningún ángulo recorte la imagen.
+fn rotate_filter(clip: &RoughClip, animation: &efectos::Animation) -> String {
+    match animation.varying(animacion::Param::Rotation) {
+        Some(keys) => format!(
+            ",rotate=a='{}':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0",
+            animacion::expression(&animacion::mapped(keys, f64::to_radians), "t")
+        ),
+        None => format!(
+            ",rotate={:.8}:ow=rotw(iw):oh=roth(ih):c=black@0",
+            animation
+                .constant(animacion::Param::Rotation, clip.rotation)
+                .to_radians()
+        ),
+    }
 }
 
 fn color_eq_filter(exposure: f64, contrast: f64, saturation: f64) -> String {
@@ -1648,6 +1787,9 @@ struct Titulo {
     /// Caja, contorno, sombra y mate de «Gráficos esenciales».
     #[serde(default)]
     style: efectos::TitleStyle,
+    /// Archivo de fuente elegido; `None` es la predeterminada.
+    #[serde(default)]
+    font: Option<PathBuf>,
 }
 
 fn half_center() -> f64 {
@@ -1673,6 +1815,7 @@ impl Default for Titulo {
             green: full_channel(),
             blue: full_channel(),
             style: efectos::TitleStyle::default(),
+            font: None,
         }
     }
 }
@@ -1726,6 +1869,7 @@ impl Default for RoughClip {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         }
     }
 }
@@ -1994,8 +2138,8 @@ fn transcribe_mix(
         None,
     )
     .and_then(|filters| {
+        let _graph = attach_graph(&mut ffmpeg, &filters)?;
         let output = ffmpeg
-            .args(["-filter_complex", &filters.join(";")])
             .args([
                 "-map",
                 "[aout]",
@@ -2136,6 +2280,7 @@ fn clips_with_subtitles(
                 green: style.green.clamp(0.0, 1.0),
                 blue: style.blue.clamp(0.0, 1.0),
                 style: efectos::TitleStyle::default(),
+                font: None,
             }),
             ..Default::default()
         });
@@ -2304,9 +2449,37 @@ struct RoughProject {
     /// la superficie de la edición por texto.
     #[serde(default)]
     transcript: Vec<transcripcion::Word>,
+    /// Medios del proyecto (panel Proyecto), estén o no en una secuencia.
+    #[serde(default)]
+    library: Vec<proyecto::LibraryItem>,
+    /// Bins declarados, aunque estén vacíos (rutas con `/`).
+    #[serde(default)]
+    bins: Vec<String>,
+    /// Secuencias que no están abiertas; la abierta son los campos de arriba.
+    #[serde(default)]
+    sequences: Vec<proyecto::StoredSequence>,
+    #[serde(default)]
+    sequence_id: u64,
+    #[serde(default)]
+    sequence_name: String,
+    #[serde(default)]
+    sequence_bin: String,
 }
 
 impl RoughProject {
+    /// Todos los clips del proyecto: la secuencia abierta, las guardadas y
+    /// la biblioteca. Para relativizar rutas, reenlazar y similares.
+    fn all_clips_mut(&mut self) -> impl Iterator<Item = &mut RoughClip> {
+        self.clips
+            .iter_mut()
+            .chain(
+                self.sequences
+                    .iter_mut()
+                    .flat_map(|sequence| sequence.data.clips.iter_mut()),
+            )
+            .chain(self.library.iter_mut().map(|item| &mut item.clip))
+    }
+
     fn normalize(&mut self) {
         if self.version < 2 {
             let mut cursor = 0.0;
@@ -2323,6 +2496,19 @@ impl RoughProject {
             .unwrap_or_else(|| Timebase::from_fps(self.fps));
         self.timebase = Some(timebase);
         self.fps = timebase.fps();
+        if self.sequence_id == 0 {
+            self.sequence_id = self
+                .sequences
+                .iter()
+                .map(|sequence| sequence.id)
+                .max()
+                .unwrap_or(0)
+                + 1;
+        }
+        if self.sequence_name.trim().is_empty() {
+            self.sequence_name = self.unique_sequence_name("Secuencia 1");
+        }
+        self.migrate_library();
         let inferred_source_durations: HashMap<PathBuf, f64> = self
             .clips
             .iter()
@@ -2664,6 +2850,12 @@ impl Default for RoughProject {
             min_video_tracks: 0,
             min_audio_tracks: 0,
             transcript: Vec::new(),
+            library: Vec::new(),
+            bins: Vec::new(),
+            sequences: Vec::new(),
+            sequence_id: 1,
+            sequence_name: "Secuencia 1".to_owned(),
+            sequence_bin: String::new(),
         }
     }
 }
@@ -2690,6 +2882,16 @@ struct NovaCutWindows {
     clean_project_json: Option<String>,
     drag_edit: Option<(usize, DragKind, RoughProject)>,
     export_cancel: Option<Arc<AtomicBool>>,
+    /// Calidad, bitrate y audio de la exportación.
+    encode_settings: exportacion::EncodeSettings,
+    export_queue: Vec<QueueItem>,
+    /// Trabajo de la cola que se está renderizando.
+    running_job: Option<u64>,
+    next_job_id: u64,
+    show_export: bool,
+    show_queue: bool,
+    /// Destino elegido en el panel de exportación.
+    export_target: Option<PathBuf>,
     montage_render: Option<Receiver<Result<PathBuf, String>>>,
     /// Zoom de timeline: 1.0 ajusta el montaje al ancho disponible.
     zoom: f32,
@@ -2774,6 +2976,18 @@ struct NovaCutWindows {
     /// Filtro de texto del panel de medios.
     media_filter: String,
     media_options: media_browser::Options,
+    /// Vista del panel izquierdo: el proyecto (bins) o los usos de la secuencia.
+    media_view_project: bool,
+    /// Bin que se está viendo en el panel Proyecto; destino de lo importado.
+    project_bin: String,
+    /// La próxima importación va solo a la biblioteca, no a la timeline.
+    import_library_only: bool,
+    /// Elemento del panel Proyecto que se está renombrando y el texto.
+    project_rename: Option<(ProjectItem, String)>,
+    /// Plano de referencia elegido para «Igualar color».
+    match_reference: Option<usize>,
+    /// Análisis de vidstab en curso: archivo destino y resultado.
+    stabilization: Option<(PathBuf, Receiver<Result<PathBuf, String>>)>,
     media_file_status: media_browser::FileStatus,
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
@@ -2996,6 +3210,8 @@ struct UiSettings {
     /// `None` hasta que el usuario (o el primer arranque) lo fija.
     #[serde(default)]
     ui_scale: Option<f32>,
+    #[serde(default)]
+    encode: exportacion::EncodeSettings,
 }
 
 /// Tamaños de interfaz ofrecidos en el menú «Aa».
@@ -3370,6 +3586,7 @@ impl NovaCutWindows {
             loop_playback: self.loop_playback,
             proxy_limit_gb: self.proxy_limit_gb,
             hardware_encoding: self.hardware_encoding,
+            encode: self.encode_settings,
             ui_scale: Some(self.ui_scale),
         }
     }
@@ -3429,6 +3646,7 @@ impl NovaCutWindows {
         self.loop_playback = settings.loop_playback;
         self.proxy_limit_gb = settings.proxy_limit_gb.clamp(0.0, 1000.0);
         self.hardware_encoding = settings.hardware_encoding;
+        self.encode_settings = settings.encode;
         if let Some(scale) = settings.ui_scale {
             self.ui_scale = scale.clamp(0.75, 2.0);
             self.ui_scale_chosen = true;
@@ -3749,6 +3967,7 @@ impl NovaCutWindows {
             probe_media(new_path).ok()
         };
         let ok = metadata.is_some();
+        let old_path = self.project.clips[index].path.clone();
         let clip = &mut self.project.clips[index];
         clip.path = new_path.to_path_buf();
         clip.source_duration_seconds = metadata.as_ref().map(|probe| probe.duration);
@@ -3757,6 +3976,26 @@ impl NovaCutWindows {
             .as_ref()
             .is_some_and(|probe| probe.variable_frame_rate);
         clip.source_pts = metadata.and_then(|probe| probe.source_pts);
+        // El mismo archivo en la biblioteca, en otras secuencias y dentro de
+        // anidados apunta también al nuevo.
+        let relinked = self.project.clips[index].clone();
+        fn follow(clip: &mut RoughClip, old: &Path, relinked: &RoughClip) {
+            if clip.path == old {
+                clip.path = relinked.path.clone();
+                clip.source_duration_seconds = relinked.source_duration_seconds;
+                clip.source_timebase = relinked.source_timebase;
+                clip.source_vfr = relinked.source_vfr;
+                clip.source_pts = relinked.source_pts.clone();
+            }
+            for child in clip.nested.iter_mut().flatten() {
+                follow(child, old, relinked);
+            }
+        }
+        if !old_path.as_os_str().is_empty() {
+            for clip in self.project.all_clips_mut() {
+                follow(clip, &old_path, &relinked);
+            }
+        }
         ok
     }
 
@@ -3814,6 +4053,13 @@ impl NovaCutWindows {
             clean_project_json: serde_json::to_string(&RoughProject::default()).ok(),
             drag_edit: None,
             export_cancel: None,
+            encode_settings: exportacion::EncodeSettings::default(),
+            export_queue: Vec::new(),
+            running_job: None,
+            next_job_id: 1,
+            show_export: false,
+            show_queue: false,
+            export_target: None,
             montage_render: None,
             zoom: 1.0,
             hscroll: 0.0,
@@ -3863,6 +4109,12 @@ impl NovaCutWindows {
             waveform_inflight: None,
             media_filter: String::new(),
             media_options: media_browser::Options::default(),
+            media_view_project: true,
+            project_bin: String::new(),
+            import_library_only: false,
+            project_rename: None,
+            match_reference: None,
+            stabilization: None,
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Mixer,
             subtitle_query: String::new(),
@@ -3929,9 +4181,14 @@ impl NovaCutWindows {
 
     /// Abre el monitor de fuente con el medio del clip indicado.
     fn open_source_monitor(&mut self, index: usize) {
-        let Some(clip) = self.project.clips.get(index).cloned() else {
-            return;
-        };
+        if let Some(clip) = self.project.clips.get(index).cloned() {
+            self.open_source_clip(clip);
+        }
+    }
+
+    /// Monitor de fuente para cualquier clip de archivo (también de la
+    /// biblioteca, aunque no esté en la secuencia).
+    fn open_source_clip(&mut self, clip: RoughClip) {
         if clip.title.is_some() || clip.nested.is_some() || clip.path.as_os_str().is_empty() {
             self.status = "El monitor de fuente necesita un medio de archivo".to_owned();
             return;
@@ -4339,12 +4596,26 @@ impl NovaCutWindows {
     }
 
     /// Proxies que el proyecto abierto tiene enlazados: nunca se desalojan.
+    /// Proxies que usa cualquier secuencia (abierta o no), la biblioteca o
+    /// un anidado: el presupuesto de caché nunca debe borrarlos.
     fn linked_proxies(&self) -> HashSet<PathBuf> {
-        self.project
-            .clips
-            .iter()
-            .filter_map(|clip| clip.proxy.clone())
-            .collect()
+        fn collect(clips: &[RoughClip], out: &mut HashSet<PathBuf>) {
+            for clip in clips {
+                out.extend(clip.proxy.clone());
+                if let Some(children) = &clip.nested {
+                    collect(children, out);
+                }
+            }
+        }
+        let mut linked = HashSet::new();
+        collect(&self.project.clips, &mut linked);
+        for sequence in &self.project.sequences {
+            collect(&sequence.data.clips, &mut linked);
+        }
+        for item in &self.project.library {
+            linked.extend(item.clip.proxy.clone());
+        }
+        linked
     }
 
     /// ¿El proxy enlazado por el clip seleccionado sigue describiendo su medio?
@@ -4539,8 +4810,8 @@ impl NovaCutWindows {
                 filters.push(
                     "[aout]loudnorm=I=-14:TP=-1:LRA=11:print_format=json[analysis]".to_owned(),
                 );
+                let _graph = attach_graph(&mut command, &filters)?;
                 let output = command
-                    .args(["-filter_complex", &filters.join(";")])
                     .args(["-map", "[analysis]", "-f", "null", "NUL"])
                     .creation_flags(CREATE_NO_WINDOW)
                     .output()
@@ -5370,6 +5641,7 @@ impl NovaCutWindows {
                         nested: None,
                         freeze_at: None,
                         enabled: true,
+                        anim: animacion::Tracks::new(),
                     };
                     if let Some(target) = target {
                         clip.timeline_start = target.timeline_start;
@@ -5387,7 +5659,20 @@ impl NovaCutWindows {
                 Err(error) => errors.push(error),
             }
         }
+        let library_only = std::mem::take(&mut self.import_library_only);
+        if imported > 0 && library_only {
+            let bin = self.project_bin.clone();
+            let added = self.project.register_media(&clips_to_add, &bin);
+            self.finish_edit(before);
+            self.status = format!(
+                "{added} medio(s) añadido(s) al proyecto{}",
+                if bin.is_empty() { String::new() } else { format!(" en «{bin}»") }
+            );
+            return;
+        }
         if imported > 0 {
+            let bin = self.project_bin.clone();
+            self.project.register_media(&clips_to_add, &bin);
             self.project.clips.extend(clips_to_add);
             self.select_only(self.project.clips.len() - 1);
             self.status = if variable_frame_rate > 0 {
@@ -5574,6 +5859,7 @@ impl NovaCutWindows {
                                 green: t.verde.clamp(0.0, 1.0),
                                 blue: t.azul.clamp(0.0, 1.0),
                                 style: efectos::TitleStyle::default(),
+                                font: None,
                             })
                         }
                         _ => {
@@ -5703,6 +5989,7 @@ impl NovaCutWindows {
                     transition_duration: default_transition_duration(),
                     label: 0,
                     enabled: true,
+                    anim: animacion::Tracks::new(),
                 });
             }
         }
@@ -5893,14 +6180,8 @@ impl NovaCutWindows {
         }
         // Keyframes evaluados exactamente en el cabezal para el monitor.
         for (clip, _) in &mut sources {
-            if clip.keyframes.is_some() {
-                let local = (self.playhead - clip.timeline_start).max(0.0);
-                let (x, y, scale, opacity) = clip.evaluate_transform(local);
-                clip.position_x = x;
-                clip.position_y = y;
-                clip.scale_percent = scale.clamp(1.0, 800.0);
-                clip.opacity = opacity.clamp(0.0, 100.0);
-            }
+            let local = (self.playhead - clip.timeline_start).max(0.0);
+            clip.freeze_animation(local);
         }
         // Los fundidos se ven en el monitor multiplicando la opacidad efectiva.
         for (clip, _) in &mut sources {
@@ -5957,14 +6238,13 @@ impl NovaCutWindows {
                 self.status = "La pista está bloqueada".to_owned();
                 return;
             }
-            let before = self.project.clone();
             let local = self.playhead - self.project.clips[index].timeline_start;
-            let source_split = self.project.clips[index].in_seconds
-                + local * self.project.clips[index].speed.clamp(0.1, 8.0);
-            let mut right = self.project.clips[index].clone();
-            self.project.clips[index].out_seconds = source_split;
-            right.in_seconds = source_split;
-            right.timeline_start = self.playhead;
+            let Some((left, right)) = montaje::split(&self.project.clips[index], local) else {
+                self.status = "El cabezal está demasiado cerca del borde del clip".to_owned();
+                return;
+            };
+            let before = self.project.clone();
+            self.project.clips[index] = left;
             self.project.clips.insert(index + 1, right);
             self.select_only(index + 1);
             self.finish_edit(before);
@@ -6008,15 +6288,12 @@ impl NovaCutWindows {
             return;
         }
         let cut = clip.timeline_start + local;
-        let source_cut = clip.in_seconds + local * clip.speed.clamp(0.1, 8.0);
+        let Some((left, right)) = montaje::split(&clip, local) else {
+            self.status = "Pulsa dentro del clip, lejos de sus bordes".to_owned();
+            return;
+        };
         let before = self.project.clone();
-        let mut right = clip;
-        self.project.clips[index].out_seconds = source_cut;
-        self.project.clips[index].fade_out_seconds = 0.0;
-        right.in_seconds = source_cut;
-        right.timeline_start = cut;
-        right.fade_in_seconds = 0.0;
-        right.transition = None;
+        self.project.clips[index] = left;
         self.project.clips.insert(index + 1, right);
         self.playhead = cut;
         self.select_only(index + 1);
@@ -6050,11 +6327,33 @@ impl NovaCutWindows {
         }
     }
 
+    /// Abre el panel de exportación (Ctrl+M, como en Premiere).
     fn export(&mut self) {
         if self.project.clips.is_empty() {
             self.status = "Importa al menos un clip".to_owned();
             return;
         }
+        self.show_export = true;
+    }
+
+    /// Nombre de archivo propuesto: el del proyecto con la extensión.
+    fn suggested_export_name(&self) -> String {
+        let stem: String = self
+            .project
+            .name
+            .chars()
+            .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+            .collect();
+        let stem = stem.trim();
+        if stem.is_empty() {
+            self.export_format.default_file_name().to_owned()
+        } else {
+            format!("{stem}.{}", self.export_format.extension())
+        }
+    }
+
+    /// Valida el montaje y añade un trabajo con los ajustes actuales.
+    fn enqueue_export(&mut self, output: PathBuf) -> bool {
         if self
             .project
             .clips
@@ -6062,76 +6361,107 @@ impl NovaCutWindows {
             .any(|clip| clip.duration() <= 0.01)
         {
             self.status = "Todos los clips necesitan una salida posterior a la entrada".to_owned();
+            return false;
+        }
+        let job = self.render_job(output);
+        if job.clips.is_empty() {
+            self.status = "El rango de trabajo no contiene ningún clip".to_owned();
+            return false;
+        }
+        if self
+            .export_queue
+            .iter()
+            .any(|item| item.job.output == job.output && matches!(item.state, JobState::Waiting | JobState::Running))
+        {
+            self.status = "Ya hay un trabajo en la cola que escribe ese archivo".to_owned();
+            return false;
+        }
+        let seconds = job.output_length();
+        let summary = if job.audio_only {
+            format!("{} · {}", job.format.short_name(), format_clock(seconds))
+        } else {
+            format!(
+                "{} {}×{} · {}",
+                job.format.short_name(),
+                job.size.0,
+                job.size.1,
+                format_clock(seconds)
+            )
+        };
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.export_queue.push(QueueItem {
+            id,
+            job,
+            state: JobState::Waiting,
+            summary,
+        });
+        true
+    }
+
+    /// Arranca el siguiente trabajo en espera si no hay ninguno en marcha.
+    fn pump_queue(&mut self) {
+        if self.export_result.is_some() || self.montage_render.is_some() {
             return;
         }
-        let audio_only = self.export_format.is_audio_only();
-        let Some(output) = FileDialog::new()
-            .add_filter(
-                self.export_format.label(),
-                &[self.export_format.extension()],
-            )
-            .set_file_name(self.export_format.default_file_name())
-            .save_file()
+        if !self
+            .export_queue
+            .iter()
+            .any(|item| item.state == JobState::Waiting)
+        {
+            return;
+        }
+        self.stop_playback_for_render();
+        let Some(item) = self
+            .export_queue
+            .iter_mut()
+            .find(|item| item.state == JobState::Waiting)
         else {
             return;
         };
-
-        let clips = self.export_clips();
-        if clips.is_empty() {
-            self.status = "El rango de trabajo no contiene ningún clip".to_owned();
-            return;
-        }
+        item.state = JobState::Running;
+        self.running_job = Some(item.id);
+        let job = item.job.clone();
+        let output = job.output.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = Arc::clone(&cancel);
         let progress = Arc::clone(&self.render_progress);
         if let Ok(mut state) = progress.lock() {
             state.pct = 0.0;
             state.eta_secs = 0.0;
-        }
-        let size = self.export_size;
-        let format = self.export_format;
-        let track_gains = self.project.track_gains.clone();
-        let master_gain_db = self.project.master_gain_db;
-        let normalize_loudness = self.project.normalize_loudness;
-        let timebase = self.project.timebase();
-        let measured_loudness = self.current_loudness_measurement().cloned();
-        let hw = self.active_hw();
-        if let Ok(mut state) = self.render_progress.lock() {
             state.note = None;
         }
         let (sender, receiver) = mpsc::channel();
         self.export_result = Some(receiver);
         self.export_cancel = Some(cancel);
-        self.status = if audio_only {
-            format!("Exportando audio {}...", format.extension().to_uppercase())
-        } else {
-            format!(
-                "Exportando {} {}x{}...",
-                format.short_name(),
-                size.0,
-                size.1
-            )
-        };
+        let waiting = self
+            .export_queue
+            .iter()
+            .filter(|item| item.state == JobState::Waiting)
+            .count();
+        self.status = format!(
+            "Exportando {}{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("exportación"),
+            if waiting > 0 {
+                format!(" · {waiting} en cola")
+            } else {
+                String::new()
+            }
+        );
         std::thread::spawn(move || {
-            let result = run_export(
-                &clips,
-                &output,
-                &thread_cancel,
-                false,
-                size,
-                audio_only,
-                format,
-                &track_gains,
-                master_gain_db,
-                normalize_loudness,
-                timebase,
-                measured_loudness.as_ref(),
-                hw,
-                &progress,
-            )
-            .map(|()| output);
+            let result = run_export(&job, &thread_cancel, &progress).map(|()| output);
             let _ = sender.send(result);
         });
+    }
+
+    /// La reproducción y el render compiten por la CPU: se para al exportar.
+    fn stop_playback_for_render(&mut self) {
+        if self.playback.is_some() {
+            self.stop_playback();
+        }
     }
 
     fn start_hw_detection(&mut self) {
@@ -6179,6 +6509,18 @@ impl NovaCutWindows {
                 .and_then(|mut state| state.note.take())
                 .map(|note| format!(" ({note})"))
                 .unwrap_or_default();
+            let state = match &result {
+                Ok(_) => JobState::Done,
+                Err(error) if error == "Exportación cancelada" => JobState::Cancelled,
+                Err(error) => JobState::Failed(error.clone()),
+            };
+            if let Some(item) = self
+                .running_job
+                .take()
+                .and_then(|id| self.export_queue.iter_mut().find(|item| item.id == id))
+            {
+                item.state = state;
+            }
             self.status = match result {
                 Ok(path) => format!("Exportado: {}{note}", path.display()),
                 Err(error) if error == "Exportación cancelada" => error,
@@ -6186,6 +6528,7 @@ impl NovaCutWindows {
             };
             self.export_result = None;
             self.export_cancel = None;
+            self.pump_queue();
         }
     }
 
@@ -6447,16 +6790,36 @@ impl NovaCutWindows {
         clips
     }
 
-    /// Clips que van al render final: como los efectivos, pero recortados al
-    /// rango de trabajo cuando el usuario pide exportar solo ese tramo.
-    fn export_clips(&self) -> Vec<RoughClip> {
-        let clips = self.effective_clips();
+    /// Exportación con los ajustes actuales. Con «solo rango», los clips se
+    /// recortan al rango de trabajo y el preroll se descarta en la salida.
+    fn render_job(&self, output: PathBuf) -> RenderJob {
+        let mut clips = self.effective_clips();
+        let (mut skip, mut length) = (0.0, None);
         if self.export_range_only {
             if let Some((start, end)) = self.work_range() {
-                return trim_clips_to_range(&clips, start, end);
+                let (windowed, preroll) = montaje::window(&clips, start, end);
+                clips = windowed;
+                skip = preroll;
+                length = Some(end - start);
             }
         }
-        clips
+        RenderJob {
+            clips,
+            output,
+            fast: false,
+            size: self.export_size,
+            audio_only: self.export_format.is_audio_only(),
+            format: self.export_format,
+            track_gains: self.project.track_gains.clone(),
+            master_gain_db: self.project.master_gain_db,
+            normalize_loudness: self.project.normalize_loudness,
+            timebase: self.project.timebase(),
+            measured_loudness: self.current_loudness_measurement().cloned(),
+            hw: self.active_hw(),
+            skip,
+            length,
+            encode: self.encode_settings,
+        }
     }
 
     /// Sincroniza los ángulos de multicámara por audio: alinea cada clip de vídeo
@@ -6558,7 +6921,8 @@ impl NovaCutWindows {
         self.playback = None;
     }
 
-    /// Exporta el fotograma compuesto del cabezal como PNG.
+    /// Exporta el fotograma compuesto del cabezal como PNG, a la resolución
+    /// de exportación.
     fn export_frame(&mut self) {
         if !self.ffmpeg_ready || self.project.clips.is_empty() {
             self.status = "Importa clips antes de exportar un fotograma".to_owned();
@@ -6574,52 +6938,23 @@ impl NovaCutWindows {
         else {
             return;
         };
-        let prepared = prepare_render_clips(&self.effective_clips());
-        let mut command = Command::new(tool_path("ffmpeg.exe"));
-        command.args(["-v", "error", "-y"]);
-        let size = self.export_size;
         let timebase = self.project.timebase();
-        let (input_indices, is_title_input) =
-            push_render_inputs(&mut command, &prepared, size, self.use_proxies, timebase);
-        let Ok(filters) = build_render_filters(
-            &prepared,
-            &input_indices,
-            &is_title_input,
-            size,
-            true,
-            false,
-            &self.project.track_gains,
-            self.project.master_gain_db,
-            self.project.normalize_loudness,
-            timebase,
-            None,
-        ) else {
-            self.status = "No se pudo componer el fotograma".to_owned();
-            return;
+        let at = timebase.seconds(timebase.frames(
+            self.playhead
+                .clamp(0.0, (self.project.duration() - timebase.seconds(1)).max(0.0)),
+        ));
+        let (windowed, preroll) =
+            montaje::window(&self.effective_clips(), at, at + timebase.seconds(1));
+        let job = RenderJob {
+            clips: windowed,
+            skip: preroll,
+            length: None,
+            ..self.render_job(output.clone())
         };
-        // Recorta el montaje al instante del cabezal y saca un solo frame.
-        let clip = self.playhead.clamp(0.0, self.project.duration().max(0.001));
         let (sender, receiver) = mpsc::channel();
         self.frame_result = Some(receiver);
         std::thread::spawn(move || {
-            let result = command
-                .args(["-filter_complex", &filters.join(";")])
-                .args(["-map", "[vout]"])
-                .args(["-ss", &format_seconds(clip), "-frames:v", "1"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|error| format!("FFmpeg no esta disponible: {error}"))
-                .and_then(|out| {
-                    if out.status.success() {
-                        Ok(())
-                    } else {
-                        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
-                    }
-                })
-                .map(|()| output);
-            let _ = sender.send(result);
+            let _ = sender.send(render_still(&job).map(|()| output));
         });
     }
 
@@ -6732,9 +7067,7 @@ impl NovaCutWindows {
                     self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
                     return;
                 }
-                let speed = orig.speed.clamp(0.1, 8.0);
-                let start_min = (orig.timeline_start - orig.in_seconds / speed).max(0.0);
-                let max_start = (orig.timeline_start + orig.duration() - 0.04).max(start_min);
+                let (head_min, head_max, _, _) = montaje::edge_limits(&orig);
                 let new_start = snap_time(
                     self.quantize_time(target_time),
                     &before.clips,
@@ -6743,15 +7076,18 @@ impl NovaCutWindows {
                     self.playhead,
                     self.snap_tolerance(),
                 )
-                .clamp(start_min, max_start);
+                .clamp(
+                    orig.timeline_start + head_min,
+                    orig.timeline_start + head_max.max(head_min),
+                );
                 let delta_t = new_start - orig.timeline_start;
-                let clip_out = &mut self.project.clips[index];
-                clip_out.timeline_start = if ripple {
-                    orig.timeline_start
-                } else {
-                    new_start
+                let Some(mut trimmed) = montaje::retime(&orig, delta_t, 0.0) else {
+                    return;
                 };
-                clip_out.in_seconds = (orig.in_seconds + delta_t * speed).max(0.0);
+                if ripple {
+                    trimmed.timeline_start = orig.timeline_start;
+                }
+                self.project.clips[index] = trimmed;
                 if ripple {
                     let orig_end = orig.timeline_start + orig.duration();
                     for (other, baseline) in before.clips.iter().enumerate() {
@@ -6790,14 +7126,8 @@ impl NovaCutWindows {
                     self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
                     return;
                 }
-                let speed = orig.speed.clamp(0.1, 8.0);
-                let min_end = orig.timeline_start + 0.04;
-                let max_end = orig
-                    .source_duration_seconds
-                    .map(|duration| {
-                        orig.timeline_start + (duration - orig.in_seconds).max(0.04) / speed
-                    })
-                    .unwrap_or(f64::INFINITY);
+                let orig_end = orig.timeline_start + orig.duration();
+                let (_, _, tail_min, tail_max) = montaje::edge_limits(&orig);
                 let new_end = snap_time(
                     self.quantize_time(target_time),
                     &before.clips,
@@ -6806,10 +7136,11 @@ impl NovaCutWindows {
                     self.playhead,
                     self.snap_tolerance(),
                 )
-                .clamp(min_end, max_end.max(min_end));
-                let clip_out = &mut self.project.clips[index];
-                clip_out.in_seconds = orig.in_seconds;
-                clip_out.out_seconds = orig.in_seconds + (new_end - orig.timeline_start) * speed;
+                .clamp(orig_end + tail_min, orig_end + tail_max.max(tail_min));
+                let Some(trimmed) = montaje::retime(&orig, 0.0, new_end - orig_end) else {
+                    return;
+                };
+                self.project.clips[index] = trimmed;
                 if ripple {
                     let orig_end = orig.timeline_start + orig.duration();
                     let delta_t = new_end - orig_end;
@@ -6825,6 +7156,64 @@ impl NovaCutWindows {
                     }
                 }
                 self.request_preview();
+            }
+            Some(TimelineDragEvent::Tool(index, pointer)) => {
+                let Some((kind, before)) = self
+                    .drag_edit
+                    .as_ref()
+                    .filter(|state| state.0 == index)
+                    .map(|state| (state.1, &state.2))
+                else {
+                    return;
+                };
+                // Cada paso parte del estado al empezar el gesto: el delta es
+                // absoluto y no acumula errores de redondeo.
+                let mut clips = before.clips.clone();
+                let applied = match kind {
+                    DragKind::Roll { left, right, cut } => {
+                        let target = snap_time(
+                            self.quantize_time(pointer),
+                            &before.clips,
+                            Some(index),
+                            &before.markers,
+                            self.playhead,
+                            self.snap_tolerance(),
+                        );
+                        let locked = self.project.clip_locked(&before.clips[left])
+                            || self.project.clip_locked(&before.clips[right]);
+                        (!locked)
+                            .then(|| montaje::roll(&mut clips, left, right, target - cut))
+                            .flatten()
+                    }
+                    // Arrastrar a la derecha lleva el contenido a la derecha:
+                    // se ve material anterior, como en Premiere.
+                    DragKind::Slip { grab } => {
+                        montaje::slip(&mut clips[index], -self.quantize_time(pointer - grab))
+                    }
+                    DragKind::Slide { grab } => {
+                        let delta = self.quantize_time(pointer - grab);
+                        let neighbours_locked = clips.iter().any(|other| {
+                            other.track == clips[index].track
+                                && other.has_video == clips[index].has_video
+                                && self.project.clip_locked(other)
+                        });
+                        (!neighbours_locked)
+                            .then(|| montaje::slide(&mut clips, index, delta))
+                            .flatten()
+                    }
+                    _ => None,
+                };
+                match applied {
+                    Some(_) => {
+                        self.project.clips = clips;
+                        self.request_preview();
+                    }
+                    None => {
+                        self.status =
+                            "Ese clip no admite la edición (rampa, anidado o pista bloqueada)"
+                                .to_owned();
+                    }
+                }
             }
             Some(TimelineDragEvent::Commit(index)) => {
                 if let Some((active, kind, before)) = self.drag_edit.take() {
@@ -6921,6 +7310,9 @@ impl NovaCutWindows {
                             DragKind::RippleTrimStart | DragKind::RippleTrimEnd => {
                                 "Clip recortado con ripple".to_owned()
                             }
+                            DragKind::Roll { .. } => "Corte rodado".to_owned(),
+                            DragKind::Slip { .. } => "Contenido desplazado".to_owned(),
+                            DragKind::Slide { .. } => "Clip deslizado entre sus vecinos".to_owned(),
                             _ => "Clip recortado".to_owned(),
                         };
                     }
@@ -7735,6 +8127,580 @@ impl NovaCutWindows {
     }
 
     /// Fila de la biblioteca de medios: miniatura, nombre, duración y avisos.
+    /// Panel Proyecto: navegación por bins con sus medios y secuencias.
+    fn project_panel(&mut self, ui: &mut egui::Ui) {
+        let mut import = false;
+        let mut new_sequence = false;
+        let mut new_bin = false;
+        ui.horizontal_wrapped(|ui| {
+            import = ui
+                .small_button("+ Medios")
+                .on_hover_text("Añade archivos a este bin sin ponerlos en la secuencia")
+                .clicked();
+            new_sequence = ui
+                .small_button("+ Secuencia")
+                .on_hover_text("Crea una secuencia vacía en este bin y la abre")
+                .clicked();
+            new_bin = ui
+                .small_button("+ Bin")
+                .on_hover_text("Crea una carpeta dentro de este bin")
+                .clicked();
+        });
+        if import && self.ffmpeg_ready {
+            self.import_library_only = true;
+            self.import_media();
+            if self.import_result.is_none() {
+                self.import_library_only = false;
+            }
+        }
+        if new_sequence {
+            let before = self.project.clone();
+            let bin = self.project_bin.clone();
+            self.stop_playback();
+            self.project.new_sequence(&bin);
+            self.after_sequence_switch();
+            self.finish_edit(before);
+            self.status = format!("{} creada", self.project.sequence_name);
+        }
+        if new_bin {
+            let base = if self.project_bin.is_empty() {
+                "Bin nuevo".to_owned()
+            } else {
+                format!("{}/Bin nuevo", self.project_bin)
+            };
+            let name = (1..)
+                .map(|n| if n == 1 { base.clone() } else { format!("{base} {n}") })
+                .find(|name| !self.project.all_bins().contains(name))
+                .unwrap_or(base);
+            let before = self.project.clone();
+            if let Some(path) = self.project.add_bin(&name) {
+                self.finish_edit(before);
+                let leaf = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                self.project_rename = Some((ProjectItem::Bin(path), leaf));
+            }
+        }
+        ui.add(
+            egui::TextEdit::singleline(&mut self.media_filter)
+                .desired_width(ui.available_width())
+                .font(egui::TextStyle::Small)
+                .hint_text("Buscar en todo el proyecto…"),
+        );
+        let query = self.media_filter.trim().to_lowercase();
+        // Migas de pan del bin actual.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.project_bin.is_empty(), "Raíz")
+                .on_hover_text("Raíz del proyecto")
+                .clicked()
+            {
+                self.project_bin.clear();
+            }
+            let parts: Vec<String> = self.project_bin.split('/').map(str::to_owned).collect();
+            if !self.project_bin.is_empty() {
+                for depth in 0..parts.len() {
+                    ui.label(egui::RichText::new("›").color(theme::TEXT_FAINT));
+                    let path = parts[..=depth].join("/");
+                    if ui
+                        .selectable_label(depth + 1 == parts.len(), &parts[depth])
+                        .clicked()
+                    {
+                        self.project_bin = path;
+                    }
+                }
+            }
+        });
+        ui.add_space(2.0);
+        let bins = self.project.all_bins();
+        let current = self.project_bin.clone();
+        let searching = !query.is_empty();
+        let in_view = |bin: &str| {
+            if searching {
+                true
+            } else {
+                bin == current
+            }
+        };
+        let child_bins: Vec<String> = if searching {
+            bins.iter()
+                .filter(|bin| bin.to_lowercase().contains(&query))
+                .cloned()
+                .collect()
+        } else {
+            bins.iter()
+                .filter(|bin| {
+                    let parent = bin.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+                    parent == current
+                })
+                .cloned()
+                .collect()
+        };
+        // Secuencias visibles: la abierta y las guardadas.
+        let mut sequences: Vec<(u64, String, String, f64, bool)> = vec![(
+            self.project.sequence_id,
+            self.project.sequence_name.clone(),
+            self.project.sequence_bin.clone(),
+            self.project.duration(),
+            true,
+        )];
+        sequences.extend(self.project.sequences.iter().map(|sequence| {
+            (
+                sequence.id,
+                sequence.name.clone(),
+                sequence.bin.clone(),
+                sequence.data.duration(),
+                false,
+            )
+        }));
+        sequences.retain(|(_, name, bin, _, _)| {
+            in_view(bin) && (!searching || name.to_lowercase().contains(&query))
+        });
+        let media: Vec<usize> = self
+            .project
+            .library
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                in_view(&item.bin)
+                    && (!searching
+                        || item.clip.name().to_lowercase().contains(&query)
+                        || item.clip.path.to_string_lossy().to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut open_bin: Option<String> = None;
+        let mut move_media: Option<(usize, String)> = None;
+        let mut move_sequence: Option<(u64, String)> = None;
+        let mut open_sequence: Option<u64> = None;
+        let mut duplicate: Option<u64> = None;
+        let mut delete_sequence: Option<u64> = None;
+        let mut nest: Option<u64> = None;
+        let mut delete_bin: Option<String> = None;
+        let mut remove_media: Option<usize> = None;
+        let mut source: Option<RoughClip> = None;
+        let mut rename_done: Option<(ProjectItem, String)> = None;
+        let mut rename_cancel = false;
+        let mut start_rename: Option<(ProjectItem, String)> = None;
+        let row_height = 30.0;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Nombre editable en línea para el elemento que se renombra.
+            let mut rename_field = |ui: &mut egui::Ui, item: &ProjectItem| -> bool {
+                let Some((target, text)) = self.project_rename.as_mut() else {
+                    return false;
+                };
+                if target != item {
+                    return false;
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(text).desired_width(ui.available_width()),
+                );
+                response.request_focus();
+                if response.lost_focus() {
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        rename_cancel = true;
+                    } else {
+                        rename_done = Some((item.clone(), text.clone()));
+                    }
+                }
+                true
+            };
+            let row = |ui: &mut egui::Ui, icon: &str, name: &str, detail: &str, active: bool| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter();
+                let fill = if active {
+                    theme::ACCENT_SOFT
+                } else if response.hovered() {
+                    theme::CARD_HOVER
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                painter.rect_filled(rect, 4.0, fill);
+                painter.text(
+                    egui::pos2(rect.left() + 6.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    icon,
+                    egui::FontId::proportional(13.0),
+                    theme::TEXT_DIM,
+                );
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    name.to_owned(),
+                    egui::FontId::proportional(12.0),
+                    if active { theme::ACCENT } else { theme::TEXT },
+                );
+                job.wrap.max_width = (rect.width() - 90.0).max(20.0);
+                job.wrap.max_rows = 1;
+                painter.galley(
+                    egui::pos2(rect.left() + 26.0, rect.center().y - 8.0),
+                    painter.layout_job(job),
+                    theme::TEXT,
+                );
+                painter.text(
+                    egui::pos2(rect.right() - 6.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    detail,
+                    egui::FontId::monospace(10.5),
+                    theme::TEXT_FAINT,
+                );
+                response
+            };
+            for bin in &child_bins {
+                let item = ProjectItem::Bin(bin.clone());
+                if rename_field(ui, &item) {
+                    continue;
+                }
+                let label = if searching {
+                    bin.clone()
+                } else {
+                    bin.rsplit('/').next().unwrap_or(bin).to_owned()
+                };
+                let response = row(ui, "▸", &label, "bin", false)
+                    .on_hover_text("Doble clic: abrir · Suelta aquí medios o secuencias para moverlos");
+                if response.double_clicked() {
+                    open_bin = Some(bin.clone());
+                }
+                if let Some(payload) = response.dnd_release_payload::<LibraryPayload>() {
+                    move_media = Some((payload.0, bin.clone()));
+                }
+                if let Some(payload) = response.dnd_release_payload::<SequencePayload>() {
+                    move_sequence = Some((payload.0, bin.clone()));
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Abrir").clicked() {
+                        open_bin = Some(bin.clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Renombrar").clicked() {
+                        let leaf = bin.rsplit('/').next().unwrap_or(bin).to_owned();
+                        start_rename = Some((ProjectItem::Bin(bin.clone()), leaf));
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Eliminar bin")
+                        .on_hover_text("Su contenido pasa al bin superior; no se borra nada")
+                        .clicked()
+                    {
+                        delete_bin = Some(bin.clone());
+                        ui.close_menu();
+                    }
+                });
+            }
+            for (id, name, _bin, duration, active) in &sequences {
+                let item = ProjectItem::Sequence(*id);
+                if rename_field(ui, &item) {
+                    continue;
+                }
+                let response = row(ui, "▤", name, &format_clock(*duration), *active).on_hover_text(
+                    if *active {
+                        "Secuencia abierta · clic derecho: más opciones"
+                    } else {
+                        "Doble clic: abrir · Arrastra a la timeline para anidarla"
+                    },
+                );
+                if response.double_clicked() && !*active {
+                    open_sequence = Some(*id);
+                }
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), SequencePayload(*id));
+                }
+                response.context_menu(|ui| {
+                    if !*active && ui.button("Abrir").clicked() {
+                        open_sequence = Some(*id);
+                        ui.close_menu();
+                    }
+                    if !*active
+                        && ui
+                            .button("Anidar en el cabezal")
+                            .on_hover_text("Coloca una copia de esta secuencia como clip anidado en la abierta")
+                            .clicked()
+                    {
+                        nest = Some(*id);
+                        ui.close_menu();
+                    }
+                    if ui.button("Renombrar").clicked() {
+                        start_rename = Some((ProjectItem::Sequence(*id), name.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Duplicar").clicked() {
+                        duplicate = Some(*id);
+                        ui.close_menu();
+                    }
+                    ui.menu_button("Mover a", |ui| {
+                        for target in std::iter::once(String::new()).chain(bins.iter().cloned()) {
+                            let label = if target.is_empty() { "Proyecto (raíz)".to_owned() } else { target.clone() };
+                            if ui.button(label).clicked() {
+                                move_sequence = Some((*id, target));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    if !*active && ui.button("Eliminar").clicked() {
+                        delete_sequence = Some(*id);
+                        ui.close_menu();
+                    }
+                });
+            }
+            for index in &media {
+                let item = &self.project.library[*index];
+                let offline = !self.media_file_status.is_file(&item.clip.path);
+                let name = item.clip.name();
+                let detail = if offline {
+                    "OFFLINE".to_owned()
+                } else {
+                    format_clock(item.clip.source_duration_seconds.unwrap_or(item.clip.out_seconds))
+                };
+                let icon = if !item.clip.has_video { "♪" } else { "▶" };
+                let clip = item.clip.clone();
+                let response = row(ui, icon, &name, &detail, false).on_hover_text(format!(
+                    "{}\nDoble clic: monitor de fuente · Arrastra a la timeline o a un bin",
+                    clip.path.display()
+                ));
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), LibraryPayload(*index));
+                }
+                if response.double_clicked() {
+                    source = Some(clip.clone());
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Abrir en el monitor de fuente").clicked() {
+                        source = Some(clip.clone());
+                        ui.close_menu();
+                    }
+                    ui.menu_button("Mover a", |ui| {
+                        for target in std::iter::once(String::new()).chain(bins.iter().cloned()) {
+                            let label = if target.is_empty() { "Proyecto (raíz)".to_owned() } else { target.clone() };
+                            if ui.button(label).clicked() {
+                                move_media = Some((*index, target));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    if ui
+                        .button("Quitar del proyecto")
+                        .on_hover_text("Solo si ninguna secuencia lo usa; el archivo no se borra")
+                        .clicked()
+                    {
+                        remove_media = Some(*index);
+                        ui.close_menu();
+                    }
+                });
+            }
+            if child_bins.is_empty() && sequences.is_empty() && media.is_empty() {
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(if searching {
+                            "Nada coincide con la búsqueda"
+                        } else {
+                            "Bin vacío: arrastra aquí medios o usa + Medios"
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_FAINT),
+                    );
+                });
+            }
+        });
+        if rename_cancel {
+            self.project_rename = None;
+        }
+        if start_rename.is_some() {
+            self.project_rename = start_rename;
+        }
+        if let Some((item, text)) = rename_done {
+            self.project_rename = None;
+            let before = self.project.clone();
+            match item {
+                ProjectItem::Sequence(id) => self.project.rename_sequence(id, &text),
+                ProjectItem::Bin(path) => {
+                    let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+                    let leaf = proyecto::clean_bin(&text.replace('/', "-"));
+                    if !leaf.is_empty() {
+                        let target = match parent {
+                            Some(parent) => format!("{parent}/{leaf}"),
+                            None => leaf,
+                        };
+                        self.project.rename_bin(&path, &target);
+                        if proyecto::is_inside(&self.project_bin, &path) && !self.project_bin.is_empty() {
+                            self.project_bin = self.project_bin.replacen(&path, &target, 1);
+                        }
+                    }
+                }
+            }
+            self.finish_edit(before);
+        }
+        if let Some(bin) = open_bin {
+            self.project_bin = bin;
+            self.media_filter.clear();
+        }
+        let edit = |app: &mut Self, change: &dyn Fn(&mut RoughProject), message: String| {
+            let before = app.project.clone();
+            change(&mut app.project);
+            app.finish_edit(before);
+            app.status = message;
+        };
+        if let Some((index, bin)) = move_media {
+            edit(self, &|project| {
+                if let Some(item) = project.library.get_mut(index) {
+                    item.bin = bin.clone();
+                }
+            }, "Medio movido de bin".to_owned());
+        }
+        if let Some((id, bin)) = move_sequence {
+            edit(self, &|project| {
+                if project.sequence_id == id {
+                    project.sequence_bin = bin.clone();
+                } else if let Some(sequence) = project.sequences.iter_mut().find(|sequence| sequence.id == id) {
+                    sequence.bin = bin.clone();
+                }
+            }, "Secuencia movida de bin".to_owned());
+        }
+        if let Some(bin) = delete_bin {
+            edit(self, &|project| project.delete_bin(&bin), "Bin eliminado; su contenido subió un nivel".to_owned());
+            if proyecto::is_inside(&self.project_bin, &bin) {
+                self.project_bin = bin.rsplit_once('/').map(|(parent, _)| parent.to_owned()).unwrap_or_default();
+            }
+        }
+        if let Some(id) = duplicate {
+            edit(self, &|project| {
+                project.duplicate_sequence(id);
+            }, "Secuencia duplicada".to_owned());
+        }
+        if let Some(id) = delete_sequence {
+            edit(self, &|project| {
+                project.delete_sequence(id);
+            }, "Secuencia eliminada (Ctrl+Z la recupera)".to_owned());
+        }
+        if let Some(index) = remove_media {
+            let path = self.project.library[index].clip.path.clone();
+            if self.project.media_in_use(&path) {
+                self.status = "Ese medio se usa en alguna secuencia; quítalo de ellas primero".to_owned();
+            } else {
+                edit(self, &|project| {
+                    project.library.remove(index);
+                }, "Medio quitado del proyecto".to_owned());
+            }
+        }
+        if let Some(id) = open_sequence {
+            self.switch_sequence(id);
+        }
+        if let Some(id) = nest {
+            self.nest_sequence_at_playhead(id);
+        }
+        if let Some(clip) = source {
+            self.open_source_clip(clip);
+        }
+    }
+
+    /// Analiza en segundo plano el movimiento del clip seleccionado para el
+    /// estabilizador de deformación.
+    fn start_stabilization(&mut self) {
+        if self.stabilization.is_some() || !estabilizar::vidstab_available() {
+            return;
+        }
+        let Some(clip) = self.selected.and_then(|index| self.project.clips.get(index)).cloned() else {
+            return;
+        };
+        if !estabilizar::wants_warp(&clip) || estabilizar::ready(&clip) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.stabilization = Some((estabilizar::analysis_path(&clip), receiver));
+        self.status = format!("Analizando el movimiento de {}…", clip.name());
+        std::thread::spawn(move || {
+            let _ = sender.send(estabilizar::analyze(&clip));
+        });
+    }
+
+    fn poll_stabilization(&mut self) {
+        let Some((_, receiver)) = &self.stabilization else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.stabilization = None;
+            self.status = match result {
+                Ok(_) => "Análisis de estabilización listo".to_owned(),
+                Err(error) => format!("No se pudo analizar el movimiento: {error}"),
+            };
+            self.request_preview();
+        }
+    }
+
+    /// «Igualar color»: corrige el clip `target` para parecerse a `reference`.
+    fn match_color(&mut self, target: usize, reference: usize) {
+        let (Some(target_clip), Some(reference_clip)) = (
+            self.project.clips.get(target).cloned(),
+            self.project.clips.get(reference).cloned(),
+        ) else {
+            return;
+        };
+        match compute_color_match(&target_clip, &reference_clip, self.project.timebase()) {
+            Ok(matched) => {
+                let before = self.project.clone();
+                self.project.clips[target].fx.color_match = Some(matched);
+                self.finish_edit(before);
+                self.request_preview();
+                self.status = format!("Color igualado a «{}»", reference_clip.name());
+            }
+            Err(error) => self.status = format!("No se pudo igualar el color: {error}"),
+        }
+    }
+
+    /// Abre otra secuencia del proyecto.
+    fn switch_sequence(&mut self, id: u64) {
+        self.flush_pending_edit();
+        self.stop_playback();
+        let before = self.project.clone();
+        if self.project.open_sequence(id) {
+            self.after_sequence_switch();
+            self.finish_edit(before);
+            self.status = format!("Secuencia abierta: {}", self.project.sequence_name);
+        }
+    }
+
+    /// Estado de la vista que depende de la secuencia abierta.
+    fn after_sequence_switch(&mut self) {
+        self.clear_selection();
+        self.playhead = 0.0;
+        self.work_in = None;
+        self.work_out = None;
+        self.transcript_selection = None;
+        self.zoom = 1.0;
+        self.hscroll = 0.0;
+        self.preview_texture = None;
+        self.request_preview();
+    }
+
+    /// Copia de la secuencia `id` como clip anidado en el cabezal, en la
+    /// pista de vídeo más alta libre.
+    fn nest_sequence_at_playhead(&mut self, id: u64) {
+        let Some(mut clip) = self.project.sequence_as_nested(id) else {
+            self.status = "Esa secuencia está vacía".to_owned();
+            return;
+        };
+        let start = self.playhead;
+        let end = start + clip.duration();
+        let track = (0..16)
+            .find(|track| {
+                !self.project.lane_locked(*track, true)
+                    && !self.project.clips.iter().any(|other| {
+                        other.has_video
+                            && other.track == *track
+                            && other.timeline_start < end - 0.001
+                            && other.timeline_start + other.duration() > start + 0.001
+                    })
+            })
+            .unwrap_or(0);
+        clip.timeline_start = start;
+        clip.track = track;
+        let before = self.project.clone();
+        self.project.clips.push(clip);
+        self.select_only(self.project.clips.len() - 1);
+        self.finish_edit(before);
+        self.status = format!("Secuencia anidada en V{}", track + 1);
+    }
+
     fn draw_media_row(&mut self, ui: &mut egui::Ui, row: &media_browser::Row) {
         let index = self
             .selected
@@ -7956,6 +8922,400 @@ impl NovaCutWindows {
     }
 
     /// Hoja de atajos, equivalente al menú de teclado de la app macOS.
+    /// Panel de exportación: preajustes, formato, calidad, audio, destino y
+    /// las dos salidas (exportar ahora o añadir a la cola).
+    fn show_export_window(&mut self, context: &egui::Context) {
+        if !self.show_export {
+            return;
+        }
+        let mut open = true;
+        let mut export_now = false;
+        let mut add_to_queue = false;
+        let mut choose_target = false;
+        let format_before = self.export_format;
+        egui::Window::new("Exportar")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                theme::section_label(ui, "Preajustes");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in &exportacion::PRESETS {
+                        let format = ExportFormat::from_code(preset.format);
+                        let active = self.export_format == format
+                            && (format.is_audio_only() || self.export_size == preset.size)
+                            && self.encode_settings == preset.settings;
+                        if ui
+                            .selectable_label(active, preset.name)
+                            .on_hover_text(preset.hint)
+                            .clicked()
+                        {
+                            self.export_format = format;
+                            if !format.is_audio_only() {
+                                self.export_size = preset.size;
+                            }
+                            self.encode_settings = preset.settings;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                theme::section_label(ui, "Ajustes");
+                let audio_only = self.export_format.is_audio_only();
+                egui::Grid::new("export-settings")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Formato");
+                        egui::ComboBox::from_id_salt("export-window-format")
+                            .width(220.0)
+                            .selected_text(self.export_format.label())
+                            .show_ui(ui, |ui| {
+                                for format in ExportFormat::ALL {
+                                    ui.selectable_value(&mut self.export_format, format, format.label());
+                                }
+                            });
+                        ui.end_row();
+                        if !audio_only {
+                            ui.label("Tamaño");
+                            egui::ComboBox::from_id_salt("export-window-size")
+                                .width(220.0)
+                                .selected_text(format!("{}×{}", self.export_size.0, self.export_size.1))
+                                .show_ui(ui, |ui| {
+                                    for (size, name) in [
+                                        ((854, 480), "480p · 854×480"),
+                                        ((1280, 720), "720p · 1280×720"),
+                                        ((1920, 1080), "1080p · 1920×1080"),
+                                        ((2560, 1440), "1440p · 2560×1440"),
+                                        ((3840, 2160), "4K · 3840×2160"),
+                                        ((1080, 1920), "Vertical · 1080×1920"),
+                                        ((1080, 1350), "Retrato 4:5 · 1080×1350"),
+                                        ((1080, 1080), "Cuadrado · 1080×1080"),
+                                    ] {
+                                        ui.selectable_value(&mut self.export_size, size, name);
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Calidad");
+                            ui.vertical(|ui| {
+                                let mut by_bitrate = self.encode_settings.bitrate_mbps.is_some();
+                                ui.horizontal_wrapped(|ui| {
+                                    for quality in exportacion::Quality::ALL {
+                                        let chosen = !by_bitrate && self.encode_settings.quality == quality;
+                                        if ui
+                                            .selectable_label(chosen, quality.label())
+                                            .on_hover_text(quality.hint())
+                                            .clicked()
+                                        {
+                                            self.encode_settings.quality = quality;
+                                            self.encode_settings.bitrate_mbps = None;
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .checkbox(&mut by_bitrate, "Bitrate objetivo")
+                                        .on_hover_text("Tamaño previsible en vez de calidad constante: lo que piden algunas plataformas y emisoras")
+                                        .changed()
+                                    {
+                                        self.encode_settings.bitrate_mbps = by_bitrate.then_some(16.0);
+                                    }
+                                    if let Some(mbps) = self.encode_settings.bitrate_mbps.as_mut() {
+                                        ui.add(
+                                            egui::DragValue::new(mbps)
+                                                .speed(0.25)
+                                                .range(0.5..=400.0)
+                                                .max_decimals(1)
+                                                .suffix(" Mbps"),
+                                        );
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                        }
+                        let compressed_audio = matches!(
+                            self.export_format,
+                            ExportFormat::Mp4Video
+                                | ExportFormat::Mp4Hevc
+                                | ExportFormat::Mp3Audio
+                                | ExportFormat::WebmVp9
+                        );
+                        if compressed_audio {
+                            ui.label("Audio");
+                            egui::ComboBox::from_id_salt("export-window-audio")
+                                .width(120.0)
+                                .selected_text(format!("{} kbps", self.encode_settings.audio_kbps))
+                                .show_ui(ui, |ui| {
+                                    for kbps in exportacion::AUDIO_KBPS {
+                                        ui.selectable_value(
+                                            &mut self.encode_settings.audio_kbps,
+                                            kbps,
+                                            format!("{kbps} kbps"),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                        if let Some(backend) = self.hw_backends.first().copied() {
+                            if matches!(self.export_format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc) {
+                                ui.label("Aceleración");
+                                ui.checkbox(
+                                    &mut self.hardware_encoding,
+                                    format!("Codificar con {}", backend.label()),
+                                )
+                                .on_hover_text("Varias veces más rápido; si la GPU falla se repite con CPU");
+                                ui.end_row();
+                            }
+                        }
+                        ui.label("Duración");
+                        ui.horizontal(|ui| {
+                            let range = self.work_range();
+                            ui.add_enabled_ui(range.is_some(), |ui| {
+                                ui.checkbox(&mut self.export_range_only, "Solo el rango I–O")
+                                    .on_disabled_hover_text("Marca entrada (I) y salida (O) en la timeline");
+                            });
+                            let seconds = match range {
+                                Some((start, end)) if self.export_range_only => end - start,
+                                _ => self.project.duration(),
+                            };
+                            let size = exportacion::estimated_megabytes(
+                                &self.encode_settings,
+                                seconds,
+                                !audio_only,
+                            )
+                            .filter(|_| self.export_format != ExportFormat::MovProRes)
+                            .map(|mb| format!(" · ≈ {mb:.0} MB"))
+                            .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!("{}{size}", format_clock(seconds)))
+                                    .monospace()
+                                    .color(theme::TEXT_DIM),
+                            );
+                        });
+                        ui.end_row();
+                        ui.label("Destino");
+                        ui.horizontal(|ui| {
+                            let shown = self
+                                .export_target
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "Sin elegir".to_owned());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(shown).color(theme::TEXT_DIM))
+                                    .truncate(),
+                            );
+                            if ui.button("Elegir…").clicked() {
+                                choose_target = true;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let busy = self.export_result.is_some();
+                    let now = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if busy { "Exportar después" } else { "Exportar ahora" })
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(8, 24, 27)),
+                            )
+                            .fill(theme::ACCENT),
+                        )
+                        .on_hover_text(if busy {
+                            "Hay una exportación en marcha: esta empezará al terminar"
+                        } else {
+                            "Empieza a exportar ya"
+                        });
+                    export_now = now.clicked();
+                    add_to_queue = ui
+                        .button("Añadir a la cola")
+                        .on_hover_text("Guarda una copia de estos ajustes y del montaje para exportar luego")
+                        .clicked();
+                });
+            });
+        // Cambiar de formato cambia la extensión del destino elegido.
+        if self.export_format != format_before {
+            if let Some(target) = self.export_target.as_mut() {
+                target.set_extension(self.export_format.extension());
+            }
+        }
+        if choose_target || ((export_now || add_to_queue) && self.export_target.is_none()) {
+            let mut dialog = FileDialog::new()
+                .add_filter(self.export_format.label(), &[self.export_format.extension()])
+                .set_file_name(self.suggested_export_name());
+            if let Some(folder) = self.export_target.as_ref().and_then(|path| path.parent()) {
+                dialog = dialog.set_directory(folder);
+            }
+            match dialog.save_file() {
+                Some(path) => self.export_target = Some(path),
+                None => {
+                    export_now = false;
+                    add_to_queue = false;
+                }
+            }
+        }
+        if let (true, Some(target)) = (export_now || add_to_queue, self.export_target.clone()) {
+            if self.enqueue_export(target) {
+                self.show_export = false;
+                // Cada trabajo necesita su archivo: el siguiente se elige de nuevo.
+                self.export_target = None;
+                if export_now {
+                    self.pump_queue();
+                } else {
+                    self.show_queue = true;
+                    self.status = "Añadido a la cola de exportación".to_owned();
+                }
+            }
+        }
+        if !open {
+            self.show_export = false;
+        }
+    }
+
+    /// Cola de exportación: progreso, cancelar, quitar y abrir la carpeta.
+    fn show_queue_window(&mut self, context: &egui::Context) {
+        if !self.show_queue {
+            return;
+        }
+        let mut open = true;
+        let mut remove: Option<u64> = None;
+        let mut retry: Option<u64> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let mut cancel_running = false;
+        let mut start = false;
+        let (pct, eta) = self
+            .render_progress
+            .lock()
+            .map(|state| (state.pct as f32, state.eta_secs))
+            .unwrap_or((0.0, 0.0));
+        egui::Window::new("Cola de exportación")
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(true)
+            .default_width(520.0)
+            .show(context, |ui| {
+                if self.export_queue.is_empty() {
+                    ui.label("No hay trabajos. Añádelos desde Exportar (Ctrl+M).");
+                    return;
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for item in &self.export_queue {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            let name = item
+                                .job
+                                .output
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("exportación");
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(name).strong());
+                                ui.label(egui::RichText::new(&item.summary).color(theme::TEXT_DIM));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                match &item.state {
+                                    JobState::Waiting => {
+                                        ui.label("En espera");
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Running => {
+                                        ui.add(
+                                            egui::ProgressBar::new(pct)
+                                                .desired_width(220.0)
+                                                .show_percentage(),
+                                        );
+                                        if eta > 1.0 {
+                                            ui.label(format!("quedan {}", format_clock(eta)));
+                                        }
+                                        if ui.small_button("Cancelar").clicked() {
+                                            cancel_running = true;
+                                        }
+                                    }
+                                    JobState::Done => {
+                                        ui.label(egui::RichText::new("Terminado").color(theme::ACCENT));
+                                        if ui.small_button("Mostrar en carpeta").clicked() {
+                                            reveal = Some(item.job.output.clone());
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Failed(error) => {
+                                        ui.label(egui::RichText::new("Falló").color(theme::DANGER))
+                                            .on_hover_text(error);
+                                        if ui.small_button("Reintentar").clicked() {
+                                            retry = Some(item.id);
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Cancelled => {
+                                        ui.label("Cancelado");
+                                        if ui.small_button("Reintentar").clicked() {
+                                            retry = Some(item.id);
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let waiting = self
+                        .export_queue
+                        .iter()
+                        .any(|item| item.state == JobState::Waiting);
+                    if ui
+                        .add_enabled(
+                            waiting && self.export_result.is_none(),
+                            egui::Button::new("Iniciar cola"),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if ui
+                        .button("Limpiar terminados")
+                        .on_hover_text("Quita de la lista lo terminado, fallido o cancelado")
+                        .clicked()
+                    {
+                        self.export_queue
+                            .retain(|item| matches!(item.state, JobState::Waiting | JobState::Running));
+                    }
+                });
+            });
+        if let Some(id) = remove {
+            self.export_queue.retain(|item| item.id != id);
+        }
+        if let Some(item) = retry.and_then(|id| self.export_queue.iter_mut().find(|item| item.id == id)) {
+            item.state = JobState::Waiting;
+            start = true;
+        }
+        if cancel_running {
+            if let Some(cancel) = &self.export_cancel {
+                cancel.store(true, Ordering::Relaxed);
+                self.status = "Cancelando exportación...".to_owned();
+            }
+        }
+        if start {
+            self.pump_queue();
+        }
+        if let Some(path) = reveal {
+            reveal_in_file_manager(&path);
+        }
+        if !open {
+            self.show_queue = false;
+        }
+    }
+
     fn show_shortcuts_window(&mut self, context: &egui::Context) {
         if !self.show_shortcuts {
             return;
@@ -7971,9 +9331,10 @@ impl NovaCutWindows {
                     (
                         "Reproducción",
                         &[
-                            ("Espacio / L", "Reproducir / detener"),
+                            ("Espacio", "Reproducir / detener"),
+                            ("L / J", "Adelante / atrás; repetir acelera hasta 8×"),
                             ("K", "Detener la reproducción"),
-                            ("J", "Corte anterior"),
+                            ("K + L / K + J", "Un fotograma adelante / atrás"),
                             ("← →", "Un fotograma atrás / adelante"),
                             ("Mayús + ← →", "Un segundo atrás / adelante"),
                             ("↑ ↓", "Corte anterior / siguiente"),
@@ -7990,6 +9351,9 @@ impl NovaCutWindows {
                             ("C", "Tijeras: partir donde pulses"),
                             ("R", "Recortar desde cualquier mitad del clip"),
                             ("T", "Recorte ripple que cierra el montaje"),
+                            ("N", "Rodar: mover un corte entre dos clips"),
+                            ("Y", "Desplazar el contenido sin mover el clip"),
+                            ("Mayús+Y", "Deslizar el clip entre sus vecinos"),
                             ("H", "Mano: desplazar la timeline"),
                             ("Z / Mayús+clic", "Acercar / alejar con Zoom"),
                             ("G", "Varita: escenas o silencios"),
@@ -8015,7 +9379,8 @@ impl NovaCutWindows {
                             ("D", "Activar o desactivar los clips marcados"),
                             ("Supr", "Quitar dejando hueco"),
                             ("Mayús + Supr", "Quitar y cerrar hueco"),
-                            ("Q / W", "Recortar entrada / salida al cabezal"),
+                            ("Q / W", "Recortar entrada / salida al cabezal (ripple)"),
+                            ("; / '", "Levantar / extraer el rango I–O"),
                             ("E", "Extender el borde más cercano"),
                             ("F", "Match frame: clip bajo el cabezal"),
                             ("Ctrl + ← →", "Mover los clips un fotograma"),
@@ -8042,7 +9407,7 @@ impl NovaCutWindows {
                             ("Alt+↑ / ↓", "Pistas más altas / bajas"),
                             ("Ctrl+S", "Guardar"),
                             ("Ctrl+O / Ctrl+I", "Abrir / importar"),
-                            ("Ctrl+Mayús+E", "Exportar"),
+                            ("Ctrl+M o Ctrl+Mayús+E", "Exportar: preajustes, calidad y cola"),
                             (
                                 "Ctrl+Z / Ctrl+Y",
                                 "Deshacer / rehacer (también Ctrl+Mayús+Z)",
@@ -8456,16 +9821,11 @@ impl NovaCutWindows {
         // De mayor a menor para que las inserciones no muevan los índices
         // pendientes.
         for index in targets.iter().rev() {
-            let clip = self.project.clips[*index].clone();
-            let local = playhead - clip.timeline_start;
-            let source_split = clip.in_seconds + local * clip.speed.clamp(0.1, 8.0);
-            let mut right = clip.clone();
-            self.project.clips[*index].out_seconds = source_split;
-            self.project.clips[*index].fade_out_seconds = 0.0;
-            right.in_seconds = source_split;
-            right.timeline_start = playhead;
-            right.fade_in_seconds = 0.0;
-            right.transition = None;
+            let clip = &self.project.clips[*index];
+            let Some((left, right)) = montaje::split(clip, playhead - clip.timeline_start) else {
+                continue;
+            };
+            self.project.clips[*index] = left;
             self.project.clips.insert(index + 1, right);
         }
         self.clear_selection();
@@ -8576,10 +9936,79 @@ impl NovaCutWindows {
         self.batch_state.paste = Some((indices, self.document_generation, source));
     }
 
-    /// Recorta el borde indicado del clip seleccionado hasta el cabezal (Q/W).
+    /// Levantar (`;`) deja hueco; Extraer (`'`) lo cierra. Actúan sobre el
+    /// rango de entrada/salida en todas las pistas no bloqueadas.
+    fn lift_or_extract(&mut self, extract: bool) {
+        if self.work_in.is_none() || self.work_out.is_none() {
+            self.status = "Marca entrada (I) y salida (O) antes de levantar o extraer".to_owned();
+            return;
+        }
+        let Some((start, end)) = self.work_range() else {
+            return;
+        };
+        let project = &self.project;
+        let editable = |clip: &RoughClip| !project.clip_locked(clip);
+        let result = if extract {
+            // Extraer desplaza todo lo posterior: una pista bloqueada con
+            // material después del rango se desincronizaría.
+            let blocked = self.project.clips.iter().any(|clip| {
+                self.project.clip_locked(clip) && clip.timeline_start + clip.duration() > start
+            });
+            if blocked {
+                Err("Hay pistas bloqueadas con material después de la entrada".to_owned())
+            } else {
+                transcripcion::extract_ranges(&self.project.clips, &[(start, end)])
+            }
+        } else {
+            montaje::lift(&self.project.clips, start, end, editable)
+        };
+        match result {
+            Ok(clips) => {
+                let before = self.project.clone();
+                self.project.clips = clips;
+                self.clear_selection();
+                if extract {
+                    self.work_in = None;
+                    self.work_out = None;
+                    self.playhead = start;
+                }
+                self.finish_edit(before);
+                self.request_preview();
+                self.status = format!(
+                    "{} {} del montaje",
+                    if extract { "Extraído" } else { "Levantado" },
+                    format_clock(end - start)
+                );
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Clip sobre el que actúan Q/W: el seleccionado o, sin selección, el de
+    /// la pista de vídeo más alta bajo el cabezal.
+    fn edit_target(&self) -> Option<usize> {
+        self.selected
+            .filter(|index| *index < self.project.clips.len())
+            .or_else(|| {
+                self.project
+                    .clips
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, clip)| {
+                        self.playhead > clip.timeline_start
+                            && self.playhead < clip.timeline_start + clip.duration()
+                            && !self.project.clip_locked(clip)
+                    })
+                    .max_by_key(|(_, clip)| (clip.has_video, clip.track))
+                    .map(|(index, _)| index)
+            })
+    }
+
+    /// Q / W de Premiere: recorta la entrada (o la salida) del clip hasta el
+    /// cabezal y cierra el hueco desplazando lo que venga detrás en su pista.
     fn trim_to_playhead(&mut self, start_edge: bool) {
-        let Some(index) = self.selected.filter(|i| *i < self.project.clips.len()) else {
-            self.status = "Selecciona un clip para recortarlo".to_owned();
+        let Some(index) = self.edit_target() else {
+            self.status = "Selecciona un clip o pon el cabezal encima de uno".to_owned();
             return;
         };
         let clip = self.project.clips[index].clone();
@@ -8587,36 +10016,47 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        if clip
-            .speed_ramp
-            .as_ref()
-            .is_some_and(|points| !points.is_empty())
-        {
-            self.status = "Desanida o quita la rampa antes de recortar".to_owned();
-            return;
-        }
         let end = clip.timeline_start + clip.duration();
-        if self.playhead <= clip.timeline_start + 0.04 || self.playhead >= end - 0.04 {
+        if self.playhead <= clip.timeline_start + montaje::MIN_CLIP
+            || self.playhead >= end - montaje::MIN_CLIP
+        {
             self.status = "Coloca el cabezal dentro del clip para recortarlo".to_owned();
             return;
         }
-        let speed = clip.speed.clamp(0.1, 8.0);
-        let before = self.project.clone();
-        if start_edge {
-            let delta = self.playhead - clip.timeline_start;
-            let target = &mut self.project.clips[index];
-            target.timeline_start = self.playhead;
-            target.in_seconds = (clip.in_seconds + delta * speed).max(0.0);
+        let (head, tail) = if start_edge {
+            (self.playhead - clip.timeline_start, 0.0)
         } else {
-            let target = &mut self.project.clips[index];
-            target.out_seconds = clip.in_seconds + (self.playhead - clip.timeline_start) * speed;
+            (0.0, self.playhead - end)
+        };
+        let Some(mut trimmed) = montaje::retime(&clip, head, tail) else {
+            self.status = "Desanida o quita la rampa antes de recortar".to_owned();
+            return;
+        };
+        let before = self.project.clone();
+        // Ripple: el clip conserva su inicio y lo posterior de su pista se
+        // acerca lo mismo que se ha quitado.
+        let removed = head - tail;
+        trimmed.timeline_start = clip.timeline_start;
+        self.project.clips[index] = trimmed;
+        for (other, baseline) in before.clips.iter().enumerate() {
+            if other != index
+                && baseline.track == clip.track
+                && baseline.has_video == clip.has_video
+                && baseline.timeline_start >= end - 0.001
+            {
+                self.project.clips[other].timeline_start =
+                    (baseline.timeline_start - removed).max(0.0);
+            }
+        }
+        if start_edge {
+            self.playhead = clip.timeline_start;
         }
         self.finish_edit(before);
         self.request_preview();
         self.status = if start_edge {
-            "Entrada recortada al cabezal".to_owned()
+            "Entrada recortada al cabezal (ripple)".to_owned()
         } else {
-            "Salida recortada al cabezal".to_owned()
+            "Salida recortada al cabezal (ripple)".to_owned()
         };
     }
 
@@ -8631,49 +10071,44 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        if clip.nested.is_some()
-            || clip
-                .speed_ramp
-                .as_ref()
-                .is_some_and(|points| !points.is_empty())
-        {
+        if montaje::is_complex(&clip) {
             self.status = "Desanida o quita la rampa antes de extender".to_owned();
             return;
         }
-        let speed = clip.speed.clamp(0.1, 8.0);
         let end = clip.timeline_start + clip.duration();
-        let before = self.project.clone();
-        if self.playhead > end {
-            let source_end = clip
-                .source_duration_seconds
-                .unwrap_or(clip.out_seconds)
-                .max(clip.out_seconds);
-            let requested = clip.in_seconds + (self.playhead - clip.timeline_start) * speed;
-            if requested > source_end + 0.001 {
+        let (head_min, _, _, tail_max) = montaje::edge_limits(&clip);
+        let (head, tail, status) = if self.playhead > end {
+            if tail_max <= 0.001 {
                 self.status = "No queda más material en el archivo fuente".to_owned();
                 return;
             }
-            let target = &mut self.project.clips[index];
-            target.out_seconds = requested.min(source_end);
-            self.status = "Salida extendida al cabezal".to_owned();
+            let wanted = self.playhead - end;
+            let status = if wanted > tail_max + 0.001 {
+                "Salida extendida hasta el final del material"
+            } else {
+                "Salida extendida al cabezal"
+            };
+            (0.0, wanted.min(tail_max), status)
         } else if self.playhead < clip.timeline_start {
-            let delta = clip.timeline_start - self.playhead;
-            let available = clip.in_seconds / speed;
-            let delta = delta.min(available);
-            if delta <= 0.001 {
+            if head_min >= -0.001 {
                 self.status = "No queda material antes de la entrada".to_owned();
                 return;
             }
-            let target = &mut self.project.clips[index];
-            target.timeline_start = clip.timeline_start - delta;
-            target.in_seconds = (clip.in_seconds - delta * speed).max(0.0);
-            self.status = "Entrada extendida al cabezal".to_owned();
+            let wanted = self.playhead - clip.timeline_start;
+            (wanted.max(head_min), 0.0, "Entrada extendida al cabezal")
         } else {
             self.status = "Coloca el cabezal fuera del clip para extenderlo".to_owned();
             return;
-        }
+        };
+        let Some(extended) = montaje::retime(&clip, head, tail) else {
+            self.status = "No se pudo extender el clip".to_owned();
+            return;
+        };
+        let before = self.project.clone();
+        self.project.clips[index] = extended;
         self.finish_edit(before);
         self.request_preview();
+        self.status = status.to_owned();
     }
 
     /// Selecciona el clip que hay bajo el cabezal en la pista más alta (F).
@@ -8992,6 +10427,20 @@ impl NovaCutWindows {
             self.stop_playback();
             return;
         }
+        self.start_playback(1);
+    }
+
+    /// Transporte JKL: L acelera hacia delante, J hacia atrás.
+    fn shuttle(&mut self, forward: bool) {
+        let current = self.playback.as_ref().map(|playback| playback.rate);
+        self.start_playback(next_shuttle_rate(current, forward));
+    }
+
+    /// Reproduce desde el cabezal a `rate`× (negativo, hacia atrás). Solo se
+    /// compone desde el cabezal (más el preroll que pida la ventana), así
+    /// que arrancar en el minuto 45 cuesta lo mismo que en el 0.
+    fn start_playback(&mut self, rate: i32) {
+        self.playback = None;
         if !self.ffmpeg_ready || self.project.clips.is_empty() {
             return;
         }
@@ -8999,6 +10448,11 @@ impl NovaCutWindows {
             self.status = "Espera a que termine el render antes de reproducir".to_owned();
             return;
         }
+        if rate < 0 {
+            self.start_reverse_playback(rate);
+            return;
+        }
+        let rate = rate.clamp(1, 8);
         // Reproducir dentro del rango arranca en su entrada si el cabezal
         // está fuera, para no esperar a que llegue.
         if self.export_range_only {
@@ -9010,7 +10464,12 @@ impl NovaCutWindows {
         }
         let timebase = self.project.timebase();
         let start_playhead = timebase.seconds(timebase.frames(self.playhead));
-        let prepared = prepare_render_clips(&self.effective_clips());
+        let (windowed, preroll) =
+            montaje::window(&self.effective_clips(), start_playhead, f64::INFINITY);
+        let mut prepared = prepare_render_clips(&windowed);
+        if self.use_proxies {
+            use_proxy_paths(&mut prepared);
+        }
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error"]);
         let (input_indices, is_title_input) = push_render_inputs(
@@ -9038,8 +10497,14 @@ impl NovaCutWindows {
         };
         let monitor_label =
             append_monitor_scopes(&mut filters, self.show_waveform, self.show_vectorscope);
+        let video_graph = match attach_graph(&mut command, &filters) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         let Ok(mut child) = command
-            .args(["-filter_complex", &filters.join(";")])
             .args(["-map", &format!("[{monitor_label}]")])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -9051,7 +10516,8 @@ impl NovaCutWindows {
             return;
         };
         let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
-        let skip_frames = timebase.frames(start_playhead).max(0) as u64;
+        let skip_frames = timebase.frames(preroll).max(0) as u64;
+        let step = rate as u64;
         let stdout = child.stdout.take();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -9064,29 +10530,22 @@ impl NovaCutWindows {
             let mut index: u64 = 0;
             let mut buffer = vec![0u8; frame_len];
             loop {
-                let mut filled = 0;
-                while filled < frame_len {
-                    match reader.read(&mut buffer[filled..]) {
-                        Ok(0) => {
-                            let _ = sender.send(None);
-                            return;
-                        }
-                        Ok(n) => filled += n,
-                        Err(_) => {
-                            let _ = sender.send(None);
-                            return;
-                        }
-                    }
+                if reader.read_exact(&mut buffer).is_err() {
+                    let _ = sender.send(None);
+                    return;
                 }
                 index += 1;
                 if index <= skip_frames {
                     continue;
                 }
-                // Ritmo en tiempo real: el frame j se entrega en j/fps.
+                // A 2×, 4× u 8× se entrega uno de cada `step` fotogramas.
+                let played = index - skip_frames - 1;
+                if played % step != 0 {
+                    continue;
+                }
+                // Ritmo en tiempo real: el entregado j sale en j/fps.
                 let due = started
-                    + std::time::Duration::from_secs_f64(
-                        timebase.seconds((index - skip_frames - 1) as i64),
-                    );
+                    + std::time::Duration::from_secs_f64(timebase.seconds((played / step) as i64));
                 let now = std::time::Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
@@ -9112,7 +10571,7 @@ impl NovaCutWindows {
             self.use_proxies,
             timebase,
         );
-        let Ok(audio_filters) = build_render_filters(
+        let Ok(mut audio_filters) = build_render_filters(
             &prepared,
             &audio_indices,
             &audio_titles,
@@ -9128,10 +10587,19 @@ impl NovaCutWindows {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
             return;
         };
+        audio_filters.push(format!(
+            "[aout]atrim=start={preroll:.6},asetpts=PTS-STARTPTS{}[aplay]",
+            atempo_chain(rate as u32)
+        ));
+        let audio_graph = match attach_graph(&mut audio_command, &audio_filters) {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         let Ok(mut audio_child) = audio_command
-            .args(["-filter_complex", &audio_filters.join(";")])
-            .args(["-map", "[aout]"])
-            .args(["-ss", &format_seconds(start_playhead)])
+            .args(["-map", "[aplay]"])
             .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
@@ -9194,20 +10662,149 @@ impl NovaCutWindows {
             });
         }
         self.playback = Some(Playback {
-            child,
-            audio_child,
+            child: Some(child),
+            audio_child: Some(audio_child),
             rx: receiver,
             start_playhead,
             last_consumed: 0,
             timebase,
+            rate,
+            started: std::time::Instant::now(),
             meter,
-            _stream: stream,
-            sink,
+            _stream: Some(stream),
+            sink: Some(sink),
+            _graphs: vec![video_graph, audio_graph],
         });
-        self.status = "Reproduciendo el montaje".to_owned();
+        self.status = if rate == 1 {
+            "Reproduciendo el montaje".to_owned()
+        } else {
+            format!("Reproduciendo a {rate}× (L acelera, K para)")
+        };
     }
 
-    /// Consume vídeo con el reloj de audio como maestro para evitar deriva.
+    /// Marcha atrás (J): FFmpeg no decodifica hacia atrás, así que un hilo
+    /// compone el montaje en tramos cortos que terminan en el cabezal y los
+    /// entrega del último fotograma al primero. Sin audio, como el scrub.
+    fn start_reverse_playback(&mut self, rate: i32) {
+        let timebase = self.project.timebase();
+        let start_playhead = timebase.seconds(timebase.frames(self.playhead));
+        if start_playhead <= 0.0 {
+            self.status = "El cabezal ya está al principio".to_owned();
+            return;
+        }
+        let step = rate.unsigned_abs().clamp(1, 8) as i64;
+        let clips = self.effective_clips();
+        let use_proxies = self.use_proxies;
+        let (waveform, vectorscope) = (self.show_waveform, self.show_vectorscope);
+        let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
+        std::thread::spawn(move || {
+            let size = (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32);
+            let frame_len = MONITOR_WIDTH * MONITOR_HEIGHT * 4;
+            let started = std::time::Instant::now();
+            let start_frame = timebase.frames(start_playhead);
+            let mut end_frame = start_frame;
+            let mut emitted: i64 = 0;
+            // Un segundo de reproducción por tramo, sea cual sea la velocidad.
+            let chunk_frames = (timebase.frames(1.0).max(1)) * step;
+            while end_frame > 0 {
+                let begin_frame = (end_frame - chunk_frames).max(0);
+                let (begin, end) = (timebase.seconds(begin_frame), timebase.seconds(end_frame));
+                let (windowed, preroll) = montaje::window(&clips, begin, end);
+                let mut prepared = prepare_render_clips(&windowed);
+                if use_proxies {
+                    use_proxy_paths(&mut prepared);
+                }
+                let mut command = Command::new(tool_path("ffmpeg.exe"));
+                command.args(["-v", "error"]);
+                let (indices, titles) =
+                    push_render_inputs(&mut command, &prepared, size, use_proxies, timebase);
+                let Ok(mut filters) = build_render_filters(
+                    &prepared, &indices, &titles, size, true, false, &[], 0.0, false, timebase,
+                    None,
+                ) else {
+                    let _ = sender.send(None);
+                    return;
+                };
+                let label = append_monitor_scopes(&mut filters, waveform, vectorscope);
+                let skip = timebase.frames(preroll).max(0);
+                let wanted = end_frame - begin_frame;
+                let Ok(_graph) = attach_graph(&mut command, &filters) else {
+                    let _ = sender.send(None);
+                    return;
+                };
+                let Ok(mut child) = command
+                    .args(["-map", &format!("[{label}]")])
+                    .args(["-frames:v", &(skip + wanted).to_string()])
+                    .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    let _ = sender.send(None);
+                    return;
+                };
+                // Solo se guardan los fotogramas que se van a entregar.
+                let mut kept: Vec<(i64, Vec<u8>)> = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read;
+                    let mut buffer = vec![0u8; frame_len];
+                    for index in 0..skip + wanted {
+                        if stdout.read_exact(&mut buffer).is_err() {
+                            break;
+                        }
+                        let frame = begin_frame + index - skip;
+                        if index >= skip && (start_frame - frame) % step == 0 && frame < start_frame
+                        {
+                            kept.push((frame, buffer.clone()));
+                        }
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                if kept.is_empty() {
+                    let _ = sender.send(None);
+                    return;
+                }
+                for (_, pixels) in kept.into_iter().rev() {
+                    let due = started
+                        + std::time::Duration::from_secs_f64(timebase.seconds(emitted));
+                    let now = std::time::Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    }
+                    emitted += 1;
+                    let frame = PreviewFrame {
+                        pixels,
+                        width: MONITOR_WIDTH,
+                        height: MONITOR_HEIGHT,
+                    };
+                    if sender.send(Some(frame)).is_err() {
+                        return;
+                    }
+                }
+                end_frame = begin_frame;
+            }
+            let _ = sender.send(None);
+        });
+        self.playback = Some(Playback {
+            child: None,
+            audio_child: None,
+            rx: receiver,
+            start_playhead,
+            last_consumed: 0,
+            timebase,
+            rate: -(step as i32),
+            started: std::time::Instant::now(),
+            meter: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
+            _stream: None,
+            sink: None,
+            _graphs: Vec::new(),
+        });
+        self.status = format!("Marcha atrás a {step}× (J acelera, K para)");
+    }
+
+    /// Consume vídeo al ritmo del reloj de la reproducción.
     fn poll_playback(&mut self, context: &egui::Context) {
         // Con "solo rango" activo, la reproducción se detiene en la salida.
         let total = match self.work_range() {
@@ -9217,16 +10814,13 @@ impl NovaCutWindows {
         let Some(playback) = &mut self.playback else {
             return;
         };
-        let audio_time = playback.sink.get_pos().as_secs_f64();
-        let expected = playback.timebase.frames(audio_time).max(0) as u64;
+        let expected = playback.timebase.frames(playback.elapsed()).max(0) as u64;
         let mut reached_end = false;
         while playback.last_consumed < expected {
             match playback.rx.try_recv() {
                 Ok(Some(frame)) => {
                     playback.last_consumed += 1;
-                    self.playhead = (playback.start_playhead
-                        + playback.timebase.seconds(playback.last_consumed as i64))
-                    .min(total);
+                    self.playhead = playback.time_of(playback.last_consumed).clamp(0.0, total);
                     let image = egui::ColorImage::from_rgba_unmultiplied(
                         [frame.width, frame.height],
                         &frame.pixels,
@@ -9244,19 +10838,21 @@ impl NovaCutWindows {
                 Err(_) => break,
             }
         }
-        if reached_end || self.playhead >= total {
-            let restart_at = self
-                .playback
-                .as_ref()
-                .map(|playback| playback.start_playhead)
-                .unwrap_or(0.0);
+        let rate = playback.rate;
+        let past_edge = if rate > 0 {
+            self.playhead >= total
+        } else {
+            self.playhead <= 0.0
+        };
+        if reached_end || past_edge {
+            let restart_at = playback.start_playhead;
             self.playback = None;
-            if self.loop_playback && reached_end {
+            if self.loop_playback && reached_end && rate > 0 {
                 self.playhead = restart_at;
-                self.toggle_playback();
+                self.start_playback(rate);
                 return;
             }
-            self.playhead = self.playhead.min(total);
+            self.playhead = self.playhead.clamp(0.0, total);
             self.status = "Reproducción terminada".to_owned();
         }
     }
@@ -9271,45 +10867,30 @@ impl NovaCutWindows {
             return;
         }
         cleanup_old_previews();
-        let clips = self.effective_clips();
         let progress = Arc::clone(&self.render_progress);
         if let Ok(mut state) = progress.lock() {
             state.pct = 0.0;
             state.eta_secs = 0.0;
         }
-        let size = self.export_size;
-        let track_gains = self.project.track_gains.clone();
-        let master_gain_db = self.project.master_gain_db;
-        let normalize_loudness = self.project.normalize_loudness;
-        let timebase = self.project.timebase();
-        let measured_loudness = self.current_loudness_measurement().cloned();
-        let hw = self.active_hw();
+        let target = montage_preview_path();
+        let job = RenderJob {
+            clips: self.effective_clips(),
+            fast: true,
+            audio_only: false,
+            format: ExportFormat::Mp4Video,
+            skip: 0.0,
+            length: None,
+            ..self.render_job(target.clone())
+        };
         let (sender, receiver) = mpsc::channel();
         self.montage_render = Some(receiver);
         self.status = "Renderizando previsualización del montaje...".to_owned();
         std::thread::spawn(move || {
             let cancel = Arc::new(AtomicBool::new(false));
-            let target = montage_preview_path();
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let result = run_export(
-                &clips,
-                &target,
-                &cancel,
-                true,
-                size,
-                false,
-                ExportFormat::Mp4Video,
-                &track_gains,
-                master_gain_db,
-                normalize_loudness,
-                timebase,
-                measured_loudness.as_ref(),
-                hw,
-                &progress,
-            )
-            .map(|()| target);
+            let result = run_export(&job, &cancel, &progress).map(|()| target);
             let _ = sender.send(result);
         });
     }
@@ -9503,6 +11084,7 @@ impl eframe::App for NovaCutWindows {
         self.pump_thumbnails(context);
         self.pump_waveforms(context);
         self.poll_hw_detection();
+        self.poll_stabilization();
         // Primer arranque: en pantallas muy grandes en puntos (un 4K al
         // 100 %, un 1440p al 100 %) la interfaz se agranda sola; después
         // manda lo que elija el usuario.
@@ -9544,7 +11126,9 @@ impl eframe::App for NovaCutWindows {
         }
         // Decaimiento del medidor y volumen del monitor.
         if let Some(playback) = &self.playback {
-            playback.sink.set_volume(self.monitor_volume);
+            if let Some(sink) = &playback.sink {
+                sink.set_volume(self.monitor_volume);
+            }
             if let Ok(state) = playback.meter.lock() {
                 self.meter_display.0 = (self.meter_display.0 * 0.85).max(state.0);
                 self.meter_display.1 = (self.meter_display.1 * 0.85).max(state.1);
@@ -9601,6 +11185,21 @@ impl eframe::App for NovaCutWindows {
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
         let magic_tool_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::G));
+        let roll_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::N));
+        let slide_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Y));
+        let slip_tool_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
+        // Levantar (;) y Extraer ('), como en Premiere. En teclados españoles
+        // «;» lleva Mayús, así que se aceptan ambas.
+        let lift_key = keyboard_shortcuts
+            && context.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Semicolon)
+                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Semicolon)
+            });
+        let extract_key = keyboard_shortcuts
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Quote));
         let goto_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::G));
         let detach_audio_key = keyboard_shortcuts
@@ -9721,7 +11320,7 @@ impl eframe::App for NovaCutWindows {
                 input.consume_key(
                     egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
                     egui::Key::E,
-                )
+                ) || input.consume_key(egui::Modifiers::CTRL, egui::Key::M)
             });
         let select_all_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A));
@@ -9768,8 +11367,10 @@ impl eframe::App for NovaCutWindows {
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let stop_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::K));
-        let prev_cut_key = keyboard_shortcuts
+        let reverse_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::J));
+        // Con K pulsada, J y L avanzan fotograma a fotograma, como en Premiere.
+        let k_held = keyboard_shortcuts && context.input(|input| input.key_down(egui::Key::K));
         for (pressed, tool) in [
             (select_tool_key, EditTool::Select),
             (track_tool_key, EditTool::TrackSelect),
@@ -9779,6 +11380,9 @@ impl eframe::App for NovaCutWindows {
             (hand_tool_key, EditTool::Hand),
             (zoom_tool_key, EditTool::Zoom),
             (magic_tool_key, EditTool::Magic),
+            (roll_tool_key, EditTool::Roll),
+            (slip_tool_key, EditTool::Slip),
+            (slide_tool_key, EditTool::Slide),
         ] {
             if pressed {
                 self.set_edit_tool(tool);
@@ -9849,6 +11453,12 @@ impl eframe::App for NovaCutWindows {
         if clear_range {
             self.clear_work_range();
         }
+        if lift_key {
+            self.lift_or_extract(false);
+        }
+        if extract_key {
+            self.lift_or_extract(true);
+        }
         if trim_start_key {
             self.trim_to_playhead(true);
         }
@@ -9897,7 +11507,7 @@ impl eframe::App for NovaCutWindows {
         if open_key {
             self.request_document_action(DocumentAction::Open);
         }
-        if export_key && self.ffmpeg_ready && self.export_result.is_none() {
+        if export_key && self.ffmpeg_ready {
             self.export();
         }
         if shortcuts_key {
@@ -9954,16 +11564,17 @@ impl eframe::App for NovaCutWindows {
         if preview_shortcut && self.ffmpeg_ready {
             self.toggle_playback();
         }
-        // Transporte JKL, como en los montadores clásicos.
-        if play_key && self.ffmpeg_ready {
-            self.toggle_playback();
-        }
+        // Transporte JKL: cada pulsación duplica la velocidad (hasta 8×) y
+        // cambiar de sentido vuelve a 1×; con K pulsada, fotograma a fotograma.
         if stop_key && self.playback.is_some() {
             self.stop_playback();
             self.status = "Reproducción detenida (K)".to_owned();
         }
-        if prev_cut_key {
-            self.go_to_cut(false);
+        if (play_key || reverse_key) && k_held {
+            self.stop_playback();
+            self.step_frames(if play_key { 1 } else { -1 });
+        } else if (play_key || reverse_key) && self.ffmpeg_ready {
+            self.shuttle(play_key);
         }
         let title = format!(
             "{}{} - NovaCut Windows",
@@ -10359,7 +11970,7 @@ impl eframe::App for NovaCutWindows {
                     }
                     if ui
                         .add_enabled(
-                            self.ffmpeg_ready && self.export_result.is_none(),
+                            self.ffmpeg_ready,
                             egui::Button::new(
                                 egui::RichText::new(format!(
                                     "Exportar {}{}",
@@ -10376,10 +11987,29 @@ impl eframe::App for NovaCutWindows {
                             )
                             .fill(theme::ACCENT)
                             .min_size(egui::vec2(0.0, 24.0)),
-                        ).on_hover_text("Exporta el montaje (o solo el rango, si está activo) con el formato elegido").on_disabled_hover_text("Exporta el montaje (o solo el rango, si está activo) con el formato elegido")
+                        ).on_hover_text("Abre la exportación: preajustes, calidad, destino y cola (Ctrl+M)").on_disabled_hover_text("Hace falta FFmpeg para exportar")
                         .clicked()
                     {
                         self.export();
+                    }
+                    let pending = self
+                        .export_queue
+                        .iter()
+                        .filter(|item| matches!(item.state, JobState::Waiting | JobState::Running))
+                        .count();
+                    if !self.export_queue.is_empty()
+                        && theme::bar_button(
+                            ui,
+                            &if pending > 0 {
+                                format!("Cola ({pending})")
+                            } else {
+                                "Cola".to_owned()
+                            },
+                        )
+                        .on_hover_text("Trabajos de exportación: progreso, cancelar y abrir")
+                        .clicked()
+                    {
+                        self.show_queue = !self.show_queue;
                     }
                     if self.export_result.is_some() {
                         let (pct, _) = self
@@ -10448,6 +12078,8 @@ impl eframe::App for NovaCutWindows {
         self.show_silence_review(context);
         self.show_scene_cut_review(context);
         self.show_shortcuts_window(context);
+        self.show_export_window(context);
+        self.show_queue_window(context);
         self.show_command_center(context);
 
         if self.monitor_fullscreen {
@@ -10549,6 +12181,9 @@ impl eframe::App for NovaCutWindows {
 
         let project_before_inspector = self.project.clone();
         let mut trim_changed = false;
+        let playhead_now = self.playhead;
+        // Salto pedido desde los controles de keyframe (◀ ▶), en timeline.
+        let mut keyframe_seek: Option<f64> = None;
         let mut toggle_enabled = false;
         let mut label_request: Option<u8> = None;
         let mut relink_requested = false;
@@ -10561,6 +12196,50 @@ impl eframe::App for NovaCutWindows {
         let mut proxy_limit_gb = self.proxy_limit_gb;
         let mut trim_cache_requested = false;
         let mut nest_requested = false;
+        // Planos que pueden servir de referencia para «Igualar color».
+        let match_candidates: Vec<(usize, String)> = self
+            .project
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(index, clip)| {
+                Some(*index) != self.selected
+                    && clip.has_video
+                    && clip.title.is_none()
+                    && !clip.is_adjustment
+                    && clip.nested.is_none()
+                    && !clip.path.as_os_str().is_empty()
+            })
+            .map(|(index, clip)| {
+                (
+                    index,
+                    format!(
+                        "{} · V{} {}",
+                        clip.name(),
+                        clip.track + 1,
+                        timecode(clip.timeline_start, self.project.fps)
+                    ),
+                )
+            })
+            .collect();
+        let mut match_reference = self
+            .match_reference
+            .filter(|index| match_candidates.iter().any(|(candidate, _)| candidate == index));
+        let mut color_match_request = false;
+        let mut stabilize_requested = false;
+        let stab_status = match self.selected.and_then(|index| self.project.clips.get(index)) {
+            _ if !estabilizar::vidstab_available() => efectos::StabStatus::Unavailable,
+            Some(clip)
+                if self
+                    .stabilization
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == estabilizar::analysis_path(clip)) =>
+            {
+                efectos::StabStatus::Analyzing
+            }
+            Some(clip) if estabilizar::analysis_path(clip).is_file() => efectos::StabStatus::Ready,
+            _ => efectos::StabStatus::Pending,
+        };
         let mut unnest_requested = false;
         // Panel de medios a la izquierda, como el "MEDIOS" de la app macOS:
         // lista de clips del proyecto; un clic selecciona y centra el cabezal.
@@ -10579,6 +12258,16 @@ impl eframe::App for NovaCutWindows {
             .show(context, |ui| {
                 use media_browser::{Kind, Proxy, Sort};
                 theme::panel_header(ui, "Medios", None);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.media_view_project, true, "Proyecto")
+                        .on_hover_text("Bins, medios y secuencias del proyecto, estén o no montados");
+                    ui.selectable_value(&mut self.media_view_project, false, "En la secuencia")
+                        .on_hover_text("Cada medio con sus usos en la secuencia abierta");
+                });
+                if self.media_view_project {
+                    self.project_panel(ui);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
                     ui.add(
@@ -10826,9 +12515,17 @@ impl eframe::App for NovaCutWindows {
                                 );
                             } else {
                                 ui.label("Texto del título");
-                                trim_changed |=
-                                    ui.text_edit_singleline(&mut title.text).changed();
+                                trim_changed |= ui
+                                    .add(
+                                        egui::TextEdit::multiline(&mut title.text)
+                                            .desired_rows(2)
+                                            .desired_width(ui.available_width()),
+                                    )
+                                    .on_hover_text("Intro añade una línea")
+                                    .changed();
                             }
+                            ui.label("Fuente");
+                            trim_changed |= font_picker(ui, &mut title.font);
                             ui.label("Tamaño");
                             trim_changed |= ui
                                 .add(
@@ -11173,37 +12870,82 @@ impl eframe::App for NovaCutWindows {
                         if clip.has_video && clip.title.is_none() {
                             ui.separator();
                             theme::section_label(ui, "Color");
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.exposure, -1.0..=1.0)
-                                        .text("Exposición"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.contrast, -1.0..=1.0)
-                                        .text("Contraste"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.saturation, -1.0..=1.0)
-                                        .text("Saturación"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.vignette, -1.0..=1.0)
-                                        .text("Viñeta"),
-                                )
-                                .changed();
-                            trim_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut clip.blur, 0.0..=1.0).text("Desenfoque"),
-                                )
-                                .changed();
-                            trim_changed |=
-                                efectos::inspector_video(ui, &mut clip.fx, clip.is_adjustment);
+                            // ◇ junto a cada deslizador lo anima con keyframes,
+                            // como el cronómetro de Premiere.
+                            let local_t =
+                                (playhead_now - clip.timeline_start).clamp(0.0, clip.duration());
+                            for (param, range, text) in [
+                                (animacion::Param::Exposure, -1.0..=1.0, "Exposición"),
+                                (animacion::Param::Contrast, -1.0..=1.0, "Contraste"),
+                                (animacion::Param::Saturation, -1.0..=1.0, "Saturación"),
+                                (animacion::Param::Vignette, -1.0..=1.0, "Viñeta"),
+                                (animacion::Param::Blur, 0.0..=1.0, "Desenfoque"),
+                            ] {
+                                let value = match param {
+                                    animacion::Param::Exposure => &mut clip.exposure,
+                                    animacion::Param::Contrast => &mut clip.contrast,
+                                    animacion::Param::Saturation => &mut clip.saturation,
+                                    animacion::Param::Vignette => &mut clip.vignette,
+                                    _ => &mut clip.blur,
+                                };
+                                match animacion::animated_slider(
+                                    ui, &mut clip.anim, param, value, range, text, local_t, 0.0,
+                                ) {
+                                    animacion::KeyAction::Changed => trim_changed = true,
+                                    animacion::KeyAction::Seek(t) => {
+                                        keyframe_seek = Some(clip.timeline_start + t)
+                                    }
+                                    animacion::KeyAction::None => {}
+                                }
+                            }
+                            let video = efectos::inspector_video(
+                                ui,
+                                &mut clip.fx,
+                                &mut clip.anim,
+                                local_t,
+                                clip.is_adjustment,
+                                stab_status,
+                            );
+                            trim_changed |= video.changed;
+                            stabilize_requested |= video.analyze;
+                            if let Some(t) = video.seek {
+                                keyframe_seek = Some(clip.timeline_start + t);
+                            }
+                            if !clip.is_adjustment {
+                                ui.collapsing("Igualar color", |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Lleva el color y el contraste de este plano a los de otro, como la Comparación de color de Lumetri.")
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    egui::ComboBox::from_id_salt("match-reference")
+                                        .width(ui.available_width().min(260.0))
+                                        .selected_text(
+                                            match_reference
+                                                .and_then(|index| match_candidates.iter().find(|(candidate, _)| *candidate == index))
+                                                .map(|(_, name)| name.clone())
+                                                .unwrap_or_else(|| "Elige el plano de referencia".to_owned()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (index, name) in &match_candidates {
+                                                ui.selectable_value(&mut match_reference, Some(*index), name);
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        color_match_request = ui
+                                            .add_enabled(match_reference.is_some(), egui::Button::new("Igualar"))
+                                            .on_hover_text("Mide los dos planos a mitad de su duración y corrige este")
+                                            .on_disabled_hover_text("Primero elige un plano de referencia")
+                                            .clicked();
+                                        if clip.fx.color_match.is_some()
+                                            && ui.button("Quitar igualación").clicked()
+                                        {
+                                            clip.fx.color_match = None;
+                                            trim_changed = true;
+                                        }
+                                    });
+                                });
+                            }
                             if !clip.is_adjustment {
                                 ui.collapsing("Croma (pantalla verde/azul)", |ui| {
                                 if clip.chroma.is_none() {
@@ -11489,164 +13231,208 @@ impl eframe::App for NovaCutWindows {
                                 }
                             });
                             ui.separator();
-                            if clip.keyframes.is_some() {
-                                ui.separator();
-                                ui.label("Animación (keyframes)");
-                                ui.small("t local del clip; export e interpolan por tramos");
-                                let duration = clip.duration();
-                                let local_t =
-                                    (self.playhead - clip.timeline_start).clamp(0.0, duration);
-                                if ui.button("Añadir keyframe aquí").on_hover_text("Guarda posición, escala y opacidad donde está el cabezal").clicked() {
-                                    let keyframes = clip.keyframes.get_or_insert_with(Vec::new);
-                                    let keyframe = TransformKeyframe {
-                                        t: local_t,
-                                        x: clip.position_x,
-                                        y: clip.position_y,
-                                        scale: clip.scale_percent,
-                                        opacity: clip.opacity,
-                                    };
-                                    match keyframes
-                                        .iter_mut()
-                                        .find(|existing| (existing.t - local_t).abs() < 0.03)
-                                    {
-                                        Some(existing) => *existing = keyframe,
-                                        None => {
-                                            keyframes.push(keyframe);
-                                            keyframes
-                                                .sort_by(|left, right| left.t.total_cmp(&right.t));
-                                        }
-                                    }
-                                    trim_changed = true;
-                                }
-                                let Some(keyframes) = clip.keyframes.as_mut() else {
-                                    unreachable!()
-                                };
-                                let mut remove_keyframe: Option<usize> = None;
-                                for (keyframe_index, keyframe) in keyframes.iter_mut().enumerate() {
+                            // Transformación: con keyframes, los campos muestran el
+                            // valor en el cabezal y editarlos crea o actualiza el
+                            // keyframe ahí, como con el cronómetro de Premiere.
+                            let duration = clip.duration();
+                            let local_t = (playhead_now - clip.timeline_start).clamp(0.0, duration);
+                            let animated = clip.keyframes.as_ref().is_some_and(|keys| !keys.is_empty());
+                            let (mut x, mut y, mut scale, mut opacity) = clip.evaluate_transform(local_t);
+                            let mut transform_edit = false;
+                            theme::section_label(ui, "Transformación");
+                            egui::Grid::new("clip_transform")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Posición");
                                     ui.horizontal(|ui| {
-                                        ui.monospace(format!("kf{:02}", keyframe_index + 1));
-                                        trim_changed |= ui
+                                        transform_edit |= ui
                                             .add(
-                                                egui::DragValue::new(&mut keyframe.t)
-                                                    .speed(0.05)
-                                                    .range(0.0..=duration.max(0.01))
-                                                    .prefix("t "),
+                                                egui::DragValue::new(&mut x)
+                                                    .speed(1.0)
+                                                    .range(-7680.0..=7680.0)
+                                                    .prefix("X ")
+                                                    .suffix(" px"),
                                             )
                                             .changed();
-                                        trim_changed |= ui
+                                        transform_edit |= ui
                                             .add(
-                                                egui::DragValue::new(&mut keyframe.x)
+                                                egui::DragValue::new(&mut y)
                                                     .speed(1.0)
-                                                    .prefix("x "),
-                                            )
-                                            .changed();
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.y)
-                                                    .speed(1.0)
-                                                    .prefix("y "),
+                                                    .range(-4320.0..=4320.0)
+                                                    .prefix("Y ")
+                                                    .suffix(" px"),
                                             )
                                             .changed();
                                     });
-                                    ui.horizontal(|ui| {
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.scale)
-                                                    .speed(0.5)
-                                                    .range(1.0..=800.0)
-                                                    .prefix("esc "),
-                                            )
-                                            .changed();
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut keyframe.opacity)
-                                                    .speed(0.5)
-                                                    .range(0.0..=100.0)
-                                                    .prefix("op "),
-                                            )
-                                            .changed();
-                                        if ui.button("×").on_hover_text("Quita este keyframe").clicked() {
-                                            remove_keyframe = Some(keyframe_index);
-                                        }
-                                    });
-                                }
-                                if let Some(index) = remove_keyframe {
-                                    keyframes.remove(index);
-                                    if keyframes.len() < 2 {
-                                        clip.keyframes = None;
-                                    }
-                                    trim_changed = true;
-                                }
-                                if ui.button("Quitar animación").on_hover_text("Borra todos los keyframes del clip").clicked() {
-                                    clip.keyframes = None;
-                                    trim_changed = true;
-                                }
-                            } else {
-                                theme::section_label(ui, "Transformación");
-                                egui::Grid::new("clip_transform")
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Posición");
-                                        ui.horizontal(|ui| {
-                                            trim_changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut clip.position_x)
-                                                        .speed(1.0)
-                                                        .range(-7680.0..=7680.0)
-                                                        .prefix("X ")
-                                                        .suffix(" px"),
-                                                )
-                                                .changed();
-                                            trim_changed |= ui
-                                                .add(
-                                                    egui::DragValue::new(&mut clip.position_y)
-                                                        .speed(1.0)
-                                                        .range(-4320.0..=4320.0)
-                                                        .prefix("Y ")
-                                                        .suffix(" px"),
-                                                )
-                                                .changed();
-                                        });
-                                        ui.end_row();
-                                        ui.label("Escala");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut clip.scale_percent)
-                                                    .speed(0.5)
-                                                    .range(1.0..=800.0)
-                                                    .suffix(" %"),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                        ui.label("Rotación");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::DragValue::new(&mut clip.rotation)
+                                    ui.end_row();
+                                    ui.label("Escala");
+                                    transform_edit |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut scale)
+                                                .speed(0.5)
+                                                .range(1.0..=800.0)
+                                                .suffix(" %"),
+                                        )
+                                        .changed();
+                                    ui.end_row();
+                                    ui.label("Opacidad");
+                                    transform_edit |= ui
+                                        .add(egui::Slider::new(&mut opacity, 0.0..=100.0).suffix(" %"))
+                                        .changed();
+                                    ui.end_row();
+                                    ui.label("Rotación");
+                                    match animacion::animated_value(
+                                        ui,
+                                        &mut clip.anim,
+                                        animacion::Param::Rotation,
+                                        &mut clip.rotation,
+                                        local_t,
+                                        |ui, value| {
+                                            ui.add(
+                                                egui::DragValue::new(value)
                                                     .speed(0.25)
                                                     .range(-3600.0..=3600.0)
                                                     .suffix(" °"),
                                             )
-                                            .changed();
-                                        ui.end_row();
-                                        ui.label("Opacidad");
-                                        trim_changed |= ui
-                                            .add(
-                                                egui::Slider::new(&mut clip.opacity, 0.0..=100.0)
-                                                    .suffix(" %"),
-                                            )
-                                            .changed();
-                                        ui.end_row();
-                                    });
-                                if ui.button("Animar (keyframes)").on_hover_text("Empieza a animar posición, escala y opacidad").clicked() {
-                                    clip.keyframes = Some(vec![TransformKeyframe {
-                                        t: 0.0,
-                                        x: clip.position_x,
-                                        y: clip.position_y,
-                                        scale: clip.scale_percent,
-                                        opacity: clip.opacity,
-                                    }]);
-                                    trim_changed = true;
+                                            .changed()
+                                        },
+                                    ) {
+                                        animacion::KeyAction::Changed => trim_changed = true,
+                                        animacion::KeyAction::Seek(t) => {
+                                            keyframe_seek = Some(clip.timeline_start + t)
+                                        }
+                                        animacion::KeyAction::None => {}
+                                    }
+                                    ui.end_row();
+                                });
+                            let here = TransformKeyframe { t: local_t, x, y, scale, opacity };
+                            if transform_edit {
+                                trim_changed = true;
+                                match clip.keyframes.as_mut().filter(|_| animated) {
+                                    Some(keyframes) => {
+                                        match keyframes
+                                            .iter_mut()
+                                            .find(|existing| (existing.t - local_t).abs() < animacion::SAME_KEY)
+                                        {
+                                            Some(existing) => *existing = here,
+                                            None => {
+                                                keyframes.push(here);
+                                                keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        clip.position_x = x;
+                                        clip.position_y = y;
+                                        clip.scale_percent = scale;
+                                        clip.opacity = opacity;
+                                    }
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if !animated {
+                                    if ui
+                                        .button("◇ Animar posición, escala y opacidad")
+                                        .on_hover_text("Crea un keyframe en el cabezal; después, cada cambio en otro instante crea otro")
+                                        .clicked()
+                                    {
+                                        clip.keyframes = Some(vec![here]);
+                                        trim_changed = true;
+                                    }
+                                    return;
+                                }
+                                ui.label("Keyframes");
+                                let times: Vec<f64> = clip
+                                    .keyframes
+                                    .iter()
+                                    .flatten()
+                                    .map(|keyframe| keyframe.t)
+                                    .collect();
+                                match animacion::key_buttons(ui, &times, local_t) {
+                                    animacion::KeyButton::Seek(t) => {
+                                        keyframe_seek = Some(clip.timeline_start + t)
+                                    }
+                                    animacion::KeyButton::Toggle => {
+                                        let keyframes = clip.keyframes.get_or_insert_with(Vec::new);
+                                        match keyframes.iter().position(|existing| {
+                                            (existing.t - local_t).abs() < animacion::SAME_KEY
+                                        }) {
+                                            Some(index) => {
+                                                keyframes.remove(index);
+                                            }
+                                            None => {
+                                                keyframes.push(here);
+                                                keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                            }
+                                        }
+                                        trim_changed = true;
+                                    }
+                                    animacion::KeyButton::Clear => {
+                                        clip.keyframes = Some(Vec::new());
+                                        trim_changed = true;
+                                    }
+                                    animacion::KeyButton::None => {}
+                                }
+                            });
+                            // Sin keyframes queda el estado del cabezal como fijo.
+                            if clip.keyframes.as_ref().is_some_and(|keys| keys.is_empty()) {
+                                clip.keyframes = None;
+                                clip.position_x = x;
+                                clip.position_y = y;
+                                clip.scale_percent = scale;
+                                clip.opacity = opacity;
+                            }
+                            if let Some(keyframes) = clip.keyframes.as_mut() {
+                                let count = keyframes.len();
+                                ui.collapsing(format!("Lista de keyframes ({count})"), |ui| {
+                                    let mut remove_keyframe: Option<usize> = None;
+                                    for (keyframe_index, keyframe) in keyframes.iter_mut().enumerate() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.t)
+                                                        .speed(0.05)
+                                                        .range(0.0..=duration.max(0.01))
+                                                        .prefix("t ")
+                                                        .suffix(" s"),
+                                                )
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(egui::DragValue::new(&mut keyframe.x).speed(1.0).prefix("x "))
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(egui::DragValue::new(&mut keyframe.y).speed(1.0).prefix("y "))
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.scale)
+                                                        .speed(0.5)
+                                                        .range(1.0..=800.0)
+                                                        .prefix("esc "),
+                                                )
+                                                .changed();
+                                            trim_changed |= ui
+                                                .add(
+                                                    egui::DragValue::new(&mut keyframe.opacity)
+                                                        .speed(0.5)
+                                                        .range(0.0..=100.0)
+                                                        .prefix("op "),
+                                                )
+                                                .changed();
+                                            if ui.small_button("×").on_hover_text("Quita este keyframe").clicked() {
+                                                remove_keyframe = Some(keyframe_index);
+                                            }
+                                        });
+                                    }
+                                    if let Some(index) = remove_keyframe {
+                                        keyframes.remove(index);
+                                        trim_changed = true;
+                                    }
+                                    keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                                });
+                                if keyframes.is_empty() {
+                                    clip.keyframes = None;
                                 }
                             }
                         }
@@ -11882,6 +13668,19 @@ impl eframe::App for NovaCutWindows {
             // (ver poll_pending_edit), en vez de una por tecla o píxel.
             self.queue_edit(project_before_inspector);
             self.request_preview();
+        }
+        if let Some(time) = keyframe_seek {
+            self.stop_playback();
+            self.seek(time);
+        }
+        self.match_reference = match_reference;
+        if stabilize_requested {
+            self.start_stabilization();
+        }
+        if let (true, Some(target), Some(reference)) =
+            (color_match_request, self.selected, match_reference)
+        {
+            self.match_color(target, reference);
         }
         if relink_requested {
             self.relink_selected();
@@ -12218,12 +14017,53 @@ impl eframe::App for NovaCutWindows {
                     ui.add_space(2.0);
                 }
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("TIMELINE")
-                            .strong()
-                            .size(11.5)
-                            .color(theme::TEXT),
-                    );
+                    // Secuencia abierta; el desplegable cambia a otra o crea
+                    // una nueva, como las pestañas de secuencia de Premiere.
+                    let mut switch_to: Option<u64> = None;
+                    let mut create = false;
+                    egui::ComboBox::from_id_salt("timeline-sequence")
+                        .width(if compact_header { 96.0 } else { 150.0 })
+                        .selected_text(
+                            egui::RichText::new(&self.project.sequence_name)
+                                .strong()
+                                .size(11.5),
+                        )
+                        .show_ui(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&self.project.sequence_name)
+                                    .strong()
+                                    .color(theme::ACCENT),
+                            );
+                            for sequence in &self.project.sequences {
+                                if ui
+                                    .selectable_label(false, &sequence.name)
+                                    .on_hover_text(format!(
+                                        "{} · {}",
+                                        if sequence.bin.is_empty() { "Proyecto" } else { &sequence.bin },
+                                        format_clock(sequence.data.duration())
+                                    ))
+                                    .clicked()
+                                {
+                                    switch_to = Some(sequence.id);
+                                }
+                            }
+                            ui.separator();
+                            create = ui.button("+ Nueva secuencia").clicked();
+                        })
+                        .response
+                        .on_hover_text("Secuencia abierta; el panel Proyecto las organiza en bins");
+                    if let Some(id) = switch_to {
+                        self.switch_sequence(id);
+                    }
+                    if create {
+                        let before = self.project.clone();
+                        let bin = self.project.sequence_bin.clone();
+                        self.stop_playback();
+                        self.project.new_sequence(&bin);
+                        self.after_sequence_switch();
+                        self.finish_edit(before);
+                        self.status = format!("{} creada", self.project.sequence_name);
+                    }
                     if !compact_header {
                         ui.label(
                             egui::RichText::new(format!("{video_tracks}V · {audio_tracks}A"))
@@ -12457,7 +14297,10 @@ impl eframe::App for NovaCutWindows {
                         EditTool::Select => egui::CursorIcon::Default,
                         EditTool::TrackSelect => egui::CursorIcon::PointingHand,
                         EditTool::Blade => egui::CursorIcon::Crosshair,
-                        EditTool::Trim | EditTool::RippleTrim => egui::CursorIcon::ResizeHorizontal,
+                        EditTool::Trim | EditTool::RippleTrim | EditTool::Roll => {
+                            egui::CursorIcon::ResizeHorizontal
+                        }
+                        EditTool::Slip | EditTool::Slide => egui::CursorIcon::ResizeColumn,
                         EditTool::Hand if primary_down => egui::CursorIcon::Grabbing,
                         EditTool::Hand => egui::CursorIcon::Grab,
                         EditTool::Zoom => egui::CursorIcon::ZoomIn,
@@ -12933,9 +14776,10 @@ impl eframe::App for NovaCutWindows {
                             match self.edit_tool {
                                 EditTool::TrackSelect => egui::CursorIcon::PointingHand,
                                 EditTool::Blade => egui::CursorIcon::Crosshair,
-                                EditTool::Trim | EditTool::RippleTrim => {
+                                EditTool::Trim | EditTool::RippleTrim | EditTool::Roll => {
                                     egui::CursorIcon::ResizeHorizontal
                                 }
+                                EditTool::Slip | EditTool::Slide => egui::CursorIcon::ResizeColumn,
                                 EditTool::Hand if response.dragged() => egui::CursorIcon::Grabbing,
                                 EditTool::Hand => egui::CursorIcon::Grab,
                                 EditTool::Zoom => egui::CursorIcon::ZoomIn,
@@ -13139,6 +14983,26 @@ impl eframe::App for NovaCutWindows {
                             } else {
                                 DragKind::RippleTrimEnd
                             }
+                        } else if self.edit_tool == EditTool::Roll {
+                            // El corte más cercano al puntero: el de la
+                            // entrada o el de la salida del clip.
+                            let at = if pointer.x < rect.center().x {
+                                clip.timeline_start
+                            } else {
+                                clip.timeline_start + clip.duration()
+                            };
+                            match montaje::cut_at(&self.project.clips, index, at, 0.002) {
+                                Some((left, right)) => DragKind::Roll { left, right, cut: at },
+                                None => DragKind::Slip { grab: f64::NAN },
+                            }
+                        } else if self.edit_tool == EditTool::Slip {
+                            DragKind::Slip {
+                                grab: pointer_time(pointer.x),
+                            }
+                        } else if self.edit_tool == EditTool::Slide {
+                            DragKind::Slide {
+                                grab: pointer_time(pointer.x),
+                            }
                         } else if (pointer.x - rect.left()).abs() <= EDGE_GRAB {
                             DragKind::TrimStart
                         } else if (rect.right() - pointer.x).abs() <= EDGE_GRAB {
@@ -13146,7 +15010,13 @@ impl eframe::App for NovaCutWindows {
                         } else {
                             DragKind::Move
                         };
-                        self.drag_edit = Some((index, kind, self.project.clone()));
+                        if matches!(kind, DragKind::Slip { grab } if grab.is_nan()) {
+                            self.status =
+                                "Rodar necesita otro clip pegado a ese borde en la misma pista"
+                                    .to_owned();
+                        } else {
+                            self.drag_edit = Some((index, kind, self.project.clone()));
+                        }
                         // Arrastrar un clip no seleccionado pasa a moverlo solo
                         // a él; si ya estaba en la selección, se mueve el grupo.
                         if !self.selection.contains(&index) {
@@ -13187,6 +15057,14 @@ impl eframe::App for NovaCutWindows {
                                 }
                                 DragKind::TrimEnd | DragKind::RippleTrimEnd => {
                                     timeline_drag = Some(TimelineDragEvent::TrimEnd(
+                                        index,
+                                        pointer_time(pointer.x),
+                                    ));
+                                }
+                                DragKind::Roll { .. }
+                                | DragKind::Slip { .. }
+                                | DragKind::Slide { .. } => {
+                                    timeline_drag = Some(TimelineDragEvent::Tool(
                                         index,
                                         pointer_time(pointer.x),
                                     ));
@@ -13348,6 +15226,25 @@ impl eframe::App for NovaCutWindows {
                                     ),
                                     format_clock(current.duration())
                                 ),
+                                DragKind::Roll { left, .. } => format!(
+                                    "Corte {}",
+                                    timecode(
+                                        self.project.clips.get(*left).map_or(0.0, |clip| {
+                                            clip.timeline_start + clip.duration()
+                                        }),
+                                        self.project.fps
+                                    )
+                                ),
+                                DragKind::Slip { .. } => format!(
+                                    "Origen {} → {}",
+                                    timecode(current.in_seconds, self.project.fps),
+                                    timecode(current.out_seconds, self.project.fps)
+                                ),
+                                DragKind::Slide { .. } => format!(
+                                    "Δ {:+.2} s  ·  inicio {}",
+                                    current.timeline_start - original.timeline_start,
+                                    timecode(current.timeline_start, self.project.fps)
+                                ),
                             };
                             let info_rect = egui::Rect::from_min_size(
                                 egui::pos2(
@@ -13380,7 +15277,26 @@ impl eframe::App for NovaCutWindows {
                 // Arrastre desde la biblioteca: previsualiza dónde caerá el
                 // medio y lo inserta al soltar, sobrescribiendo como un drop
                 // de archivo.
-                if let Some(source_index) = egui::DragAndDrop::payload::<usize>(context) {
+                // Qué se está arrastrando: un uso del panel de medios, un
+                // medio de la biblioteca o una secuencia entera (anidada).
+                let dragged: Option<(RoughClip, bool)> =
+                    if let Some(index) = egui::DragAndDrop::payload::<usize>(context) {
+                        self.project.clips.get(*index).cloned().map(|clip| (clip, false))
+                    } else if let Some(item) = egui::DragAndDrop::payload::<LibraryPayload>(context) {
+                        self.project
+                            .library
+                            .get(item.0)
+                            .map(|item| (item.clip.clone(), false))
+                    } else if let Some(sequence) =
+                        egui::DragAndDrop::payload::<SequencePayload>(context)
+                    {
+                        self.project
+                            .sequence_as_nested(sequence.0)
+                            .map(|clip| (clip, true))
+                    } else {
+                        None
+                    };
+                if let Some((dragged_clip, is_sequence)) = dragged {
                     if let Some(pointer) = context.input(|input| input.pointer.hover_pos()) {
                         if lanes_area.contains(pointer) {
                             let drop_time = pointer_time(pointer.x);
@@ -13395,18 +15311,19 @@ impl eframe::App for NovaCutWindows {
                             };
                             let released = context.input(|input| input.pointer.any_released());
                             if released {
-                                let source = self.project.clips.get(*source_index).cloned();
-                                let Some(mut clip) = source else {
-                                    egui::DragAndDrop::clear_payload(context);
-                                    return;
-                                };
+                                egui::DragAndDrop::clear_payload(context);
+                                let mut clip = dragged_clip;
                                 let file_based = clip.title.is_none()
                                     && clip.nested.is_none()
                                     && !clip.path.as_os_str().is_empty();
-                                if !file_based {
+                                if !file_based && !is_sequence {
                                     self.status =
                                         "Arrastra medios de archivo, no capas generadas".to_owned();
-                                    egui::DragAndDrop::clear_payload(context);
+                                    return;
+                                }
+                                if is_sequence && !is_video {
+                                    self.status =
+                                        "Suelta la secuencia en una pista de vídeo".to_owned();
                                     return;
                                 }
                                 if let Err(reason) = media_browser::validate_drop_destination(
@@ -13416,15 +15333,27 @@ impl eframe::App for NovaCutWindows {
                                     clip.has_audio,
                                 ) {
                                     self.status = reason.to_owned();
-                                    egui::DragAndDrop::clear_payload(context);
                                     return;
                                 }
                                 let before = self.project.clone();
                                 clip.timeline_start = drop_time;
                                 clip.track = track;
-                                clip.has_video = is_video;
-                                // Preserve source audio capability; never invent a stream.
+                                if !is_sequence {
+                                    // Preserve source audio capability; never invent a stream.
+                                    clip.has_video = is_video;
+                                }
                                 let span_end = clip.timeline_start + clip.duration();
+                                if span_hits_complex_clip(
+                                    &self.project.clips,
+                                    clip.track,
+                                    clip.has_video,
+                                    clip.timeline_start,
+                                    span_end,
+                                    &[],
+                                ) {
+                                    self.status = "No se puede soltar encima de una rampa o secuencia anidada".to_owned();
+                                    return;
+                                }
                                 clear_track_span(
                                     &mut self.project.clips,
                                     clip.track,
@@ -13437,17 +15366,19 @@ impl eframe::App for NovaCutWindows {
                                 self.select_only(self.project.clips.len() - 1);
                                 self.finish_edit(before);
                                 self.status = format!(
-                                    "Medio colocado en {}{} · {}",
+                                    "{} en {}{} · {}",
+                                    if is_sequence { "Secuencia anidada" } else { "Medio colocado" },
                                     if is_video { "V" } else { "A" },
                                     track + 1,
                                     timecode(drop_time, self.project.fps)
                                 );
                             } else {
                                 let x0 = to_x(drop_time);
+                                let width = (dragged_clip.duration() as f32 * pps as f32).clamp(24.0, 4000.0);
                                 let row_bottom = tracks_bottom - row as f32 * row_height;
                                 let preview = egui::Rect::from_min_max(
                                     egui::pos2(x0, row_bottom - row_height),
-                                    egui::pos2(x0 + 120.0, row_bottom),
+                                    egui::pos2(x0 + width, row_bottom),
                                 );
                                 lane_painter.rect_filled(
                                     preview,
@@ -13583,9 +15514,12 @@ impl eframe::App for NovaCutWindows {
                         EditTool::Blade => egui::CursorIcon::Crosshair,
                         EditTool::Magic => egui::CursorIcon::PointingHand,
                         EditTool::TrackSelect => egui::CursorIcon::PointingHand,
-                        EditTool::Select | EditTool::Trim | EditTool::RippleTrim => {
-                            egui::CursorIcon::ResizeHorizontal
-                        }
+                        EditTool::Select
+                        | EditTool::Trim
+                        | EditTool::RippleTrim
+                        | EditTool::Roll
+                        | EditTool::Slip
+                        | EditTool::Slide => egui::CursorIcon::ResizeHorizontal,
                     });
                 }
                 // Caja de selección: arrastrar sobre el fondo marca todos los
@@ -14012,7 +15946,7 @@ fn render_preview_frame(
             let Some(title) = clip.title.as_ref() else {
                 continue;
             };
-            let Some(font) = find_font() else {
+            let Some(font) = fuentes::resolve(title.font.as_deref()) else {
                 return Err("No se encontro una fuente TTF del sistema para los titulos".to_owned());
             };
             // El tamano se define sobre 1080p y se escala al monitor.
@@ -14026,7 +15960,7 @@ fn render_preview_frame(
                 Some(local.max(0.0)),
             );
             filters.push(format!(
-                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none,colorchannelmixer=aa={opacity:.6}[pv{index}]",
+                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0,colorchannelmixer=aa={opacity:.6}[pv{index}]",
             ));
         } else {
             let is_blend = clip.fusion.blend_mode().is_some();
@@ -14049,7 +15983,7 @@ fn render_preview_frame(
             let lut = lut_filter(clip.lut.as_deref());
             let mask = mask_filter(clip.mask.as_ref(), width as f64, height as f64);
             let cadence = conform_video_filter(clip, &frame_rate);
-            let geometry = clip.fx.geometry_chain(false);
+            let geometry = clip.fx.geometry_chain(false, false);
             let fx_color = clip.fx.video_color_chain();
             let fx_alpha = clip.fx.alpha_chain();
             let scale_mode = if is_blend { "increase" } else { "decrease" };
@@ -14069,7 +16003,7 @@ fn render_preview_frame(
                 // `setpts=PTS-STARTPTS`: tras `-ss` el primer fotograma no
                 // empieza en 0 si el cabezal cae entre dos fotogramas del
                 // medio, y `overlay` componía el fondo negro sin él.
-                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
@@ -14134,8 +16068,9 @@ fn render_preview_frame(
         }
         previous = output;
     }
+    let _graph = attach_graph(&mut command, &filters)?;
     let result = command
-        .args(["-filter_complex", &filters.join(";"), "-map", "[vout]"])
+        .args(["-map", "[vout]"])
         .args([
             "-frames:v",
             "1",
@@ -14496,8 +16431,30 @@ fn build_render_filters(
         let speed = clips[index].speed.clamp(0.1, 8.0);
         let start = clips[index].timeline_start.max(0.0);
         if clips[index].has_video && include_video {
-            let angle = clips[index].rotation.to_radians();
-            let opacity = (clips[index].opacity / 100.0).clamp(0.0, 1.0);
+            let (_, _, static_scale, static_opacity) = clips[index].evaluate_transform(0.0);
+            let opacity = (static_opacity / 100.0).clamp(0.0, 1.0);
+            let transform = moving_transform(&clips[index]);
+            let animation = efectos::Animation {
+                tracks: Some(&clips[index].anim),
+                tag: index.to_string(),
+                frame: timebase.seconds(1),
+                duration: clips[index].duration(),
+                // Los títulos y capas de ajuste se animan ya en tiempo de
+                // composición; los medios, en tiempo local del clip.
+                shift: if clips[index].is_adjustment { start } else { 0.0 },
+            };
+            let mut commands: Vec<String> = Vec::new();
+            let rotate = rotate_filter(&clips[index], &animation);
+            // Opacidad: constante o animada por órdenes sobre el mezclador.
+            let opacity_filter = match transform.as_ref().filter(|tracks| animacion::varies(&tracks[3])) {
+                Some(tracks) => {
+                    let target = format!("colorchannelmixer@o{index}");
+                    let to_alpha = |v: f64| (v / 100.0).clamp(0.0, 1.0);
+                    commands.extend(animation.commands(&target, &[("aa", &to_alpha)], &tracks[3]));
+                    format!("{target}=aa={:.6}", to_alpha(tracks[3][0].v))
+                }
+                None => format!("colorchannelmixer=aa={opacity:.6}"),
+            };
             let (fade_in, fade_out) = clips[index].effective_fades();
             let duration = clips[index].duration();
             let mut fade_filters = String::new();
@@ -14515,11 +16472,7 @@ fn build_render_filters(
                     white(clips[index].runtime.white_out)
                 ));
             }
-            let eq = color_eq_filter(
-                clips[index].exposure,
-                clips[index].contrast,
-                clips[index].saturation,
-            );
+            let eq = animated_eq(&clips[index], &animation);
             if clips[index].is_adjustment {
                 // Sin `[v{index}]`: la capa de ajuste no aporta imagen propia,
                 // se aplica directamente sobre lo compuesto debajo en el
@@ -14528,7 +16481,7 @@ fn build_render_filters(
                 let Some(title) = clips[index].title.as_ref() else {
                     return Err("Entrada de titulo sin titulo".to_owned());
                 };
-                let Some(font) = find_font() else {
+                let Some(font) = fuentes::resolve(title.font.as_deref()) else {
                     return Err(
                         "No se encontro una fuente TTF del sistema para los titulos".to_owned()
                     );
@@ -14537,8 +16490,11 @@ fn build_render_filters(
                 // así un 720p o un 4K conservan la proporción que se ve.
                 let fontsize = title.size.max(8.0) * out_h as f64 / 1080.0;
                 let drawing = title_layer_filters(title, &font, fontsize, (out_w, out_h), None);
+                // Todo en tiempo local del título y el desplazamiento al final:
+                // los fundidos van en su tiempo, no en el segundo 0.
+                let sendcmd = animacion::sendcmd(&commands);
                 filters.push(format!(
-                    "[{media}:v:0]{drawing},format=rgba,setpts=(PTS-STARTPTS)+{start:.6}/TB,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none,colorchannelmixer=aa={opacity:.6}{fade_filters}[v{index}]",
+                    "[{media}:v:0]{drawing},format=rgba,setpts=PTS-STARTPTS{sendcmd}{rotate},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]",
                 ));
             } else {
                 let is_blend = clips[index].fusion.blend_mode().is_some();
@@ -14551,15 +16507,20 @@ fn build_render_filters(
                 let width = if cover_canvas {
                     out_w
                 } else {
-                    even_dimension(out_w as f64 * clips[index].scale_percent / 100.0)
+                    even_dimension(out_w as f64 * static_scale / 100.0)
                 };
                 let height = if cover_canvas {
                     out_h
                 } else {
-                    even_dimension(out_h as f64 * clips[index].scale_percent / 100.0)
+                    even_dimension(out_h as f64 * static_scale / 100.0)
                 };
-                let vig = vignette_filter(clips[index].vignette);
-                let blur = blur_filter(clips[index].blur, out_w.min(out_h) as f64);
+                let vig = animated_vignette(&clips[index], &animation);
+                let blur = animated_blur(
+                    &clips[index],
+                    out_w.min(out_h) as f64,
+                    &animation,
+                    &mut commands,
+                );
                 let wheels = wheels_filter(clips[index].wheels.as_ref());
                 let chroma = chroma_filter(clips[index].chroma.as_ref());
                 let curves = curves_filter(clips[index].curves.as_ref());
@@ -14588,12 +16549,61 @@ fn build_render_filters(
                 let cadence = conform_video_filter(&clips[index], &frame_rate);
                 let fx = &clips[index].fx;
                 let prefix = fx.input_prefix(clips[index].freeze_at.is_some());
-                let geometry = fx.geometry_chain(true);
-                let fx_color = fx.video_color_chain();
+                // Pasada 2 de vidstab sobre los fotogramas tal como se leen,
+                // antes de invertir o conformar cadencia (como en el análisis).
+                let warp = if estabilizar::ready(&clips[index]) {
+                    estabilizar::transform_filter(&clips[index])
+                } else {
+                    String::new()
+                };
+                let geometry = fx.geometry_chain(true, !warp.is_empty());
+                let cadence = match clips[index].freeze_at {
+                    None => fx.interpolation.filter(&frame_rate).unwrap_or(cadence),
+                    Some(_) => cadence,
+                };
+                let fx_color = fx.video_color_chain_animated(&animation, &mut commands);
                 let fx_alpha = fx.alpha_chain();
-                filters.push(format!(
-                    "[{media}:v:0]{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=none{blend_canvas},colorchannelmixer=aa={opacity:.6}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
-                ));
+                // Escala animada: el tamaño cambia por fotograma, y `rotate`
+                // fija el suyo con el primero, así que la capa se centra en un
+                // lienzo transparente del tamaño máximo antes de girar.
+                let zoom = transform
+                    .as_ref()
+                    .filter(|tracks| !cover_canvas && animacion::varies(&tracks[2]));
+                let size_filter = match zoom {
+                    Some(tracks) => {
+                        let percent = animacion::expression(&tracks[2], "t");
+                        format!(
+                            "scale=w='max(2,trunc({out_w}*({percent})/200)*2)':h='max(2,trunc({out_h}*({percent})/200)*2)':eval=frame:force_original_aspect_ratio={scale_mode}"
+                        )
+                    }
+                    None => format!(
+                        "scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop}"
+                    ),
+                };
+                let sendcmd = animacion::sendcmd(&commands);
+                let wipe = clips[index].runtime.wipe_filter();
+                let head = format!(
+                    "[{media}:v:0]{warp}{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
+                );
+                let tail = format!(
+                    "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
+                );
+                match zoom {
+                    Some(tracks) => {
+                        let largest = tracks[2].iter().map(|key| key.v).fold(1.0, f64::max);
+                        let canvas_w = even_dimension(out_w as f64 * largest / 100.0);
+                        let canvas_h = even_dimension(out_h as f64 * largest / 100.0);
+                        filters.push(format!("{head}[zoom{index}]"));
+                        filters.push(format!(
+                            "color=c=black@0.0:s={canvas_w}x{canvas_h}:r={frame_rate}:d={:.6},format=rgba[zoomcanvas{index}]",
+                            duration + timebase.seconds(1)
+                        ));
+                        filters.push(format!(
+                            "[zoomcanvas{index}][zoom{index}]overlay=x='(W-w)/2':y='(H-h)/2':eval=frame:shortest=1:format=auto{tail}"
+                        ));
+                    }
+                    None => filters.push(format!("{head}{tail}")),
+                }
             }
         }
         if clips[index].has_audio && include_audio && !clips[index].is_adjustment {
@@ -14609,12 +16619,17 @@ fn build_render_filters(
             let fade_out_audio = fade_out_audio.max(clips[index].runtime.audio_fade_out);
             let audio_duration = clips[index].duration();
             let mut afade_filters = String::new();
+            let curve = if clips[index].runtime.audio_crossfade {
+                ":curve=qsin"
+            } else {
+                ""
+            };
             if fade_in_audio > 0.004 {
-                afade_filters.push_str(&format!(",afade=t=in:st=0:d={fade_in_audio:.3}"));
+                afade_filters.push_str(&format!(",afade=t=in:st=0:d={fade_in_audio:.3}{curve}"));
             }
             if fade_out_audio > 0.004 {
                 afade_filters.push_str(&format!(
-                    ",afade=t=out:st={:.3}:d={fade_out_audio:.3}",
+                    ",afade=t=out:st={:.3}:d={fade_out_audio:.3}{curve}",
                     (audio_duration - fade_out_audio)
                 ));
             }
@@ -14662,8 +16677,7 @@ fn build_render_filters(
         } else {
             format!("overlay{layer}")
         };
-        let x = clips[index].position_x;
-        let y = clips[index].position_y;
+        let (x, y, _, _) = clips[index].evaluate_transform(0.0);
         if clips[index].is_adjustment {
             // Capa de ajuste: sin overlay de medio propio. Gradúa una copia
             // de todo lo compuesto debajo (`[previous]`) y la recompone solo
@@ -14678,13 +16692,22 @@ fn build_render_filters(
             let wheels = wheels_filter(clips[index].wheels.as_ref());
             let curves = curves_filter(clips[index].curves.as_ref());
             let lut = lut_filter(clips[index].lut.as_deref());
-            let eq = color_eq_filter(
-                clips[index].exposure,
-                clips[index].contrast,
-                clips[index].saturation,
+            let animation = efectos::Animation {
+                tracks: Some(&clips[index].anim),
+                tag: format!("adj{layer}"),
+                frame: timebase.seconds(1),
+                duration: clips[index].duration(),
+                shift: start,
+            };
+            let mut commands = Vec::new();
+            let eq = animated_eq(&clips[index], &animation);
+            let vig = animated_vignette(&clips[index], &animation);
+            let blur = animated_blur(
+                &clips[index],
+                out_w.min(out_h) as f64,
+                &animation,
+                &mut commands,
             );
-            let vig = vignette_filter(clips[index].vignette);
-            let blur = blur_filter(clips[index].blur, out_w.min(out_h) as f64);
             let spatial = clips[index]
                 .mask
                 .as_ref()
@@ -14696,9 +16719,12 @@ fn build_render_filters(
             filters.push(format!(
                 "[{previous}]split=2[adjbase{layer}][adjsrc{layer}]"
             ));
-            let fx_color = clips[index].fx.video_color_chain();
+            let fx_color = clips[index]
+                .fx
+                .video_color_chain_animated(&animation, &mut commands);
+            let sendcmd = animacion::sendcmd(&commands);
             filters.push(format!(
-                "[adjsrc{layer}]null{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba,geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':a='{alpha_expr}'[adjfx{layer}]"
+                "[adjsrc{layer}]null{sendcmd}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba,geq=r='r(X\\,Y)':g='g(X\\,Y)':b='b(X\\,Y)':a='{alpha_expr}'[adjfx{layer}]"
             ));
             filters.push(format!(
                 "[adjbase{layer}][adjfx{layer}]overlay=eof_action=pass:shortest=0:format=auto[{output_label}]"
@@ -14728,7 +16754,15 @@ fn build_render_filters(
             filters.push(format!(
                 "[base{layer}b][blenda{layer}]overlay=eof_action=pass:shortest=0:format=auto[{output_label}]"
             ));
-        } else if let Some((dx, dy)) = clips[index].runtime.offset_expressions() {
+        } else if let Some(((dx, dy), (px, py))) = clips[index]
+            .runtime
+            .offset_expressions()
+            .map(|offsets| (offsets, (format!("{x:.3}"), format!("{y:.3}"))))
+            .or_else(|| {
+                moving_position(&clips[index])
+                    .map(|position| ((String::new(), String::new()), position))
+            })
+        {
             let term = |expression: String| {
                 if expression.is_empty() {
                     String::new()
@@ -14736,8 +16770,9 @@ fn build_render_filters(
                     format!("+{expression}")
                 }
             };
+            let (px, py) = moving_position(&clips[index]).unwrap_or((px, py));
             filters.push(format!(
-                "[{previous}][v{index}]overlay=x='(W-w)/2+{x:.3}{}':y='(H-h)/2+{y:.3}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
+                "[{previous}][v{index}]overlay=x='(W-w)/2+{px}{}':y='(H-h)/2+{py}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
                 term(dx),
                 term(dy)
             ));
@@ -14766,74 +16801,179 @@ fn build_render_filters(
     Ok(filters)
 }
 
-/// Exporta con la GPU si se pide y, si la GPU falla (driver viejo, sesión
-/// remota, límite de sesiones de NVENC…), repite con CPU en vez de fallar.
-#[allow(clippy::too_many_arguments)]
-fn run_export(
-    clips: &[RoughClip],
-    output: &Path,
-    cancel: &AtomicBool,
+/// Algo del panel Proyecto que se puede renombrar.
+#[derive(Clone, PartialEq)]
+enum ProjectItem {
+    Sequence(u64),
+    Bin(String),
+}
+
+/// Arrastre de un medio de la biblioteca (índice en `project.library`).
+#[derive(Clone, Copy)]
+struct LibraryPayload(usize);
+
+/// Arrastre de una secuencia guardada (su id), que entra como anidada.
+#[derive(Clone, Copy)]
+struct SequencePayload(u64);
+
+/// Estado de un trabajo de la cola de exportación.
+#[derive(Clone, PartialEq)]
+enum JobState {
+    Waiting,
+    Running,
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+/// Un trabajo de la cola: una instantánea del montaje en el momento de
+/// añadirlo (como Media Encoder), así que seguir editando no lo altera.
+struct QueueItem {
+    id: u64,
+    job: RenderJob,
+    state: JobState,
+    /// Resumen para la lista: formato, tamaño y duración.
+    summary: String,
+}
+
+/// Todo lo que define una exportación. Se construye en el hilo de la
+/// interfaz y viaja entero al hilo de render (y a la cola de exportación).
+#[derive(Clone)]
+struct RenderJob {
+    clips: Vec<RoughClip>,
+    output: PathBuf,
+    /// Codificación rápida para previsualizar.
     fast: bool,
     size: (u32, u32),
     audio_only: bool,
     format: ExportFormat,
-    track_gains: &[f64],
+    track_gains: Vec<f64>,
     master_gain_db: f64,
     normalize_loudness: bool,
     timebase: Timebase,
-    measured_loudness: Option<&LoudnessReport>,
+    measured_loudness: Option<LoudnessReport>,
     hw: Option<aceleracion::HwBackend>,
+    /// Segundos iniciales del grafo que se componen pero no se escriben: el
+    /// preroll de `montaje::window` cuando el rango empieza dentro de un
+    /// fundido, una transición o una secuencia anidada.
+    skip: f64,
+    /// Duración de la salida; `None` es hasta el final del último clip.
+    length: Option<f64>,
+    /// Calidad o bitrate y audio elegidos (no se aplican a `fast`).
+    encode: exportacion::EncodeSettings,
+}
+
+impl RenderJob {
+    /// Duración real del archivo que se escribe.
+    fn output_length(&self) -> f64 {
+        let total = self
+            .clips
+            .iter()
+            .map(|clip| clip.timeline_start + clip.duration())
+            .fold(0.0, f64::max);
+        let available = (total - self.skip).max(0.0);
+        self.length.map_or(available, |length| length.min(available))
+    }
+}
+
+/// Un único fotograma PNG del trabajo, en `job.skip` segundos.
+fn render_still(job: &RenderJob) -> Result<(), String> {
+    let prepared = prepare_render_clips(&job.clips);
+    let mut command = Command::new(tool_path("ffmpeg.exe"));
+    command.args(["-v", "error", "-y"]);
+    let (indices, titles) = push_render_inputs(&mut command, &prepared, job.size, false, job.timebase);
+    let filters = build_render_filters(
+        &prepared,
+        &indices,
+        &titles,
+        job.size,
+        true,
+        false,
+        &job.track_gains,
+        job.master_gain_db,
+        job.normalize_loudness,
+        job.timebase,
+        None,
+    )?;
+    let _graph = attach_graph(&mut command, &filters)?;
+    let output = command
+        .args(["-map", "[vout]"])
+        .args(["-ss", &format_seconds(job.skip), "-frames:v", "1", "-update", "1"])
+        .arg(&job.output)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+    if output.status.success() && job.output.is_file() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// Exporta con la GPU si se pide y, si la GPU falla (driver viejo, sesión
+/// remota, límite de sesiones de NVENC…), repite con CPU en vez de fallar.
+fn run_export(
+    job: &RenderJob,
+    cancel: &AtomicBool,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
-    let attempt = |hw| {
-        run_export_once(
-            clips,
-            output,
-            cancel,
-            fast,
-            size,
-            audio_only,
-            format,
-            track_gains,
-            master_gain_db,
-            normalize_loudness,
-            timebase,
-            measured_loudness,
-            hw,
-            progress,
-        )
-    };
-    let result = attempt(hw);
-    match (result, hw) {
+    let result = run_export_once(job, job.hw, cancel, progress);
+    match (result, job.hw) {
         (Err(_), Some(backend)) if !cancel.load(Ordering::Relaxed) => {
             if let Ok(mut state) = progress.lock() {
                 state.pct = 0.0;
                 state.note = Some(format!("{} falló; se exportó con CPU", backend.label()));
             }
-            attempt(None)
+            run_export_once(job, None, cancel, progress)
         }
         (result, _) => result,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_export_once(
-    clips: &[RoughClip],
-    output: &Path,
-    cancel: &AtomicBool,
-    fast: bool,
-    size: (u32, u32),
-    audio_only: bool,
-    format: ExportFormat,
-    track_gains: &[f64],
-    master_gain_db: f64,
-    normalize_loudness: bool,
-    timebase: Timebase,
-    measured_loudness: Option<&LoudnessReport>,
+    job: &RenderJob,
     hw: Option<aceleracion::HwBackend>,
+    cancel: &AtomicBool,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
+    let RenderJob {
+        output,
+        fast,
+        size,
+        audio_only,
+        format,
+        track_gains,
+        master_gain_db,
+        normalize_loudness,
+        timebase,
+        ..
+    } = job;
+    let (output, fast, size, audio_only, format) = (output.as_path(), *fast, *size, *audio_only, *format);
+    let (master_gain_db, normalize_loudness, timebase) = (*master_gain_db, *normalize_loudness, *timebase);
+    let measured_loudness = job.measured_loudness.as_ref();
+    let clips = job.clips.as_slice();
     let prepared = prepare_render_clips(clips);
+    // El estabilizador de deformación necesita su análisis antes de
+    // renderizar; si falla, ese clip cae al estabilizador rápido.
+    if estabilizar::vidstab_available() {
+        for clip in prepared.iter().filter(|clip| estabilizar::wants_warp(clip)) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Exportación cancelada".to_owned());
+            }
+            if !estabilizar::ready(clip) {
+                if let Ok(mut state) = progress.lock() {
+                    state.note = Some(format!("analizando movimiento de {}", clip.name()));
+                }
+                if let Err(error) = estabilizar::analyze(clip) {
+                    if let Ok(mut state) = progress.lock() {
+                        state.note = Some(format!("{}: estabilización rápida ({error})", clip.name()));
+                    }
+                }
+            }
+        }
+    }
     let clips: &[RoughClip] = &prepared;
     if let Some(missing) = clips
         .iter()
@@ -14877,10 +17017,7 @@ fn run_export_once(
         timebase,
         measured_loudness,
     )?;
-    let total = clips
-        .iter()
-        .map(|clip| clip.timeline_start + clip.duration())
-        .fold(0.0, f64::max);
+    let total = job.output_length();
 
     let log_file = std::fs::File::create(&error_log)
         .map_err(|error| format!("No se pudo crear el registro de exportación: {error}"))?;
@@ -14891,7 +17028,8 @@ fn run_export_once(
     } else {
         "[vout]"
     };
-    let child = command.args(["-filter_complex", &filters.join(";")]);
+    let _graph = attach_graph(&mut command, &filters)?;
+    let child = &mut command;
     if !audio_only {
         child.args(["-map", video_label]);
     }
@@ -14899,7 +17037,16 @@ fn run_export_once(
         child.args(["-map", "[aout]"]);
     }
     child.args(["-progress", "pipe:1", "-nostats"]);
-    child.args(format.export_args(fast, hw));
+    let mut codec = format.export_args(fast, hw);
+    if !fast {
+        let accelerated = hw.filter(|_| matches!(format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc));
+        exportacion::apply(&mut codec, &job.encode, accelerated);
+    }
+    child.args(codec);
+    if job.skip > 0.0005 {
+        // Búsqueda en la salida: exacta al fotograma, y el preroll es corto.
+        child.args(["-ss", &format_seconds(job.skip)]);
+    }
     let mut child = child
         .args(["-t", &format_seconds(total)])
         .arg(&temporary)
@@ -14975,6 +17122,141 @@ fn run_export_once(
             .collect::<Vec<_>>()
             .join(" | "))
     }
+}
+
+/// Fuente a mitad de un clip, respetando velocidad e inversión.
+fn middle_source_time(clip: &RoughClip) -> f64 {
+    let advanced = clip.duration() / 2.0 * clip.speed.clamp(0.1, 8.0);
+    if clip.fx.reverse {
+        (clip.out_seconds - advanced).max(clip.in_seconds)
+    } else {
+        clip.in_seconds + advanced
+    }
+}
+
+/// Mide el plano de referencia tal como se ve (con su gradación) y el
+/// objetivo en bruto (la igualación va antes de su propia gradación), y
+/// devuelve la corrección que lleva uno al otro.
+fn compute_color_match(
+    target: &RoughClip,
+    reference: &RoughClip,
+    timebase: Timebase,
+) -> Result<efectos::ColorMatch, String> {
+    let mut graded = reference.clone();
+    graded.freeze_animation(reference.duration() / 2.0);
+    graded.position_x = 0.0;
+    graded.position_y = 0.0;
+    graded.scale_percent = 100.0;
+    graded.opacity = 100.0;
+    graded.fade_in_seconds = 0.0;
+    graded.fade_out_seconds = 0.0;
+    let reference_frame = render_preview_frame(&[(graded, middle_source_time(reference))], timebase)?;
+    let target_frame = extract_frame(&target.path, middle_source_time(target), 160, 90)?;
+    Ok(efectos::ColorMatch::between(
+        efectos::ColorMatch::stats(&target_frame.pixels, 4),
+        efectos::ColorMatch::stats(&reference_frame.pixels, 4),
+    ))
+}
+
+/// Con proxies, el clip pasa a leer su proxy: así todo lo que depende del
+/// archivo (el análisis de estabilización) ve el medio que de verdad se lee.
+fn use_proxy_paths(clips: &mut [RoughClip]) {
+    for clip in clips {
+        if let Some(proxy) = clip.proxy.clone().filter(|path| path.is_file()) {
+            clip.path = proxy;
+        }
+    }
+}
+
+/// Selector de fuente de un título: búsqueda y lista de familias instaladas.
+fn font_picker(ui: &mut egui::Ui, font: &mut Option<PathBuf>) -> bool {
+    fuentes::start_loading();
+    let current = font
+        .as_deref()
+        .and_then(fuentes::read_names)
+        .map(|(family, style)| {
+            if style.is_empty() || style.eq_ignore_ascii_case("regular") {
+                family
+            } else {
+                format!("{family} {style}")
+            }
+        })
+        .unwrap_or_else(|| "Predeterminada".to_owned());
+    let mut changed = false;
+    let search_id = ui.id().with("font-search");
+    egui::ComboBox::from_id_salt("title-font")
+        .width(ui.available_width().min(240.0))
+        .selected_text(current)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let mut query: String = ui.data_mut(|data| data.get_temp(search_id).unwrap_or_default());
+            ui.add(egui::TextEdit::singleline(&mut query).hint_text("Buscar fuente…"));
+            ui.data_mut(|data| data.insert_temp(search_id, query.clone()));
+            if ui.selectable_label(font.is_none(), "Predeterminada").clicked() {
+                *font = None;
+                changed = true;
+            }
+            let Some(installed) = fuentes::installed() else {
+                ui.label(egui::RichText::new("Cargando fuentes…").color(theme::TEXT_DIM));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            };
+            let query = query.to_lowercase();
+            for entry in installed
+                .iter()
+                .filter(|entry| query.is_empty() || entry.label().to_lowercase().contains(&query))
+                .take(300)
+            {
+                let chosen = font.as_deref() == Some(entry.path.as_path());
+                if ui.selectable_label(chosen, entry.label()).clicked() {
+                    *font = Some(entry.path.clone());
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+/// Muestra el archivo seleccionado en el Explorador (o en Finder en el
+/// host de desarrollo).
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(windows)]
+    let result = Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let result = Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn();
+    let _ = result;
+}
+
+/// Grafo de filtros escrito en un temporal. Windows limita la línea de
+/// órdenes a 32 767 caracteres y el grafo de un montaje de un par de
+/// centenares de clips ya lo supera, así que siempre viaja por archivo
+/// (`-/filter_complex`, FFmpeg ≥ 7). El archivo se borra al soltar el guardia,
+/// que debe vivir hasta que FFmpeg haya arrancado.
+struct GraphFile(PathBuf);
+
+impl Drop for GraphFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn attach_graph(command: &mut Command, filters: &[String]) -> Result<GraphFile, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "novacut-grafo-{}-{serial}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, filters.join(";"))
+        .map_err(|error| format!("No se pudo escribir el grafo de filtros: {error}"))?;
+    command.arg("-/filter_complex").arg(&path);
+    Ok(GraphFile(path))
 }
 
 fn tool_path(name: &str) -> PathBuf {
@@ -15082,7 +17364,7 @@ fn resolve_project_paths(project: &mut RoughProject, project_directory: Option<&
     let Some(directory) = project_directory.filter(|path| !path.as_os_str().is_empty()) else {
         return;
     };
-    for clip in &mut project.clips {
+    for clip in project.all_clips_mut() {
         resolve_clip_paths(clip, directory);
     }
 }
@@ -15110,7 +17392,7 @@ fn project_for_storage(project: &RoughProject, project_path: &Path) -> RoughProj
     else {
         return stored;
     };
-    for clip in &mut stored.clips {
+    for clip in stored.all_clips_mut() {
         relativize_clip_paths(clip, directory);
     }
     stored
@@ -16018,6 +18300,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         assert_eq!(clip.duration(), 0.0);
     }
@@ -16080,6 +18363,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             }],
             markers: vec![],
             subtitles: vec![],
@@ -16193,6 +18477,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         clip.fade_in_seconds = clip.fade_in_seconds.max(0.0).min(clip.duration() / 2.0);
         clip.fade_out_seconds = clip.fade_out_seconds.max(0.0).min(clip.duration() / 2.0);
@@ -16250,6 +18535,7 @@ mod tests {
             nested: None,
             freeze_at: None,
             enabled: true,
+            anim: animacion::Tracks::new(),
         };
         assert_eq!(clip.duration(), 4.0);
         assert_eq!(atempo_filter(4.0), "atempo=2.0,atempo=2.000000");
@@ -16460,6 +18746,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             },
             RoughClip {
                 path: PathBuf::from("overlay.mp4"),
@@ -16508,6 +18795,7 @@ mod tests {
                 nested: None,
                 freeze_at: None,
                 enabled: true,
+                anim: animacion::Tracks::new(),
             },
         ];
         let project = RoughProject {
@@ -16657,6 +18945,7 @@ mod tests {
                     green: 0.5,
                     blue: 0.0,
                     style: efectos::TitleStyle::default(),
+                    font: None,
                 }),
                 ..Default::default()
             }],
@@ -16925,7 +19214,7 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_interpolate_linearly_and_expand() {
+    fn keyframes_interpolate_linearly_and_render_per_frame() {
         let mut clip = RoughClip {
             out_seconds: 10.0,
             position_x: 0.0,
@@ -16955,14 +19244,13 @@ mod tests {
         assert_eq!(clip.evaluate_transform(-1.0).0, 0.0);
         assert_eq!(clip.evaluate_transform(99.0).0, 400.0);
 
-        let expanded = expand_keyframes(vec![clip]);
-        // Tramos: [0,8] y [8,10].
-        assert_eq!(expanded.len(), 2);
-        let first = &expanded[0];
-        assert_eq!(first.timeline_start, 0.0);
-        assert!((first.duration() - 8.0).abs() < 1e-9);
-        assert!((first.position_x - 200.0).abs() < 1e-9);
-        assert!(first.keyframes.is_none());
+        // El render no trocea: el clip sigue entero y la posición viaja
+        // como expresión por fotograma.
+        let prepared = prepare_render_clips(&[clip.clone()]);
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].keyframes.is_some());
+        let (x, _) = moving_position(&clip).unwrap();
+        assert!(x.contains("if(lt((t-0.000000),8.000000)"), "{x}");
     }
 
     #[test]
@@ -17296,6 +19584,44 @@ mod tests {
     }
 
     #[test]
+    fn long_edits_fit_the_windows_command_line_through_a_graph_file() {
+        let clips: Vec<RoughClip> = (0..200)
+            .map(|index| RoughClip {
+                path: PathBuf::from(format!("C:\\Grabaciones\\entrevista-{index:03}.mp4")),
+                out_seconds: 3.0,
+                timeline_start: index as f64 * 3.0,
+                ..Default::default()
+            })
+            .collect();
+        let prepared = prepare_render_clips(&clips);
+        let mut command = Command::new("ffmpeg");
+        let (indices, titles) =
+            push_render_inputs(&mut command, &prepared, (1920, 1080), false, Timebase::from_fps(25.0));
+        let filters = build_render_filters(
+            &prepared, &indices, &titles, (1920, 1080), true, true, &[], 0.0, false,
+            Timebase::from_fps(25.0), None,
+        )
+        .unwrap();
+        assert!(filters.join(";").len() > 32_767, "el grafo solo ya no cabe");
+        let _graph = attach_graph(&mut command, &filters).unwrap();
+        let line: usize = command.get_args().map(|arg| arg.len() + 3).sum();
+        assert!(line < 32_767, "línea de órdenes de {line} caracteres");
+    }
+
+    #[test]
+    fn jkl_shuttle_doubles_up_to_eight_and_flips_to_one() {
+        assert_eq!(next_shuttle_rate(None, true), 1);
+        assert_eq!(next_shuttle_rate(Some(1), true), 2);
+        assert_eq!(next_shuttle_rate(Some(4), true), 8);
+        assert_eq!(next_shuttle_rate(Some(8), true), 8);
+        assert_eq!(next_shuttle_rate(Some(4), false), -1);
+        assert_eq!(next_shuttle_rate(Some(-2), false), -4);
+        assert_eq!(next_shuttle_rate(Some(-8), true), 1);
+        assert_eq!(atempo_chain(1), "");
+        assert_eq!(atempo_chain(4), ",atempo=2,atempo=2");
+    }
+
+    #[test]
     fn work_range_trim_cuts_edges_and_moves_to_zero() {
         let clips = vec![
             RoughClip {
@@ -17313,12 +19639,13 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let trimmed = trim_clips_to_range(&clips, 4.0, 8.0);
+        let (trimmed, preroll) = montaje::window(&clips, 4.0, 8.0);
+        assert_eq!(preroll, 0.0);
         assert_eq!(trimmed.len(), 1, "el clip fuera de rango se descarta");
         assert!((trimmed[0].timeline_start - 0.0).abs() < 1e-9);
         assert!((trimmed[0].in_seconds - 4.0).abs() < 1e-9);
-        assert!((trimmed[0].out_seconds - 8.0).abs() < 1e-9);
-        assert!((trimmed[0].duration() - 4.0).abs() < 1e-9);
+        // La cola no se recorta: la corta la duración de salida del render.
+        assert!((trimmed[0].out_seconds - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -17349,11 +19676,13 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let trimmed = trim_clips_to_range(&clips, 1.0, 3.0);
+        let (trimmed, preroll) = montaje::window(&clips, 2.0, 3.0);
+        // La rampa empieza en 1 s: no se corta por dentro, se compone desde
+        // su inicio y ese segundo se descarta en la salida.
+        assert!((preroll - 1.0).abs() < 1e-9);
         // A doble velocidad, un segundo de montaje consume dos de origen.
         assert!((trimmed[0].in_seconds - 2.0).abs() < 1e-9);
-        assert!((trimmed[0].out_seconds - 6.0).abs() < 1e-9);
-        // La rampa no se recorta por dentro: solo se desplaza.
+        assert!((trimmed[0].out_seconds - 8.0).abs() < 1e-9);
         assert!(trimmed[1].speed_ramp.is_some());
         assert!((trimmed[1].timeline_start - 0.0).abs() < 1e-9);
     }
@@ -17841,6 +20170,31 @@ mod render_real_tests {
         export_with(clips, output, format, None)
     }
 
+    fn test_job(
+        clips: &[RoughClip],
+        output: &Path,
+        format: ExportFormat,
+        hw: Option<aceleracion::HwBackend>,
+    ) -> RenderJob {
+        RenderJob {
+            clips: clips.to_vec(),
+            output: output.to_path_buf(),
+            fast: false,
+            size: (640, 360),
+            audio_only: format.is_audio_only(),
+            format,
+            track_gains: Vec::new(),
+            master_gain_db: 0.0,
+            normalize_loudness: false,
+            timebase: Timebase::from_fps(25.0),
+            measured_loudness: None,
+            hw,
+            skip: 0.0,
+            length: None,
+            encode: exportacion::EncodeSettings::default(),
+        }
+    }
+
     fn export_with(
         clips: &[RoughClip],
         output: &Path,
@@ -17849,19 +20203,8 @@ mod render_real_tests {
     ) -> Result<(), String> {
         let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
         run_export(
-            clips,
-            output,
+            &test_job(clips, output, format, hw),
             &AtomicBool::new(false),
-            false,
-            (640, 360),
-            format.is_audio_only(),
-            format,
-            &[],
-            0.0,
-            false,
-            Timebase::from_fps(25.0),
-            None,
-            hw,
             &progress,
         )
     }
@@ -17998,19 +20341,8 @@ mod render_real_tests {
         let output = directory.join("fallback.mp4");
         let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
         run_export(
-            &clips,
-            &output,
+            &test_job(&clips, &output, ExportFormat::Mp4Video, Some(absent)),
             &AtomicBool::new(false),
-            false,
-            (640, 360),
-            false,
-            ExportFormat::Mp4Video,
-            &[],
-            0.0,
-            false,
-            Timebase::from_fps(25.0),
-            None,
-            Some(absent),
             &progress,
         )
         .unwrap();
@@ -18273,6 +20605,616 @@ mod render_real_tests {
         assert!(
             brightness(&raw, 320, 180) > 40.0,
             "la exportación tapa el vídeo con el título"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Brillo medio del fotograma en `at` segundos de un archivo.
+    fn mean_brightness_at(path: &Path, at: f64) -> f64 {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v", "1", "-vf", "scale=160:90", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(raw.len(), 160 * 90, "no hay fotograma en {at} s");
+        raw.iter().map(|&value| value as f64).sum::<f64>() / raw.len() as f64
+    }
+
+    /// Fotograma RGB de 160×90 en `at` segundos.
+    fn frame_rgb(path: &Path, at: f64) -> Vec<u8> {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v", "1", "-vf", "scale=160:90", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(raw.len(), 160 * 90 * 3, "no hay fotograma en {at} s");
+        raw
+    }
+
+    /// Fracción de píxeles que no son negro del lienzo.
+    fn covered(pixels: &[u8]) -> f64 {
+        let lit = pixels
+            .chunks_exact(3)
+            .filter(|pixel| pixel.iter().any(|&value| value > 24))
+            .count();
+        lit as f64 / (pixels.len() / 3) as f64
+    }
+
+    fn mean_channel(pixels: &[u8], channel: usize) -> f64 {
+        let values: Vec<f64> = pixels.chunks_exact(3).map(|pixel| pixel[channel] as f64).collect();
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+
+    fn camera_clip(directory: &Path) -> RoughClip {
+        let (video, _) = generate(directory);
+        RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            ..Default::default()
+        }
+    }
+
+    fn export_and_read(clip: RoughClip, directory: &Path, name: &str) -> PathBuf {
+        let output = directory.join(name);
+        export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
+        output
+    }
+
+    #[test]
+    fn keyframed_zoom_and_fade_animate_every_frame_on_export() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("zoom");
+        let mut clip = camera_clip(&directory);
+        let keyframe = |t: f64, scale: f64, opacity: f64| TransformKeyframe {
+            t,
+            x: 0.0,
+            y: 0.0,
+            scale,
+            opacity,
+        };
+        clip.keyframes = Some(vec![keyframe(0.0, 40.0, 100.0), keyframe(4.0, 100.0, 100.0)]);
+        let output = export_and_read(clip.clone(), &directory, "zoom.mp4");
+        let coverage: Vec<f64> = [0.2, 1.5, 2.8, 3.8]
+            .iter()
+            .map(|&at| covered(&frame_rgb(&output, at)))
+            .collect();
+        // Antes el export usaba el valor del punto medio: todo al 70 %.
+        assert!(coverage[0] < 0.3, "cobertura {coverage:?}");
+        assert!(coverage[3] > 0.85, "cobertura {coverage:?}");
+        assert!(
+            coverage.windows(2).all(|pair| pair[1] > pair[0] + 0.05),
+            "el zoom no avanza: {coverage:?}"
+        );
+        // Opacidad animada: de 0 a 100 el brillo crece con ella.
+        clip.keyframes = Some(vec![keyframe(0.0, 100.0, 0.0), keyframe(4.0, 100.0, 100.0)]);
+        let output = export_and_read(clip, &directory, "opacidad.mp4");
+        let early = mean_channel(&frame_rgb(&output, 0.4), 1);
+        let middle = mean_channel(&frame_rgb(&output, 2.0), 1);
+        let late = mean_channel(&frame_rgb(&output, 3.8), 1);
+        assert!(early < middle * 0.5 && middle < late * 0.8, "{early} {middle} {late}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn keyframed_color_and_effects_change_over_the_clip() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("colorkf");
+        let mut clip = camera_clip(&directory);
+        let keys = |a: f64, b: f64| {
+            vec![animacion::Key { t: 0.0, v: a }, animacion::Key { t: 4.0, v: b }]
+        };
+        clip.anim.insert(animacion::Param::Exposure, keys(-0.8, 0.3));
+        clip.anim.insert(animacion::Param::Temperature, keys(-1.0, 1.0));
+        clip.anim.insert(animacion::Param::Blur, keys(0.0, 0.2));
+        clip.anim.insert(animacion::Param::Rotation, keys(0.0, 20.0));
+        clip.anim.insert(animacion::Param::Vignette, keys(0.0, 0.8));
+        let output = export_and_read(clip, &directory, "color.mp4");
+        assert!((probe_duration(&output) - 4.0).abs() < 0.15);
+        let early = frame_rgb(&output, 0.3);
+        let late = frame_rgb(&output, 3.7);
+        let luma = |pixels: &[u8]| (0..3).map(|c| mean_channel(pixels, c)).sum::<f64>() / 3.0;
+        assert!(luma(&late) > luma(&early) + 15.0, "la exposición no sube");
+        // Temperatura: fría (azul) al principio, cálida (roja) al final.
+        let warmth = |pixels: &[u8]| mean_channel(pixels, 0) - mean_channel(pixels, 2);
+        assert!(
+            warmth(&late) > warmth(&early) + 8.0,
+            "temperatura {} → {}",
+            warmth(&early),
+            warmth(&late)
+        );
+        // El giro deja esquinas negras al final, no al principio.
+        assert!(covered(&early) > covered(&late) + 0.05);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn titles_with_percent_signs_new_lines_and_other_fonts_render() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("fuentes");
+        let title = |text: &str, font: Option<PathBuf>| RoughClip {
+            out_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: text.to_owned(),
+                size: 140.0,
+                font,
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        // Filas con texto encendido: dos líneas ocupan más alto que una.
+        let lit_rows = |path: &Path| {
+            let frame = frame_rgb(path, 0.5);
+            (0..90)
+                .filter(|y| (0..160).any(|x| frame[(y * 160 + x) * 3] > 128))
+                .count()
+        };
+        let one = directory.join("una.mp4");
+        export(&[title("50% de descuento", None)], &one, ExportFormat::Mp4Video)
+            .expect("un título con % debe exportarse");
+        let two = directory.join("dos.mp4");
+        export(&[title("50% de\ndescuento", None)], &two, ExportFormat::Mp4Video).unwrap();
+        assert!(
+            lit_rows(&two) as f64 > lit_rows(&one) as f64 * 1.6,
+            "{} vs {}",
+            lit_rows(&two),
+            lit_rows(&one)
+        );
+        // Otra fuente dibuja otros píxeles con el mismo texto.
+        let default = fuentes::resolve(None).unwrap();
+        let other = fuentes::font_dirs()
+            .into_iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ttf"))
+                    && *path != default
+                    && fuentes::read_names(path).is_some()
+            });
+        if let Some(other) = other {
+            let styled = directory.join("otra.mp4");
+            export(&[title("50% de descuento", Some(other.clone()))], &styled, ExportFormat::Mp4Video).unwrap();
+            assert_ne!(frame_rgb(&styled, 0.5), frame_rgb(&one, 0.5), "{}", other.display());
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn title_fade_in_happens_when_the_title_starts() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("titulofundido");
+        let title = RoughClip {
+            out_seconds: 3.0,
+            timeline_start: 2.0,
+            fade_in_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "HOLA HOLA HOLA".to_owned(),
+                size: 160.0,
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let output = directory.join("titulo.mp4");
+        export(&[title], &output, ExportFormat::Mp4Video).unwrap();
+        let luma = |at: f64| {
+            let pixels = frame_rgb(&output, at);
+            pixels.iter().map(|&value| value as f64).fold(0.0, f64::max)
+        };
+        let (start, middle, full) = (luma(2.05), luma(2.5), luma(3.5));
+        assert!(full > 200.0, "el título no se ve: {full}");
+        assert!(start < full * 0.35, "sin fundido: {start} vs {full}");
+        assert!(middle > start && middle < full, "{start} {middle} {full}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Nivel RMS en dB de `[at, at+length]` del audio de un archivo.
+    fn rms_db(path: &Path, at: f64, length: f64) -> f64 {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-t", &format_seconds(length), "-i"])
+            .arg(path)
+            .args(["-ac", "1", "-f", "f32le", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let samples: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        let power = samples.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / samples.len().max(1) as f64;
+        10.0 * power.max(1e-12).log10()
+    }
+
+    #[test]
+    fn transitions_crossfade_audio_at_constant_power_and_wipe_the_picture() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("transiciones");
+        let camera = camera_clip(&directory);
+        let red_path = directory.join("rojo.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=640x360:r=25:d=4"])
+            .args(["-f", "lavfi", "-i", "sine=f=660:d=4:sample_rate=48000"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&red_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let red = RoughClip {
+            path: red_path,
+            out_seconds: 2.0,
+            source_duration_seconds: Some(4.0),
+            ..Default::default()
+        };
+        let incoming = |transition: &str| RoughClip {
+            timeline_start: 2.0,
+            out_seconds: 2.0,
+            transition: Some(transition.to_owned()),
+            transition_duration: 1.0,
+            ..camera.clone()
+        };
+        // Audio: 660 Hz sale mientras 300 Hz entra; el nivel no debe subir
+        // ni caer en mitad del cruce.
+        let output = directory.join("disolucion.mp4");
+        export(&[red.clone(), incoming("dissolve")], &output, ExportFormat::Mp4Video).unwrap();
+        let steady = rms_db(&output, 1.0, 0.5);
+        // Sin cruzar el saliente, al final del cruce sumaba +2,4 dB; con un
+        // fundido lineal en ambos, el centro caía 3 dB.
+        for at in [2.1, 2.4, 2.7] {
+            let level = rms_db(&output, at, 0.2);
+            assert!(
+                (level - steady).abs() < 1.0,
+                "en {at} s {level:.1} dB, fuera {steady:.1} dB"
+            );
+        }
+        // Barrido hacia la derecha a mitad: izquierda ya es la cámara,
+        // derecha sigue siendo rojo.
+        let output = directory.join("barrido.mp4");
+        export(&[red.clone(), incoming("barrido_der")], &output, ExportFormat::Mp4Video).unwrap();
+        let frame = frame_rgb(&output, 2.5);
+        // Blancura: el canal más bajo; el blanco la tiene alta y la carta no.
+        let whiteness = |from: usize, to: usize| {
+            let mut sum = 0.0;
+            let mut count = 0.0;
+            for y in 0..90 {
+                for x in from..to {
+                    let pixel = &frame[(y * 160 + x) * 3..][..3];
+                    sum += *pixel.iter().min().unwrap() as f64;
+                    count += 1.0;
+                }
+            }
+            sum / count
+        };
+        assert!(whiteness(120, 160) > 200.0, "la derecha debería seguir en blanco");
+        assert!(whiteness(0, 40) < 120.0, "la izquierda debería mostrar la cámara");
+        // Iris y zoom renderizan sin errores y terminan en la cámara.
+        for transition in ["iris", "zoom"] {
+            let output = directory.join(format!("{transition}.mp4"));
+            export(&[red.clone(), incoming(transition)], &output, ExportFormat::Mp4Video).unwrap();
+            let end = frame_rgb(&output, 3.8);
+            assert!(mean_channel(&end, 1) > 60.0, "{transition}: no termina en la cámara");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// `count` fotogramas seguidos en gris de 64×36 desde `at`.
+    fn gray_frames(path: &Path, at: f64, count: usize) -> Vec<Vec<u8>> {
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(at), "-i"])
+            .arg(path)
+            .args(["-frames:v", &count.to_string(), "-vf", "scale=64:36", "-pix_fmt", "gray"])
+            .args(["-f", "rawvideo", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        raw.chunks_exact(64 * 36).map(<[u8]>::to_vec).collect()
+    }
+
+    fn frame_difference(a: &[u8], b: &[u8]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / a.len() as f64
+    }
+
+    #[test]
+    fn warp_stabilizer_and_optical_flow_render() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("estabilizar");
+        // Imagen fija con el encuadre vibrando: todo el movimiento es temblor.
+        let shaky_path = directory.join("temblor.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "smptehdbars=s=640x360:r=25:d=4"])
+            .args([
+                "-vf",
+                "crop=560:315:x='40+30*sin(t*13)':y='22+18*cos(t*11)',scale=640:360",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&shaky_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let shaky = RoughClip {
+            path: shaky_path,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let jitter = |path: &Path| {
+            let frames = gray_frames(path, 1.0, 40);
+            frames.windows(2).map(|pair| frame_difference(&pair[0], &pair[1])).sum::<f64>()
+                / (frames.len() - 1) as f64
+        };
+        let raw = jitter(&export_and_read(shaky.clone(), &directory, "sin.mp4"));
+        if estabilizar::vidstab_available() {
+            let mut warp = shaky.clone();
+            warp.fx.stabilize = true;
+            warp.fx.stabilizer = estabilizar::Stabilizer::Deformacion;
+            let steady = jitter(&export_and_read(warp.clone(), &directory, "deformacion.mp4"));
+            assert!(estabilizar::ready(&warp), "la exportación debe dejar el análisis hecho");
+            assert!(steady < raw * 0.5, "con deformación {steady:.2} vs sin estabilizar {raw:.2}");
+            let _ = std::fs::remove_file(estabilizar::analysis_path(&warp));
+        } else if std::env::var_os("NOVACUT_REQUIRE_REAL").is_some() {
+            panic!("prueba real saltada: FFmpeg sin libvidstab");
+        }
+        // Cámara lenta al 50 %: el muestreo repite cada fotograma; el flujo
+        // óptico inventa los intermedios.
+        let camera = camera_clip(&directory);
+        let duplicates = |interpolation| {
+            let clip = RoughClip {
+                speed: 0.5,
+                fx: efectos::ClipFx {
+                    interpolation,
+                    ..Default::default()
+                },
+                ..camera.clone()
+            };
+            let name = format!("lento-{interpolation:?}.mp4");
+            let frames = gray_frames(&export_and_read(clip, &directory, &name), 2.0, 20);
+            frames
+                .windows(2)
+                .filter(|pair| frame_difference(&pair[0], &pair[1]) < 0.3)
+                .count()
+        };
+        let sampled = duplicates(estabilizar::TimeInterpolation::Muestreo);
+        let flow = duplicates(estabilizar::TimeInterpolation::FlujoOptico);
+        assert!(sampled >= 7, "el muestreo debería repetir fotogramas: {sampled}");
+        assert!(flow <= 1, "el flujo óptico no debería repetir: {flow}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn secondary_hsl_whites_blacks_and_color_match_render() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("lumetri");
+        let camera = camera_clip(&directory);
+        let reference_out = export_and_read(camera.clone(), &directory, "referencia.mp4");
+        let reference = frame_rgb(&reference_out, 2.0);
+        // HSL: quitar la saturación de los azules deja el resto igual.
+        let mut blues = camera.clone();
+        blues.fx.hsl = vec![efectos::HslAdjust {
+            families: [false, false, false, false, true, false],
+            saturation: -1.0,
+            ..Default::default()
+        }];
+        let graded = frame_rgb(&export_and_read(blues, &directory, "azules.mp4"), 2.0);
+        let spread = |pixel: &[u8]| {
+            (*pixel.iter().max().unwrap() as f64) - (*pixel.iter().min().unwrap() as f64)
+        };
+        let (mut blue_before, mut blue_after, mut red_before, mut red_after, mut blue_n, mut red_n) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for (before, after) in reference.chunks_exact(3).zip(graded.chunks_exact(3)) {
+            let (r, g, b) = (before[0] as i32, before[1] as i32, before[2] as i32);
+            if b > 150 && r < 90 && g < 90 {
+                blue_before += spread(before);
+                blue_after += spread(after);
+                blue_n += 1.0;
+            } else if r > 150 && g < 90 && b < 90 {
+                red_before += spread(before);
+                red_after += spread(after);
+                red_n += 1.0;
+            }
+        }
+        assert!(blue_n > 20.0 && red_n > 20.0, "la carta de prueba cambió");
+        assert!(blue_after / blue_n < blue_before / blue_n * 0.5, "los azules siguen saturados");
+        assert!(
+            (red_after / red_n - red_before / red_n).abs() < 25.0,
+            "los rojos no deberían cambiar"
+        );
+        // Negros levantados: el píxel más oscuro sube.
+        let mut lifted = camera.clone();
+        lifted.fx.blacks = 1.0;
+        let lifted = frame_rgb(&export_and_read(lifted, &directory, "negros.mp4"), 2.0);
+        // El 5 % más oscuro: un mínimo suelto lo decide el submuestreo de
+        // croma en los bordes de colores saturados, no la curva.
+        let darkest = |pixels: &[u8]| {
+            let mut values: Vec<u8> = pixels.to_vec();
+            values.sort_unstable();
+            let count = values.len() / 20;
+            values[..count].iter().map(|&value| value as f64).sum::<f64>() / count as f64
+        };
+        assert!(darkest(&lifted) > darkest(&reference) + 15.0);
+        // Igualar color: un plano teñido de azul vuelve hacia la referencia.
+        let tinted_path = directory.join("tenido.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&camera.path)
+            .args([
+                "-vf", "colorchannelmixer=rr=0.6:gg=0.8:bb=1.0,eq=contrast=0.7", "-c:v", "libx264",
+                "-pix_fmt", "yuv420p", "-c:a", "copy",
+            ])
+            .arg(&tinted_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let tinted = RoughClip {
+            path: tinted_path,
+            ..camera.clone()
+        };
+        let matched_fx = compute_color_match(&tinted, &camera, Timebase::from_fps(25.0)).unwrap();
+        let mut matched = tinted.clone();
+        matched.fx.color_match = Some(matched_fx);
+        let before = frame_rgb(&export_and_read(tinted, &directory, "sin.mp4"), 2.0);
+        let after = frame_rgb(&export_and_read(matched, &directory, "con.mp4"), 2.0);
+        let distance = |pixels: &[u8]| {
+            (0..3)
+                .map(|c| (mean_channel(pixels, c) - mean_channel(&reference, c)).abs())
+                .sum::<f64>()
+        };
+        assert!(
+            distance(&after) < distance(&before) * 0.4,
+            "igualado {:.1} vs sin igualar {:.1}",
+            distance(&after),
+            distance(&before)
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn encode_settings_control_bitrate_and_size() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("calidad");
+        let clip = camera_clip(&directory);
+        let render = |name: &str, encode: exportacion::EncodeSettings| {
+            let output = directory.join(name);
+            let job = RenderJob {
+                encode,
+                ..test_job(&[clip.clone()], &output, ExportFormat::Mp4Video, None)
+            };
+            run_export(
+                &job,
+                &AtomicBool::new(false),
+                &Arc::new(std::sync::Mutex::new(RenderProgress::default())),
+            )
+            .unwrap();
+            std::fs::metadata(&output).unwrap().len() as f64
+        };
+        let quality = |quality| exportacion::EncodeSettings {
+            quality,
+            ..Default::default()
+        };
+        let best = render("maxima.mp4", quality(exportacion::Quality::Maxima));
+        let light = render("ligera.mp4", quality(exportacion::Quality::Ligera));
+        assert!(light < best * 0.6, "ligera {light} vs máxima {best}");
+        let target = render(
+            "bitrate.mp4",
+            exportacion::EncodeSettings {
+                bitrate_mbps: Some(2.0),
+                audio_kbps: 128,
+                ..Default::default()
+            },
+        );
+        // 4 s a 2 Mbps + 128 kbps ≈ 1,06 MB; el control de tasa no es exacto.
+        let expected = 4.0 * (2_000_000.0 + 128_000.0) / 8.0;
+        assert!(
+            (target / expected - 1.0).abs() < 0.35,
+            "{target} bytes, esperados ≈ {expected}"
+        );
+        let audio = Command::new(tool_path("ffprobe.exe"))
+            .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=bit_rate"])
+            .args(["-of", "default=nw=1:nk=1"])
+            .arg(directory.join("bitrate.mp4"))
+            .output()
+            .unwrap();
+        let audio: f64 = String::from_utf8_lossy(&audio.stdout).trim().parse().unwrap_or(0.0);
+        assert!((100_000.0..160_000.0).contains(&audio), "audio a {audio} bps");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn exported_still_is_the_frame_under_the_playhead() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("fotograma");
+        let (video, _) = generate(&directory);
+        let clip = RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            fade_in_seconds: 2.0,
+            ..Default::default()
+        };
+        let full = directory.join("completo.mp4");
+        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        let (windowed, preroll) = montaje::window(&[clip], 1.0, 1.04);
+        let still = directory.join("fotograma.png");
+        let job = RenderJob {
+            skip: preroll,
+            ..test_job(&windowed, &still, ExportFormat::Mp4Video, None)
+        };
+        render_still(&job).unwrap();
+        let expected = mean_brightness_at(&full, 1.0);
+        let actual = mean_brightness_at(&still, 0.0);
+        assert!(
+            (actual - expected).abs() < 6.0,
+            "fotograma {actual:.1}, montaje {expected:.1}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn range_export_starting_mid_fade_matches_the_full_edit() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("rango");
+        let (video, _) = generate(&directory);
+        let clip = RoughClip {
+            path: video,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(4.0),
+            fade_in_seconds: 2.0,
+            ..Default::default()
+        };
+        let full = directory.join("completo.mp4");
+        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        let (windowed, preroll) = montaje::window(&[clip], 1.0, 3.0);
+        assert!((preroll - 1.0).abs() < 1e-9, "el fundido obliga a componer desde 0");
+        let ranged = directory.join("rango.mp4");
+        let job = RenderJob {
+            skip: preroll,
+            length: Some(2.0),
+            ..test_job(&windowed, &ranged, ExportFormat::Mp4Video, None)
+        };
+        run_export(
+            &job,
+            &AtomicBool::new(false),
+            &Arc::new(std::sync::Mutex::new(RenderProgress::default())),
+        )
+        .unwrap();
+        assert!((probe_duration(&ranged) - 2.0).abs() < 0.1, "dura {}", probe_duration(&ranged));
+        let expected = mean_brightness_at(&full, 1.0);
+        let actual = mean_brightness_at(&ranged, 0.0);
+        let bright = mean_brightness_at(&full, 3.0);
+        assert!(expected < bright * 0.75, "a mitad del fundido debe verse más oscuro");
+        assert!(
+            (actual - expected).abs() < bright * 0.08,
+            "el rango arranca a {actual:.1} y el montaje completo a {expected:.1}"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

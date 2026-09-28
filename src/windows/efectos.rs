@@ -40,8 +40,13 @@ pub struct ClipFx {
     pub crop_bottom: f64,
     /// Reproduce el clip hacia atrás (vídeo y audio).
     pub reverse: bool,
-    /// Estabilizador de un paso (el «Warp Stabilizer» barato).
+    /// Estabilizar el clip; `stabilizer` dice cómo.
     pub stabilize: bool,
+    pub stabilizer: super::estabilizar::Stabilizer,
+    /// Suavizado de la trayectoria (0 … 1); `None` es el valor medio.
+    pub stabilize_smoothing: Option<f64>,
+    /// Cómo se inventan los fotogramas al cambiar la velocidad o la cadencia.
+    pub interpolation: super::estabilizar::TimeInterpolation,
     // --- Lumetri básico
     /// -1 frío … +1 cálido.
     pub temperature: f64,
@@ -53,6 +58,16 @@ pub struct ClipFx {
     pub shadows: f64,
     /// -1 … +1, recupera o empuja las altas luces.
     pub highlights: f64,
+    /// -1 … +1, punto blanco: recorta o recupera los blancos.
+    pub whites: f64,
+    /// -1 … +1, punto negro: hunde o levanta los negros.
+    pub blacks: f64,
+    // --- Lumetri › Curvas HSL secundarias
+    /// Ajustes por familia de color (rojos, azules…), en orden.
+    pub hsl: Vec<HslAdjust>,
+    /// Igualación de color con otro plano: ganancia y desplazamiento por
+    /// canal R, G, B, calculados por `match_color`.
+    pub color_match: Option<ColorMatch>,
     // --- Detalle y textura
     /// 0 … 1, máscara de enfoque.
     pub sharpen: f64,
@@ -73,6 +88,123 @@ pub struct ClipFx {
     pub duck_db: f64,
     /// Banda elástica de volumen; vacía = ganancia fija.
     pub volume_keys: Vec<VolumeKey>,
+}
+
+/// Familias de color de `huesaturation`, en el orden de sus banderas.
+pub const HSL_FAMILIES: [(&str, &str); 6] = [
+    ("r", "Rojos"),
+    ("y", "Amarillos"),
+    ("g", "Verdes"),
+    ("c", "Cian"),
+    ("b", "Azules"),
+    ("m", "Magentas"),
+];
+
+/// Un ajuste HSL secundario: qué familias de color toca y cómo.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HslAdjust {
+    /// Una bandera por familia de `HSL_FAMILIES`.
+    pub families: [bool; 6],
+    /// Giro de tono en grados (−180 … 180).
+    pub hue: f64,
+    /// −1 … +1.
+    pub saturation: f64,
+    /// −1 … +1, luminosidad de esos colores.
+    pub intensity: f64,
+}
+
+impl Default for HslAdjust {
+    fn default() -> Self {
+        Self {
+            families: [false, false, false, false, true, false],
+            hue: 0.0,
+            saturation: 0.0,
+            intensity: 0.0,
+        }
+    }
+}
+
+impl HslAdjust {
+    fn filter(&self) -> Option<String> {
+        let colors: Vec<&str> = HSL_FAMILIES
+            .iter()
+            .zip(self.families)
+            .filter(|(_, on)| *on)
+            .map(|((flag, _), _)| *flag)
+            .collect();
+        if colors.is_empty()
+            || (self.hue.abs() < 0.05 && self.saturation.abs() < 0.001 && self.intensity.abs() < 0.001)
+        {
+            return None;
+        }
+        Some(format!(
+            ",huesaturation=hue={:.2}:saturation={:.4}:intensity={:.4}:colors={}:strength=6",
+            self.hue.clamp(-180.0, 180.0),
+            self.saturation.clamp(-1.0, 1.0),
+            self.intensity.clamp(-1.0, 1.0),
+            colors.join("+")
+        ))
+    }
+}
+
+/// Corrección por canal que lleva la media y el contraste de un plano a los
+/// de otro (la «Comparación de color» de Lumetri, en su forma estadística).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColorMatch {
+    pub gain: [f64; 3],
+    /// En fracción de la escala (0 … 1).
+    pub offset: [f64; 3],
+}
+
+impl ColorMatch {
+    /// Media y desviación de cada canal de píxeles RGBA/RGB.
+    pub fn stats(pixels: &[u8], channels: usize) -> [(f64, f64); 3] {
+        let mut out = [(0.0, 0.0); 3];
+        let count = (pixels.len() / channels).max(1) as f64;
+        for (channel, slot) in out.iter_mut().enumerate() {
+            let values = pixels.chunks_exact(channels).map(|pixel| pixel[channel] as f64 / 255.0);
+            let mean = values.clone().sum::<f64>() / count;
+            let variance = values.map(|value| (value - mean).powi(2)).sum::<f64>() / count;
+            *slot = (mean, variance.sqrt());
+        }
+        out
+    }
+
+    /// Corrección que lleva `target` hacia `reference`. La ganancia se limita
+    /// para que una referencia casi plana no dispare el contraste.
+    pub fn between(target: [(f64, f64); 3], reference: [(f64, f64); 3]) -> Self {
+        let mut gain = [1.0; 3];
+        let mut offset = [0.0; 3];
+        for channel in 0..3 {
+            let (target_mean, target_std) = target[channel];
+            let (reference_mean, reference_std) = reference[channel];
+            let g = if target_std > 0.01 {
+                (reference_std / target_std).clamp(0.5, 2.0)
+            } else {
+                1.0
+            };
+            gain[channel] = g;
+            offset[channel] = (reference_mean - g * target_mean).clamp(-0.5, 0.5);
+        }
+        Self { gain, offset }
+    }
+
+    fn filter(&self) -> String {
+        let channel = |c: usize| {
+            format!(
+                "clip(val*{:.4}+{:.2},0,255)",
+                self.gain[c],
+                self.offset[c] * 255.0
+            )
+        };
+        format!(
+            ",lutrgb=r='{}':g='{}':b='{}'",
+            channel(0),
+            channel(1),
+            channel(2)
+        )
+    }
 }
 
 impl ClipFx {
@@ -101,9 +233,11 @@ impl ClipFx {
     }
 
     /// Geometría previa al escalado: estabilizar y voltear.
-    pub fn geometry_chain(&self, allow_temporal: bool) -> String {
+    /// `warp` indica que la cadena ya lleva la pasada 2 de vidstab: entonces
+    /// no se añade el estabilizador rápido.
+    pub fn geometry_chain(&self, allow_temporal: bool, warp: bool) -> String {
         let mut out = String::new();
-        if self.stabilize && allow_temporal {
+        if self.stabilize && allow_temporal && !warp {
             out.push_str(",deshake=rx=32:ry=32:edge=mirror");
         }
         if self.flip_h {
@@ -118,6 +252,18 @@ impl ClipFx {
     /// Lumetri básico, detalle y textura. Va después de ruedas/curvas/LUT/eq
     /// del host y antes de pasar a RGBA.
     pub fn video_color_chain(&self) -> String {
+        self.video_color_chain_animated(&Animation::default(), &mut Vec::new())
+    }
+
+    /// Como `video_color_chain`, pero temperatura, tinte e intensidad siguen
+    /// sus keyframes: los filtros llevan nombre (`filtro@tag`) y las órdenes
+    /// `sendcmd` que los mueven se añaden a `commands`.
+    pub fn video_color_chain_animated(
+        &self,
+        animation: &Animation,
+        commands: &mut Vec<String>,
+    ) -> String {
+        use super::animacion::Param;
         let mut out = String::new();
         if self.denoise > 0.001 {
             let luma = self.denoise.clamp(0.0, 1.0) * 8.0;
@@ -128,30 +274,88 @@ impl ClipFx {
                 luma * 1.1
             ));
         }
-        if self.temperature.abs() > 0.001 {
-            let kelvin = 6500.0 - self.temperature.clamp(-1.0, 1.0) * 2500.0;
-            out.push_str(&format!(",colortemperature=temperature={kelvin:.0}"));
+        // La igualación normaliza el plano antes de cualquier otro ajuste,
+        // como en Lumetri, donde va antes de las ruedas creativas.
+        if let Some(matched) = &self.color_match {
+            out.push_str(&matched.filter());
         }
-        if self.tint.abs() > 0.001 {
-            let tint = self.tint.clamp(-1.0, 1.0);
-            let green = 1.0 - tint * 0.15;
-            let other = 1.0 + tint * 0.05;
+        let kelvin = |v: f64| 6500.0 - v.clamp(-1.0, 1.0) * 2500.0;
+        let green = |v: f64| 1.0 - v.clamp(-1.0, 1.0) * 0.15;
+        let other = |v: f64| 1.0 + v.clamp(-1.0, 1.0) * 0.05;
+        let vibrance = |v: f64| v.clamp(-1.0, 1.0);
+        if let Some(keys) = animation.varying(Param::Temperature) {
+            let target = format!("colortemperature@k{}", animation.tag);
             out.push_str(&format!(
-                ",colorchannelmixer=rr={other:.4}:gg={green:.4}:bb={other:.4}"
+                ",{target}=temperature={:.0}",
+                kelvin(keys[0].v)
             ));
+            commands.extend(animation.commands(&target, &[("temperature", &kelvin)], keys));
+        } else {
+            let temperature = animation.constant(Param::Temperature, self.temperature);
+            if temperature.abs() > 0.001 {
+                out.push_str(&format!(
+                    ",colortemperature=temperature={:.0}",
+                    kelvin(temperature)
+                ));
+            }
         }
-        if self.vibrance.abs() > 0.001 {
+        if let Some(keys) = animation.varying(Param::Tint) {
+            let target = format!("colorchannelmixer@t{}", animation.tag);
+            let first = keys[0].v;
             out.push_str(&format!(
-                ",vibrance=intensity={:.4}",
-                self.vibrance.clamp(-1.0, 1.0)
+                ",{target}=rr={:.4}:gg={:.4}:bb={:.4}",
+                other(first),
+                green(first),
+                other(first)
             ));
+            commands.extend(animation.commands(
+                &target,
+                &[("rr", &other), ("gg", &green), ("bb", &other)],
+                keys,
+            ));
+        } else {
+            let tint = animation.constant(Param::Tint, self.tint);
+            if tint.abs() > 0.001 {
+                out.push_str(&format!(
+                    ",colorchannelmixer=rr={:.4}:gg={:.4}:bb={:.4}",
+                    other(tint),
+                    green(tint),
+                    other(tint)
+                ));
+            }
         }
-        if self.shadows.abs() > 0.001 || self.highlights.abs() > 0.001 {
+        if let Some(keys) = animation.varying(Param::Vibrance) {
+            let target = format!("vibrance@i{}", animation.tag);
+            out.push_str(&format!(",{target}=intensity={:.4}", vibrance(keys[0].v)));
+            commands.extend(animation.commands(&target, &[("intensity", &vibrance)], keys));
+        } else {
+            let value = animation.constant(Param::Vibrance, self.vibrance);
+            if value.abs() > 0.001 {
+                out.push_str(&format!(",vibrance=intensity={:.4}", vibrance(value)));
+            }
+        }
+            if self.shadows.abs() > 0.001
+            || self.highlights.abs() > 0.001
+            || self.whites.abs() > 0.001
+            || self.blacks.abs() > 0.001
+        {
             let shadow = (0.25 + self.shadows.clamp(-1.0, 1.0) * 0.12).clamp(0.02, 0.6);
             let light = (0.75 + self.highlights.clamp(-1.0, 1.0) * 0.12).clamp(0.4, 0.98);
+            // Blancos y negros mueven los extremos de la curva: +1 en negros
+            // levanta el negro a 0,15 (lavado); −1 lo hunde recortando hasta
+            // 0,1 de entrada. Igual, reflejado, para los blancos.
+            let black = self.blacks.clamp(-1.0, 1.0);
+            let white = self.whites.clamp(-1.0, 1.0);
+            let (black_in, black_out) = if black >= 0.0 { (0.0, black * 0.15) } else { (-black * 0.1, 0.0) };
+            let (white_in, white_out) = if white >= 0.0 { (1.0 - white * 0.1, 1.0) } else { (1.0, 1.0 + white * 0.15) };
             out.push_str(&format!(
-                ",curves=all='0/0 0.25/{shadow:.4} 0.75/{light:.4} 1/1'"
+                ",curves=all='{black_in:.4}/{black_out:.4} 0.25/{shadow:.4} 0.75/{light:.4} {white_in:.4}/{white_out:.4}'"
             ));
+        }
+        for adjust in &self.hsl {
+            if let Some(filter) = adjust.filter() {
+                out.push_str(&filter);
+            }
         }
         if self.sharpen > 0.001 {
             out.push_str(&format!(
@@ -355,7 +559,7 @@ pub fn title_drawing(
             ));
         }
         parts.push(format!(
-            "drawtext=fontfile='{font}':text='{text}':fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
+            "drawtext=fontfile='{font}':text='{text}':expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
             position.0.clamp(0.0, 1.0),
             position.1.clamp(0.0, 1.0),
         ));
@@ -379,7 +583,34 @@ pub const TRANSITIONS: &[(&str, &str)] = &[
     ("deslizar_abajo", "Deslizar desde arriba"),
     ("empujar_izq", "Empujar a la izquierda"),
     ("empujar_der", "Empujar a la derecha"),
+    ("barrido_der", "Barrido hacia la derecha"),
+    ("barrido_izq", "Barrido hacia la izquierda"),
+    ("barrido_abajo", "Barrido hacia abajo"),
+    ("barrido_arriba", "Barrido hacia arriba"),
+    ("iris", "Iris redondo"),
+    ("zoom", "Zoom de entrada"),
 ];
+
+/// Forma en que un barrido descubre el clip entrante.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Wipe {
+    Right,
+    Left,
+    Down,
+    Up,
+    Iris,
+}
+
+pub fn wipe_of(id: &str) -> Option<Wipe> {
+    match id {
+        "barrido_der" => Some(Wipe::Right),
+        "barrido_izq" => Some(Wipe::Left),
+        "barrido_abajo" => Some(Wipe::Down),
+        "barrido_arriba" => Some(Wipe::Up),
+        "iris" => Some(Wipe::Iris),
+        _ => None,
+    }
+}
 
 pub fn transition_label(id: &str) -> &'static str {
     TRANSITIONS
@@ -418,6 +649,11 @@ pub struct TransitionRuntime {
     /// Fundidos solo de audio (la imagen entra en movimiento, sin alfa).
     pub audio_fade_in: f64,
     pub audio_fade_out: f64,
+    /// Los fundidos de audio de este clip son la mitad de un fundido
+    /// cruzado: curva de potencia constante, como en Premiere.
+    pub audio_crossfade: bool,
+    /// Barrido de entrada y su duración (tiempo local desde 0).
+    pub wipe_in: Option<(Wipe, f64)>,
 }
 
 impl TransitionRuntime {
@@ -452,6 +688,30 @@ impl TransitionRuntime {
         } else {
             Some((x, y))
         }
+    }
+
+    /// Máscara del barrido de entrada sobre la capa (ya en RGBA, tiempo
+    /// local). Borde suave del 6 %; fuera de la transición no se evalúa.
+    pub fn wipe_filter(&self) -> String {
+        let Some((wipe, duration)) = self.wipe_in else {
+            return String::new();
+        };
+        let d = duration.max(0.04);
+        let progress = format!("clip(T/{d:.6},0,1)");
+        let feather = 0.06;
+        let reveal = match wipe {
+            Wipe::Right => format!("clip((W*{:.4}*{progress}-X)/(W*{feather}),0,1)", 1.0 + feather),
+            Wipe::Left => format!("clip((W*{:.4}*{progress}-(W-X))/(W*{feather}),0,1)", 1.0 + feather),
+            Wipe::Down => format!("clip((H*{:.4}*{progress}-Y)/(H*{feather}),0,1)", 1.0 + feather),
+            Wipe::Up => format!("clip((H*{:.4}*{progress}-(H-Y))/(H*{feather}),0,1)", 1.0 + feather),
+            Wipe::Iris => format!(
+                "clip((hypot(W,H)/2*{:.4}*{progress}-hypot(X-W/2,Y-H/2))/(hypot(W,H)/2*{feather}),0,1)",
+                1.0 + feather
+            ),
+        };
+        format!(
+            ",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*{reveal}':enable='lt(t,{d:.6})'"
+        )
     }
 
     /// Desplazamiento en fracciones de lienzo en un instante de timeline,
@@ -578,15 +838,95 @@ fn slider(
     changed
 }
 
-/// Secciones de vídeo del inspector. Devuelve si algo cambió.
-pub fn inspector_video(ui: &mut egui::Ui, fx: &mut ClipFx, is_adjustment: bool) -> bool {
+/// Secciones de vídeo del inspector. Devuelve si algo cambió y, si se pidió
+/// saltar a un keyframe, su tiempo local.
+/// Estado del análisis de estabilización del clip, para el inspector.
+#[derive(Clone, Copy, PartialEq)]
+pub enum StabStatus {
+    /// Este FFmpeg no trae libvidstab.
+    Unavailable,
+    Pending,
+    Analyzing,
+    Ready,
+}
+
+/// Lo que el inspector de vídeo pide al host.
+pub struct VideoInspector {
+    pub changed: bool,
+    pub seek: Option<f64>,
+    pub analyze: bool,
+}
+
+pub fn inspector_video(
+    ui: &mut egui::Ui,
+    fx: &mut ClipFx,
+    tracks: &mut super::animacion::Tracks,
+    local_t: f64,
+    is_adjustment: bool,
+    stab: StabStatus,
+) -> VideoInspector {
+    use super::estabilizar::{Stabilizer, TimeInterpolation};
+    let mut analyze = false;
+    use super::animacion::{animated_slider, KeyAction, Param};
     let mut changed = false;
+    let mut seek = None;
     ui.collapsing("Lumetri básico", |ui| {
-        changed |= slider(ui, &mut fx.temperature, -1.0..=1.0, "Temperatura");
-        changed |= slider(ui, &mut fx.tint, -1.0..=1.0, "Tinte");
-        changed |= slider(ui, &mut fx.vibrance, -1.0..=1.0, "Intensidad");
+        for (param, value, text) in [
+            (Param::Temperature, &mut fx.temperature, "Temperatura"),
+            (Param::Tint, &mut fx.tint, "Tinte"),
+            (Param::Vibrance, &mut fx.vibrance, "Intensidad"),
+        ] {
+            match animated_slider(ui, tracks, param, value, -1.0..=1.0, text, local_t, 0.0) {
+                KeyAction::Changed => changed = true,
+                KeyAction::Seek(t) => seek = Some(t),
+                KeyAction::None => {}
+            }
+        }
         changed |= slider(ui, &mut fx.shadows, -1.0..=1.0, "Sombras");
         changed |= slider(ui, &mut fx.highlights, -1.0..=1.0, "Iluminaciones");
+        changed |= slider(ui, &mut fx.whites, -1.0..=1.0, "Blancos");
+        changed |= slider(ui, &mut fx.blacks, -1.0..=1.0, "Negros");
+    });
+    ui.collapsing("HSL secundario", |ui| {
+        ui.label(
+            egui::RichText::new("Cambia solo ciertos colores: bajar los azules del cielo, calentar la piel…")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        let mut remove = None;
+        for (index, adjust) in fx.hsl.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (family, (_, name)) in HSL_FAMILIES.iter().enumerate() {
+                        changed |= ui.toggle_value(&mut adjust.families[family], *name).changed();
+                    }
+                    if ui.small_button("×").on_hover_text("Quitar este ajuste").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.hue, -180.0..=180.0).suffix("°").text("Tono"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.saturation, -1.0..=1.0).text("Saturación"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut adjust.intensity, -1.0..=1.0).text("Luminosidad"))
+                    .changed();
+            });
+        }
+        if let Some(index) = remove {
+            fx.hsl.remove(index);
+            changed = true;
+        }
+        if ui
+            .button("+ Ajuste de color")
+            .on_hover_text("Añade un ajuste para una o varias familias de color")
+            .clicked()
+        {
+            fx.hsl.push(HslAdjust::default());
+            changed = true;
+        }
     });
     ui.collapsing("Detalle y textura", |ui| {
         changed |= slider(ui, &mut fx.sharpen, 0.0..=1.0, "Enfocar");
@@ -627,13 +967,69 @@ pub fn inspector_video(ui: &mut egui::Ui, fx: &mut ClipFx, is_adjustment: bool) 
                 .checkbox(&mut fx.reverse, "Reproducir hacia atrás")
                 .on_hover_text("Invierte imagen y sonido del recorte. Conviene en clips cortos: FFmpeg carga el tramo entero en memoria.")
                 .changed();
-            changed |= ui
-                .checkbox(&mut fx.stabilize, "Estabilizar (deshake)")
-                .on_hover_text("Compensa la vibración de cámara en mano. Se aplica en la exportación y en la reproducción; el fotograma fijo del monitor no puede mostrarlo.")
-                .changed();
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .checkbox(&mut fx.stabilize, "Estabilizar")
+                    .on_hover_text("Compensa la vibración de cámara en mano. Se ve al reproducir y al exportar; el fotograma fijo del monitor no puede mostrarlo.")
+                    .changed();
+                ui.add_enabled_ui(fx.stabilize, |ui| {
+                    let before = fx.stabilizer;
+                    ui.selectable_value(&mut fx.stabilizer, Stabilizer::Rapido, "Rápido")
+                        .on_hover_text("Un paso, sin análisis. Para vibraciones leves");
+                    ui.add_enabled(
+                        stab != StabStatus::Unavailable,
+                        egui::SelectableLabel::new(fx.stabilizer == Stabilizer::Deformacion, "Deformación"),
+                    )
+                    .on_hover_text("Dos pasadas: analiza el movimiento y suaviza la trayectoria, como el Warp Stabilizer")
+                    .on_disabled_hover_text("Este FFmpeg no trae libvidstab; el de Windows sí")
+                    .clicked()
+                    .then(|| fx.stabilizer = Stabilizer::Deformacion);
+                    if fx.stabilizer != before {
+                        changed = true;
+                        analyze = fx.stabilizer == Stabilizer::Deformacion;
+                    }
+                });
+            });
+            if fx.stabilize && fx.stabilizer == Stabilizer::Deformacion {
+                let mut smoothing = fx.stabilize_smoothing.unwrap_or(0.5);
+                if ui
+                    .add(egui::Slider::new(&mut smoothing, 0.0..=1.0).text("Suavizado"))
+                    .on_hover_text("Más suavizado sigue menos a la cámara y recorta un poco más los bordes")
+                    .changed()
+                {
+                    fx.stabilize_smoothing = Some(smoothing);
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    let (text, color) = match stab {
+                        StabStatus::Ready => ("Análisis listo", egui::Color32::from_rgb(90, 200, 150)),
+                        StabStatus::Analyzing => ("Analizando movimiento…", egui::Color32::from_rgb(240, 200, 90)),
+                        StabStatus::Pending => ("Sin analizar: se hará al exportar", egui::Color32::GRAY),
+                        StabStatus::Unavailable => ("No disponible con este FFmpeg", egui::Color32::GRAY),
+                    };
+                    ui.label(egui::RichText::new(text).size(11.0).color(color));
+                    if stab == StabStatus::Pending && ui.small_button("Analizar ahora").clicked() {
+                        analyze = true;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Interpolación");
+                egui::ComboBox::from_id_salt("time-interpolation")
+                    .selected_text(fx.interpolation.label())
+                    .show_ui(ui, |ui| {
+                        for mode in TimeInterpolation::ALL {
+                            changed |= ui
+                                .selectable_value(&mut fx.interpolation, mode, mode.label())
+                                .changed();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Para cámara lenta o cadencias distintas: el flujo óptico inventa fotogramas intermedios (lento de calcular)");
+            });
         });
     }
-    changed
+    VideoInspector { changed, seek, analyze }
 }
 
 /// Sección «Sonido esencial» del inspector. `duration` y `local_playhead`
@@ -770,6 +1166,64 @@ pub fn inspector_audio(
     changed
 }
 
+/// Contexto de animación de un clip para construir su cadena de filtros.
+#[derive(Default)]
+pub struct Animation<'a> {
+    pub tracks: Option<&'a super::animacion::Tracks>,
+    /// Sufijo único de las instancias con nombre de este clip.
+    pub tag: String,
+    /// Duración de un fotograma del proyecto.
+    pub frame: f64,
+    /// Duración local del clip.
+    pub duration: f64,
+    /// Se suma a los tiempos de las órdenes: 0 si la cadena va en tiempo
+    /// local del clip, su inicio si va en tiempo de composición.
+    pub shift: f64,
+}
+
+impl Animation<'_> {
+    /// Keyframes del parámetro si su valor cambia a lo largo del clip.
+    pub fn varying(&self, param: super::animacion::Param) -> Option<&[super::animacion::Key]> {
+        self.tracks?
+            .get(&param)
+            .filter(|keys| super::animacion::varies(keys))
+            .map(|keys| keys.as_slice())
+    }
+
+    /// Valor constante: el del único keyframe si lo hay, o el estático.
+    pub fn constant(&self, param: super::animacion::Param, fallback: f64) -> f64 {
+        self.tracks
+            .and_then(|tracks| tracks.get(&param))
+            .and_then(|keys| keys.first())
+            .map_or(fallback, |key| key.v)
+    }
+
+    pub fn commands(
+        &self,
+        target: &str,
+        options: &[(&str, &dyn Fn(f64) -> f64)],
+        keys: &[super::animacion::Key],
+    ) -> Vec<String> {
+        super::animacion::commands(
+            target,
+            options,
+            keys,
+            self.frame.max(0.001),
+            self.duration,
+            self.shift,
+        )
+    }
+
+    /// Tiempo local del clip como expresión de FFmpeg.
+    pub fn time(&self) -> String {
+        if self.shift.abs() < 1e-9 {
+            "t".to_owned()
+        } else {
+            format!("(t-{:.6})", self.shift)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,7 +1233,7 @@ mod tests {
         let fx = ClipFx::default();
         assert!(!fx.has_video_effects());
         assert_eq!(fx.input_prefix(false), "");
-        assert_eq!(fx.geometry_chain(true), "");
+        assert_eq!(fx.geometry_chain(true, false), "");
         assert_eq!(fx.video_color_chain(), "");
         assert_eq!(fx.alpha_chain(), "");
         assert_eq!(fx.audio_prefix(), "");
@@ -814,10 +1268,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            fx.geometry_chain(true),
+            fx.geometry_chain(true, false),
             ",deshake=rx=32:ry=32:edge=mirror,hflip"
         );
-        assert_eq!(fx.geometry_chain(false), ",hflip");
+        assert_eq!(fx.geometry_chain(false, false), ",hflip");
     }
 
     #[test]
@@ -958,7 +1412,7 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "drawtext=fontfile='f.ttf':text='Hola':fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
+            "drawtext=fontfile='f.ttf':text='Hola':expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
         );
         let matte_only = TitleStyle {
             matte: Some([1.0, 0.0, 0.0]),

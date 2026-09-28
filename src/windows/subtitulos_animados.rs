@@ -342,7 +342,7 @@ pub fn caption_filters(
                 })
                 .unwrap_or_default();
             filters.push(format!(
-                "drawtext=fontfile='{font}':text='{}':fontsize={:.1}:fontcolor=0x{}:x={:.1}-text_w/2:y={:.1}:borderw={outline:.0}:bordercolor=black{boxed}{enable}",
+                "drawtext=fontfile='{font}':text='{}':expansion=none:fontsize={:.1}:fontcolor=0x{}:x={:.1}-text_w/2:y={:.1}:borderw={outline:.0}:bordercolor=black{boxed}{enable}",
                 text_escape(&word.text),
                 look.size,
                 look.color,
