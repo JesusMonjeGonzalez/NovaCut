@@ -24,6 +24,7 @@ mod animacion;
 mod batch;
 mod command_center;
 mod efectos;
+mod exportacion;
 mod montaje;
 mod navigation;
 mod subtitulos_animados;
@@ -2802,6 +2803,16 @@ struct NovaCutWindows {
     clean_project_json: Option<String>,
     drag_edit: Option<(usize, DragKind, RoughProject)>,
     export_cancel: Option<Arc<AtomicBool>>,
+    /// Calidad, bitrate y audio de la exportación.
+    encode_settings: exportacion::EncodeSettings,
+    export_queue: Vec<QueueItem>,
+    /// Trabajo de la cola que se está renderizando.
+    running_job: Option<u64>,
+    next_job_id: u64,
+    show_export: bool,
+    show_queue: bool,
+    /// Destino elegido en el panel de exportación.
+    export_target: Option<PathBuf>,
     montage_render: Option<Receiver<Result<PathBuf, String>>>,
     /// Zoom de timeline: 1.0 ajusta el montaje al ancho disponible.
     zoom: f32,
@@ -3108,6 +3119,8 @@ struct UiSettings {
     /// `None` hasta que el usuario (o el primer arranque) lo fija.
     #[serde(default)]
     ui_scale: Option<f32>,
+    #[serde(default)]
+    encode: exportacion::EncodeSettings,
 }
 
 /// Tamaños de interfaz ofrecidos en el menú «Aa».
@@ -3482,6 +3495,7 @@ impl NovaCutWindows {
             loop_playback: self.loop_playback,
             proxy_limit_gb: self.proxy_limit_gb,
             hardware_encoding: self.hardware_encoding,
+            encode: self.encode_settings,
             ui_scale: Some(self.ui_scale),
         }
     }
@@ -3541,6 +3555,7 @@ impl NovaCutWindows {
         self.loop_playback = settings.loop_playback;
         self.proxy_limit_gb = settings.proxy_limit_gb.clamp(0.0, 1000.0);
         self.hardware_encoding = settings.hardware_encoding;
+        self.encode_settings = settings.encode;
         if let Some(scale) = settings.ui_scale {
             self.ui_scale = scale.clamp(0.75, 2.0);
             self.ui_scale_chosen = true;
@@ -3926,6 +3941,13 @@ impl NovaCutWindows {
             clean_project_json: serde_json::to_string(&RoughProject::default()).ok(),
             drag_edit: None,
             export_cancel: None,
+            encode_settings: exportacion::EncodeSettings::default(),
+            export_queue: Vec::new(),
+            running_job: None,
+            next_job_id: 1,
+            show_export: false,
+            show_queue: false,
+            export_target: None,
             montage_render: None,
             zoom: 1.0,
             hscroll: 0.0,
@@ -6154,11 +6176,33 @@ impl NovaCutWindows {
         }
     }
 
+    /// Abre el panel de exportación (Ctrl+M, como en Premiere).
     fn export(&mut self) {
         if self.project.clips.is_empty() {
             self.status = "Importa al menos un clip".to_owned();
             return;
         }
+        self.show_export = true;
+    }
+
+    /// Nombre de archivo propuesto: el del proyecto con la extensión.
+    fn suggested_export_name(&self) -> String {
+        let stem: String = self
+            .project
+            .name
+            .chars()
+            .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+            .collect();
+        let stem = stem.trim();
+        if stem.is_empty() {
+            self.export_format.default_file_name().to_owned()
+        } else {
+            format!("{stem}.{}", self.export_format.extension())
+        }
+    }
+
+    /// Valida el montaje y añade un trabajo con los ajustes actuales.
+    fn enqueue_export(&mut self, output: PathBuf) -> bool {
         if self
             .project
             .clips
@@ -6166,53 +6210,107 @@ impl NovaCutWindows {
             .any(|clip| clip.duration() <= 0.01)
         {
             self.status = "Todos los clips necesitan una salida posterior a la entrada".to_owned();
+            return false;
+        }
+        let job = self.render_job(output);
+        if job.clips.is_empty() {
+            self.status = "El rango de trabajo no contiene ningún clip".to_owned();
+            return false;
+        }
+        if self
+            .export_queue
+            .iter()
+            .any(|item| item.job.output == job.output && matches!(item.state, JobState::Waiting | JobState::Running))
+        {
+            self.status = "Ya hay un trabajo en la cola que escribe ese archivo".to_owned();
+            return false;
+        }
+        let seconds = job.output_length();
+        let summary = if job.audio_only {
+            format!("{} · {}", job.format.short_name(), format_clock(seconds))
+        } else {
+            format!(
+                "{} {}×{} · {}",
+                job.format.short_name(),
+                job.size.0,
+                job.size.1,
+                format_clock(seconds)
+            )
+        };
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.export_queue.push(QueueItem {
+            id,
+            job,
+            state: JobState::Waiting,
+            summary,
+        });
+        true
+    }
+
+    /// Arranca el siguiente trabajo en espera si no hay ninguno en marcha.
+    fn pump_queue(&mut self) {
+        if self.export_result.is_some() || self.montage_render.is_some() {
             return;
         }
-        let audio_only = self.export_format.is_audio_only();
-        let Some(output) = FileDialog::new()
-            .add_filter(
-                self.export_format.label(),
-                &[self.export_format.extension()],
-            )
-            .set_file_name(self.export_format.default_file_name())
-            .save_file()
+        if !self
+            .export_queue
+            .iter()
+            .any(|item| item.state == JobState::Waiting)
+        {
+            return;
+        }
+        self.stop_playback_for_render();
+        let Some(item) = self
+            .export_queue
+            .iter_mut()
+            .find(|item| item.state == JobState::Waiting)
         else {
             return;
         };
-
-        let job = self.render_job(output.clone());
-        if job.clips.is_empty() {
-            self.status = "El rango de trabajo no contiene ningún clip".to_owned();
-            return;
-        }
+        item.state = JobState::Running;
+        self.running_job = Some(item.id);
+        let job = item.job.clone();
+        let output = job.output.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = Arc::clone(&cancel);
         let progress = Arc::clone(&self.render_progress);
         if let Ok(mut state) = progress.lock() {
             state.pct = 0.0;
             state.eta_secs = 0.0;
-        }
-        let (size, format) = (job.size, job.format);
-        if let Ok(mut state) = self.render_progress.lock() {
             state.note = None;
         }
         let (sender, receiver) = mpsc::channel();
         self.export_result = Some(receiver);
         self.export_cancel = Some(cancel);
-        self.status = if audio_only {
-            format!("Exportando audio {}...", format.extension().to_uppercase())
-        } else {
-            format!(
-                "Exportando {} {}x{}...",
-                format.short_name(),
-                size.0,
-                size.1
-            )
-        };
+        let waiting = self
+            .export_queue
+            .iter()
+            .filter(|item| item.state == JobState::Waiting)
+            .count();
+        self.status = format!(
+            "Exportando {}{}",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("exportación"),
+            if waiting > 0 {
+                format!(" · {waiting} en cola")
+            } else {
+                String::new()
+            }
+        );
         std::thread::spawn(move || {
             let result = run_export(&job, &thread_cancel, &progress).map(|()| output);
             let _ = sender.send(result);
         });
+    }
+
+    /// La reproducción y el render compiten por la CPU: se para al exportar.
+    fn stop_playback_for_render(&mut self) {
+        if self.playback.is_some() {
+            self.stop_playback();
+        }
     }
 
     fn start_hw_detection(&mut self) {
@@ -6260,6 +6358,18 @@ impl NovaCutWindows {
                 .and_then(|mut state| state.note.take())
                 .map(|note| format!(" ({note})"))
                 .unwrap_or_default();
+            let state = match &result {
+                Ok(_) => JobState::Done,
+                Err(error) if error == "Exportación cancelada" => JobState::Cancelled,
+                Err(error) => JobState::Failed(error.clone()),
+            };
+            if let Some(item) = self
+                .running_job
+                .take()
+                .and_then(|id| self.export_queue.iter_mut().find(|item| item.id == id))
+            {
+                item.state = state;
+            }
             self.status = match result {
                 Ok(path) => format!("Exportado: {}{note}", path.display()),
                 Err(error) if error == "Exportación cancelada" => error,
@@ -6267,6 +6377,7 @@ impl NovaCutWindows {
             };
             self.export_result = None;
             self.export_cancel = None;
+            self.pump_queue();
         }
     }
 
@@ -6556,6 +6667,7 @@ impl NovaCutWindows {
             hw: self.active_hw(),
             skip,
             length,
+            encode: self.encode_settings,
         }
     }
 
@@ -8085,6 +8197,400 @@ impl NovaCutWindows {
     }
 
     /// Hoja de atajos, equivalente al menú de teclado de la app macOS.
+    /// Panel de exportación: preajustes, formato, calidad, audio, destino y
+    /// las dos salidas (exportar ahora o añadir a la cola).
+    fn show_export_window(&mut self, context: &egui::Context) {
+        if !self.show_export {
+            return;
+        }
+        let mut open = true;
+        let mut export_now = false;
+        let mut add_to_queue = false;
+        let mut choose_target = false;
+        let format_before = self.export_format;
+        egui::Window::new("Exportar")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                theme::section_label(ui, "Preajustes");
+                ui.horizontal_wrapped(|ui| {
+                    for preset in &exportacion::PRESETS {
+                        let format = ExportFormat::from_code(preset.format);
+                        let active = self.export_format == format
+                            && (format.is_audio_only() || self.export_size == preset.size)
+                            && self.encode_settings == preset.settings;
+                        if ui
+                            .selectable_label(active, preset.name)
+                            .on_hover_text(preset.hint)
+                            .clicked()
+                        {
+                            self.export_format = format;
+                            if !format.is_audio_only() {
+                                self.export_size = preset.size;
+                            }
+                            self.encode_settings = preset.settings;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                theme::section_label(ui, "Ajustes");
+                let audio_only = self.export_format.is_audio_only();
+                egui::Grid::new("export-settings")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Formato");
+                        egui::ComboBox::from_id_salt("export-window-format")
+                            .width(220.0)
+                            .selected_text(self.export_format.label())
+                            .show_ui(ui, |ui| {
+                                for format in ExportFormat::ALL {
+                                    ui.selectable_value(&mut self.export_format, format, format.label());
+                                }
+                            });
+                        ui.end_row();
+                        if !audio_only {
+                            ui.label("Tamaño");
+                            egui::ComboBox::from_id_salt("export-window-size")
+                                .width(220.0)
+                                .selected_text(format!("{}×{}", self.export_size.0, self.export_size.1))
+                                .show_ui(ui, |ui| {
+                                    for (size, name) in [
+                                        ((854, 480), "480p · 854×480"),
+                                        ((1280, 720), "720p · 1280×720"),
+                                        ((1920, 1080), "1080p · 1920×1080"),
+                                        ((2560, 1440), "1440p · 2560×1440"),
+                                        ((3840, 2160), "4K · 3840×2160"),
+                                        ((1080, 1920), "Vertical · 1080×1920"),
+                                        ((1080, 1350), "Retrato 4:5 · 1080×1350"),
+                                        ((1080, 1080), "Cuadrado · 1080×1080"),
+                                    ] {
+                                        ui.selectable_value(&mut self.export_size, size, name);
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Calidad");
+                            ui.vertical(|ui| {
+                                let mut by_bitrate = self.encode_settings.bitrate_mbps.is_some();
+                                ui.horizontal_wrapped(|ui| {
+                                    for quality in exportacion::Quality::ALL {
+                                        let chosen = !by_bitrate && self.encode_settings.quality == quality;
+                                        if ui
+                                            .selectable_label(chosen, quality.label())
+                                            .on_hover_text(quality.hint())
+                                            .clicked()
+                                        {
+                                            self.encode_settings.quality = quality;
+                                            self.encode_settings.bitrate_mbps = None;
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .checkbox(&mut by_bitrate, "Bitrate objetivo")
+                                        .on_hover_text("Tamaño previsible en vez de calidad constante: lo que piden algunas plataformas y emisoras")
+                                        .changed()
+                                    {
+                                        self.encode_settings.bitrate_mbps = by_bitrate.then_some(16.0);
+                                    }
+                                    if let Some(mbps) = self.encode_settings.bitrate_mbps.as_mut() {
+                                        ui.add(
+                                            egui::DragValue::new(mbps)
+                                                .speed(0.25)
+                                                .range(0.5..=400.0)
+                                                .max_decimals(1)
+                                                .suffix(" Mbps"),
+                                        );
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                        }
+                        let compressed_audio = matches!(
+                            self.export_format,
+                            ExportFormat::Mp4Video
+                                | ExportFormat::Mp4Hevc
+                                | ExportFormat::Mp3Audio
+                                | ExportFormat::WebmVp9
+                        );
+                        if compressed_audio {
+                            ui.label("Audio");
+                            egui::ComboBox::from_id_salt("export-window-audio")
+                                .width(120.0)
+                                .selected_text(format!("{} kbps", self.encode_settings.audio_kbps))
+                                .show_ui(ui, |ui| {
+                                    for kbps in exportacion::AUDIO_KBPS {
+                                        ui.selectable_value(
+                                            &mut self.encode_settings.audio_kbps,
+                                            kbps,
+                                            format!("{kbps} kbps"),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                        if let Some(backend) = self.hw_backends.first().copied() {
+                            if matches!(self.export_format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc) {
+                                ui.label("Aceleración");
+                                ui.checkbox(
+                                    &mut self.hardware_encoding,
+                                    format!("Codificar con {}", backend.label()),
+                                )
+                                .on_hover_text("Varias veces más rápido; si la GPU falla se repite con CPU");
+                                ui.end_row();
+                            }
+                        }
+                        ui.label("Duración");
+                        ui.horizontal(|ui| {
+                            let range = self.work_range();
+                            ui.add_enabled_ui(range.is_some(), |ui| {
+                                ui.checkbox(&mut self.export_range_only, "Solo el rango I–O")
+                                    .on_disabled_hover_text("Marca entrada (I) y salida (O) en la timeline");
+                            });
+                            let seconds = match range {
+                                Some((start, end)) if self.export_range_only => end - start,
+                                _ => self.project.duration(),
+                            };
+                            let size = exportacion::estimated_megabytes(
+                                &self.encode_settings,
+                                seconds,
+                                !audio_only,
+                            )
+                            .filter(|_| self.export_format != ExportFormat::MovProRes)
+                            .map(|mb| format!(" · ≈ {mb:.0} MB"))
+                            .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!("{}{size}", format_clock(seconds)))
+                                    .monospace()
+                                    .color(theme::TEXT_DIM),
+                            );
+                        });
+                        ui.end_row();
+                        ui.label("Destino");
+                        ui.horizontal(|ui| {
+                            let shown = self
+                                .export_target
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "Sin elegir".to_owned());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(shown).color(theme::TEXT_DIM))
+                                    .truncate(),
+                            );
+                            if ui.button("Elegir…").clicked() {
+                                choose_target = true;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let busy = self.export_result.is_some();
+                    let now = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if busy { "Exportar después" } else { "Exportar ahora" })
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(8, 24, 27)),
+                            )
+                            .fill(theme::ACCENT),
+                        )
+                        .on_hover_text(if busy {
+                            "Hay una exportación en marcha: esta empezará al terminar"
+                        } else {
+                            "Empieza a exportar ya"
+                        });
+                    export_now = now.clicked();
+                    add_to_queue = ui
+                        .button("Añadir a la cola")
+                        .on_hover_text("Guarda una copia de estos ajustes y del montaje para exportar luego")
+                        .clicked();
+                });
+            });
+        // Cambiar de formato cambia la extensión del destino elegido.
+        if self.export_format != format_before {
+            if let Some(target) = self.export_target.as_mut() {
+                target.set_extension(self.export_format.extension());
+            }
+        }
+        if choose_target || ((export_now || add_to_queue) && self.export_target.is_none()) {
+            let mut dialog = FileDialog::new()
+                .add_filter(self.export_format.label(), &[self.export_format.extension()])
+                .set_file_name(self.suggested_export_name());
+            if let Some(folder) = self.export_target.as_ref().and_then(|path| path.parent()) {
+                dialog = dialog.set_directory(folder);
+            }
+            match dialog.save_file() {
+                Some(path) => self.export_target = Some(path),
+                None => {
+                    export_now = false;
+                    add_to_queue = false;
+                }
+            }
+        }
+        if let (true, Some(target)) = (export_now || add_to_queue, self.export_target.clone()) {
+            if self.enqueue_export(target) {
+                self.show_export = false;
+                // Cada trabajo necesita su archivo: el siguiente se elige de nuevo.
+                self.export_target = None;
+                if export_now {
+                    self.pump_queue();
+                } else {
+                    self.show_queue = true;
+                    self.status = "Añadido a la cola de exportación".to_owned();
+                }
+            }
+        }
+        if !open {
+            self.show_export = false;
+        }
+    }
+
+    /// Cola de exportación: progreso, cancelar, quitar y abrir la carpeta.
+    fn show_queue_window(&mut self, context: &egui::Context) {
+        if !self.show_queue {
+            return;
+        }
+        let mut open = true;
+        let mut remove: Option<u64> = None;
+        let mut retry: Option<u64> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let mut cancel_running = false;
+        let mut start = false;
+        let (pct, eta) = self
+            .render_progress
+            .lock()
+            .map(|state| (state.pct as f32, state.eta_secs))
+            .unwrap_or((0.0, 0.0));
+        egui::Window::new("Cola de exportación")
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(true)
+            .default_width(520.0)
+            .show(context, |ui| {
+                if self.export_queue.is_empty() {
+                    ui.label("No hay trabajos. Añádelos desde Exportar (Ctrl+M).");
+                    return;
+                }
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for item in &self.export_queue {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            let name = item
+                                .job
+                                .output
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("exportación");
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(name).strong());
+                                ui.label(egui::RichText::new(&item.summary).color(theme::TEXT_DIM));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                match &item.state {
+                                    JobState::Waiting => {
+                                        ui.label("En espera");
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Running => {
+                                        ui.add(
+                                            egui::ProgressBar::new(pct)
+                                                .desired_width(220.0)
+                                                .show_percentage(),
+                                        );
+                                        if eta > 1.0 {
+                                            ui.label(format!("quedan {}", format_clock(eta)));
+                                        }
+                                        if ui.small_button("Cancelar").clicked() {
+                                            cancel_running = true;
+                                        }
+                                    }
+                                    JobState::Done => {
+                                        ui.label(egui::RichText::new("Terminado").color(theme::ACCENT));
+                                        if ui.small_button("Mostrar en carpeta").clicked() {
+                                            reveal = Some(item.job.output.clone());
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Failed(error) => {
+                                        ui.label(egui::RichText::new("Falló").color(theme::DANGER))
+                                            .on_hover_text(error);
+                                        if ui.small_button("Reintentar").clicked() {
+                                            retry = Some(item.id);
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                    JobState::Cancelled => {
+                                        ui.label("Cancelado");
+                                        if ui.small_button("Reintentar").clicked() {
+                                            retry = Some(item.id);
+                                        }
+                                        if ui.small_button("Quitar").clicked() {
+                                            remove = Some(item.id);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let waiting = self
+                        .export_queue
+                        .iter()
+                        .any(|item| item.state == JobState::Waiting);
+                    if ui
+                        .add_enabled(
+                            waiting && self.export_result.is_none(),
+                            egui::Button::new("Iniciar cola"),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if ui
+                        .button("Limpiar terminados")
+                        .on_hover_text("Quita de la lista lo terminado, fallido o cancelado")
+                        .clicked()
+                    {
+                        self.export_queue
+                            .retain(|item| matches!(item.state, JobState::Waiting | JobState::Running));
+                    }
+                });
+            });
+        if let Some(id) = remove {
+            self.export_queue.retain(|item| item.id != id);
+        }
+        if let Some(item) = retry.and_then(|id| self.export_queue.iter_mut().find(|item| item.id == id)) {
+            item.state = JobState::Waiting;
+            start = true;
+        }
+        if cancel_running {
+            if let Some(cancel) = &self.export_cancel {
+                cancel.store(true, Ordering::Relaxed);
+                self.status = "Cancelando exportación...".to_owned();
+            }
+        }
+        if start {
+            self.pump_queue();
+        }
+        if let Some(path) = reveal {
+            reveal_in_file_manager(&path);
+        }
+        if !open {
+            self.show_queue = false;
+        }
+    }
+
     fn show_shortcuts_window(&mut self, context: &egui::Context) {
         if !self.show_shortcuts {
             return;
@@ -8176,7 +8682,7 @@ impl NovaCutWindows {
                             ("Alt+↑ / ↓", "Pistas más altas / bajas"),
                             ("Ctrl+S", "Guardar"),
                             ("Ctrl+O / Ctrl+I", "Abrir / importar"),
-                            ("Ctrl+Mayús+E", "Exportar"),
+                            ("Ctrl+M o Ctrl+Mayús+E", "Exportar: preajustes, calidad y cola"),
                             (
                                 "Ctrl+Z / Ctrl+Y",
                                 "Deshacer / rehacer (también Ctrl+Mayús+Z)",
@@ -10082,7 +10588,7 @@ impl eframe::App for NovaCutWindows {
                 input.consume_key(
                     egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
                     egui::Key::E,
-                )
+                ) || input.consume_key(egui::Modifiers::CTRL, egui::Key::M)
             });
         let select_all_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A));
@@ -10269,7 +10775,7 @@ impl eframe::App for NovaCutWindows {
         if open_key {
             self.request_document_action(DocumentAction::Open);
         }
-        if export_key && self.ffmpeg_ready && self.export_result.is_none() {
+        if export_key && self.ffmpeg_ready {
             self.export();
         }
         if shortcuts_key {
@@ -10732,7 +11238,7 @@ impl eframe::App for NovaCutWindows {
                     }
                     if ui
                         .add_enabled(
-                            self.ffmpeg_ready && self.export_result.is_none(),
+                            self.ffmpeg_ready,
                             egui::Button::new(
                                 egui::RichText::new(format!(
                                     "Exportar {}{}",
@@ -10749,10 +11255,29 @@ impl eframe::App for NovaCutWindows {
                             )
                             .fill(theme::ACCENT)
                             .min_size(egui::vec2(0.0, 24.0)),
-                        ).on_hover_text("Exporta el montaje (o solo el rango, si está activo) con el formato elegido").on_disabled_hover_text("Exporta el montaje (o solo el rango, si está activo) con el formato elegido")
+                        ).on_hover_text("Abre la exportación: preajustes, calidad, destino y cola (Ctrl+M)").on_disabled_hover_text("Hace falta FFmpeg para exportar")
                         .clicked()
                     {
                         self.export();
+                    }
+                    let pending = self
+                        .export_queue
+                        .iter()
+                        .filter(|item| matches!(item.state, JobState::Waiting | JobState::Running))
+                        .count();
+                    if !self.export_queue.is_empty()
+                        && theme::bar_button(
+                            ui,
+                            &if pending > 0 {
+                                format!("Cola ({pending})")
+                            } else {
+                                "Cola".to_owned()
+                            },
+                        )
+                        .on_hover_text("Trabajos de exportación: progreso, cancelar y abrir")
+                        .clicked()
+                    {
+                        self.show_queue = !self.show_queue;
                     }
                     if self.export_result.is_some() {
                         let (pct, _) = self
@@ -10821,6 +11346,8 @@ impl eframe::App for NovaCutWindows {
         self.show_silence_review(context);
         self.show_scene_cut_review(context);
         self.show_shortcuts_window(context);
+        self.show_export_window(context);
+        self.show_queue_window(context);
         self.show_command_center(context);
 
         if self.monitor_fullscreen {
@@ -15342,6 +15869,26 @@ fn build_render_filters(
     Ok(filters)
 }
 
+/// Estado de un trabajo de la cola de exportación.
+#[derive(Clone, PartialEq)]
+enum JobState {
+    Waiting,
+    Running,
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+/// Un trabajo de la cola: una instantánea del montaje en el momento de
+/// añadirlo (como Media Encoder), así que seguir editando no lo altera.
+struct QueueItem {
+    id: u64,
+    job: RenderJob,
+    state: JobState,
+    /// Resumen para la lista: formato, tamaño y duración.
+    summary: String,
+}
+
 /// Todo lo que define una exportación. Se construye en el hilo de la
 /// interfaz y viaja entero al hilo de render (y a la cola de exportación).
 #[derive(Clone)]
@@ -15365,6 +15912,8 @@ struct RenderJob {
     skip: f64,
     /// Duración de la salida; `None` es hasta el final del último clip.
     length: Option<f64>,
+    /// Calidad o bitrate y audio elegidos (no se aplican a `fast`).
+    encode: exportacion::EncodeSettings,
 }
 
 impl RenderJob {
@@ -15522,7 +16071,12 @@ fn run_export_once(
         child.args(["-map", "[aout]"]);
     }
     child.args(["-progress", "pipe:1", "-nostats"]);
-    child.args(format.export_args(fast, hw));
+    let mut codec = format.export_args(fast, hw);
+    if !fast {
+        let accelerated = hw.filter(|_| matches!(format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc));
+        exportacion::apply(&mut codec, &job.encode, accelerated);
+    }
+    child.args(codec);
     if job.skip > 0.0005 {
         // Búsqueda en la salida: exacta al fotograma, y el preroll es corto.
         child.args(["-ss", &format_seconds(job.skip)]);
@@ -15602,6 +16156,22 @@ fn run_export_once(
             .collect::<Vec<_>>()
             .join(" | "))
     }
+}
+
+/// Muestra el archivo seleccionado en el Explorador (o en Finder en el
+/// host de desarrollo).
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(windows)]
+    let result = Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let result = Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn();
+    let _ = result;
 }
 
 /// Grafo de filtros escrito en un temporal. Windows limita la línea de
@@ -18561,6 +19131,7 @@ mod render_real_tests {
             hw,
             skip: 0.0,
             length: None,
+            encode: exportacion::EncodeSettings::default(),
         }
     }
 
@@ -19137,6 +19708,59 @@ mod render_real_tests {
         assert!(full > 200.0, "el título no se ve: {full}");
         assert!(start < full * 0.35, "sin fundido: {start} vs {full}");
         assert!(middle > start && middle < full, "{start} {middle} {full}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn encode_settings_control_bitrate_and_size() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("calidad");
+        let clip = camera_clip(&directory);
+        let render = |name: &str, encode: exportacion::EncodeSettings| {
+            let output = directory.join(name);
+            let job = RenderJob {
+                encode,
+                ..test_job(&[clip.clone()], &output, ExportFormat::Mp4Video, None)
+            };
+            run_export(
+                &job,
+                &AtomicBool::new(false),
+                &Arc::new(std::sync::Mutex::new(RenderProgress::default())),
+            )
+            .unwrap();
+            std::fs::metadata(&output).unwrap().len() as f64
+        };
+        let quality = |quality| exportacion::EncodeSettings {
+            quality,
+            ..Default::default()
+        };
+        let best = render("maxima.mp4", quality(exportacion::Quality::Maxima));
+        let light = render("ligera.mp4", quality(exportacion::Quality::Ligera));
+        assert!(light < best * 0.6, "ligera {light} vs máxima {best}");
+        let target = render(
+            "bitrate.mp4",
+            exportacion::EncodeSettings {
+                bitrate_mbps: Some(2.0),
+                audio_kbps: 128,
+                ..Default::default()
+            },
+        );
+        // 4 s a 2 Mbps + 128 kbps ≈ 1,06 MB; el control de tasa no es exacto.
+        let expected = 4.0 * (2_000_000.0 + 128_000.0) / 8.0;
+        assert!(
+            (target / expected - 1.0).abs() < 0.35,
+            "{target} bytes, esperados ≈ {expected}"
+        );
+        let audio = Command::new(tool_path("ffprobe.exe"))
+            .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=bit_rate"])
+            .args(["-of", "default=nw=1:nk=1"])
+            .arg(directory.join("bitrate.mp4"))
+            .output()
+            .unwrap();
+        let audio: f64 = String::from_utf8_lossy(&audio.stdout).trim().parse().unwrap_or(0.0);
+        assert!((100_000.0..160_000.0).contains(&audio), "audio a {audio} bps");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
