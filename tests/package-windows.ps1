@@ -79,7 +79,7 @@ function Assert-Package([string]$Directory) {
 New-Item $sandbox -ItemType Directory | Out-Null
 try {
     # NSIS requires /D last, with no quotes even when the directory has spaces.
-    Invoke-BoundedProcess $Installer "/S /NOFFMPEG /D=$installDir"
+    Invoke-BoundedProcess $Installer "/S /NOFFMPEG /NOWHISPER /D=$installDir"
     Assert-Package $installDir
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw 'Missing uninstaller' }
     foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt') {

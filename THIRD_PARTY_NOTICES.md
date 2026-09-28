@@ -18,3 +18,13 @@ cargo-about 0.9.2 over `Cargo.lock` for the `windows-host` feature by
 `bash tools/license-report.sh`; `bash tools/license-report.sh --check` verifies
 that the committed report matches the lockfile. The macOS application links no
 Rust crates and uses Apple system frameworks under Apple's platform terms.
+
+The Windows installer and application download two optional components at the
+user's request, each pinned to a version and SHA-256 digest: FFmpeg 9.0.2
+("essentials" build by gyan.dev, GPLv3; its license is installed next to the
+binaries as `FFmpeg-LICENSE.txt`) and whisper.cpp 1.9.2 with a `ggml` Whisper
+model (MIT, from github.com/ggml-org/whisper.cpp and
+huggingface.co/ggerganov/whisper.cpp). If the Microsoft Visual C++ runtime is
+missing, it is installed from Microsoft under Microsoft's terms after checking
+its Authenticode signature. None of these are redistributed in this
+repository or in the NovaCut packages.

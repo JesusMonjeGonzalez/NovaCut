@@ -5,9 +5,9 @@ Descarga siempre desde la página de **Releases** del repositorio:
 
 NovaCut es una alpha de ingeniería: guarda copia de tus originales.
 
-La última prerelease publicada es **v0.2.0** (25 de septiembre de 2026): el
-paquete macOS es universal (Apple Silicon e Intel) e incluye `SHA256SUMS.txt`
-con las tres descargas.
+La última prerelease publicada es **v0.3.0** (28 de septiembre de 2026): en
+Windows instala también la transcripción local; el paquete macOS es universal
+(Apple Silicon e Intel) e incluye `SHA256SUMS.txt` con las tres descargas.
 
 ## Windows 10 / 11 (64 bits)
 
@@ -22,14 +22,18 @@ actualizado (OpenGL 2.0 o superior; cualquier Intel, AMD o NVIDIA de los
    no es una garantía de seguridad. Solo si has verificado la procedencia y
    aceptas ese riesgo, pulsa **«Más información» → «Ejecutar de todas formas»**.
 3. Sigue el asistente. No pide permisos de administrador: se instala solo para
-   tu usuario. Deja marcada la casilla **«Motor multimedia FFmpeg»**: la
-   descarga, comprueba su suma SHA-256 y la deja junto a NovaCut.
+   tu usuario. Deja marcadas las casillas **«Motor multimedia FFmpeg»** y
+   **«Transcripción local con Whisper»**: las descarga (unos 300 MB en total),
+   comprueba sus sumas SHA-256 y las deja listas. Si a tu Windows le falta el
+   runtime de Visual C++ que necesita Whisper, lo instala desde Microsoft y
+   Windows te pedirá permiso de administrador una vez.
 4. Al terminar, NovaCut se abre. También lo tienes en el menú Inicio y, si lo
    marcaste, en el escritorio. Los proyectos `.ncrough` se abren con doble clic.
 
 Si FFmpeg no se pudo descargar (sin conexión, proxy de empresa…), NovaCut se
 instala igualmente y, al abrirlo, ofrece un botón **«Instalar FFmpeg
-automáticamente»**. También puedes copiar a mano `ffmpeg.exe`, `ffprobe.exe` y
+automáticamente»**, y la pestaña Transcripción, **«Instalar transcripción»**.
+También puedes copiar a mano `ffmpeg.exe`, `ffprobe.exe` y
 `ffplay.exe` (de <https://www.gyan.dev/ffmpeg/builds/>) junto a
 `novacut-windows.exe`.
 

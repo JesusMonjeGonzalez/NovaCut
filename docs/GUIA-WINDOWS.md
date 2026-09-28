@@ -171,16 +171,20 @@ muestra una pantalla con un boton para instalarlo sin usar la terminal.
 Tambien se pueden colocar `ffmpeg.exe`, `ffprobe.exe` y `ffplay.exe` junto a
 `novacut-windows.exe`.
 
-Whisper es opcional y no se incluye por el tamaño de los modelos. Coloca el
-ejecutable y el modelo en `whisper` junto a `novacut-windows.exe`, o en
-`%LOCALAPPDATA%\NovaCut\Whisper`, o en la carpeta que indique la variable
-`NOVACUT_WHISPER_DIR`. Para español conviene al menos el modelo `base`.
+La transcripción (Whisper) la instala el propio instalador si dejas marcada su
+casilla, o la pestaña "Transcripción" con un botón: **precisa** (modelo
+`small`, unos 190 MB, la recomendada en español) o **rápida** (`base`, unos
+60 MB). Descarga whisper.cpp 1.9.2 y el modelo con huellas SHA-256 fijas en
+`%LOCALAPPDATA%\NovaCut\Whisper`. Si al equipo le falta el runtime de Visual
+C++ de Microsoft, lo instala (tras comprobar su firma) y Windows pide permiso
+de administrador una vez. También puedes colocar tú `whisper-cli.exe` y un
+modelo `ggml-*.bin` en `whisper` junto a `novacut-windows.exe` o en la carpeta
+de `NOVACUT_WHISPER_DIR`.
 
 ## Limites actuales
 
 Los modos Color y Luminosidad importados de macOS se aproximan con composición
 normal porque FFmpeg no ofrece equivalentes directos. Los proxies no se limpian
-automáticamente. Whisper requiere una instalación local opcional y la calidad
-depende del modelo. Conserva los medios originales y una copia de seguridad de
+automáticamente. La calidad de la transcripción depende del modelo. Conserva los medios originales y una copia de seguridad de
 cualquier trabajo importante. Windows abre `.editorcito`, pero guardar de
 vuelta al formato Mac sin perder elementos todavía no está habilitado.
