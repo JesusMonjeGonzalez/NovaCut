@@ -104,7 +104,12 @@ try {
     # descarga real, no solo ejecutar el script aislado. El limite cubre
     # los tres intentos de red mas descompresion y copia.
     $uninstalled = $false
-    Invoke-BoundedProcess $Installer "/S /NOWHISPER /D=$installDir" -TimeoutSeconds 1050
+    try {
+        Invoke-BoundedProcess $Installer "/S /NOWHISPER /D=$installDir" -TimeoutSeconds 1050
+    } finally {
+        $downloadLog = Join-Path $installDir 'ffmpeg-install.log'
+        if (Test-Path -LiteralPath $downloadLog) { Get-Content -LiteralPath $downloadLog | Write-Host }
+    }
     Assert-Package $installDir
     foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt') {
         $path = Join-Path $installDir $name

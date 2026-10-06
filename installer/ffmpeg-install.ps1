@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$InstallDir
+    [string]$InstallDir,
+    [string]$LogPath = ''
 )
 
 # Descarga el build "release essentials" de gyan.dev y copia los binarios de
@@ -29,6 +30,7 @@ $backup = $null
 $keepBackup = $false
 $touched = @()
 $originals = @{}
+$transcribing = $false
 
 function Get-WithRetry([string[]]$Sources, [string]$OutFile) {
     # curl.exe viene con Windows 10 1803+ y Windows 11. Evita la descarga
@@ -86,6 +88,10 @@ function Get-WithRetry([string[]]$Sources, [string]$OutFile) {
 }
 
 try {
+    if ($LogPath) {
+        Start-Transcript -Path $LogPath -Force | Out-Null
+        $transcribing = $true
+    }
     New-Item $work -ItemType Directory | Out-Null
     $zip = Join-Path $work 'ffmpeg.zip'
     Write-Host 'Descargando FFmpeg (~115 MB). El progreso aparece en los detalles.'
@@ -141,6 +147,7 @@ try {
     Write-Host "FFmpeg instalado en $InstallDir"
 } catch {
     $failure = $_
+    Write-Host "Error al instalar FFmpeg: $($failure.Exception.Message)"
     foreach ($name in $touched) {
         try {
             $destination = Join-Path $InstallDir $name
@@ -163,4 +170,5 @@ try {
         Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    if ($transcribing) { Stop-Transcript | Out-Null }
 }
