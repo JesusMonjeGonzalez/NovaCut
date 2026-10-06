@@ -57,17 +57,16 @@ jobs:
       - name: Verify Whisper installer gates
         shell: powershell
         run: ./tests/whisper-install.ps1
+      # Valida la descarga en PowerShell 5.1 antes de la compilacion larga.
+      - name: Install FFmpeg with the shipped script
+        shell: powershell
+        run: ./installer/ffmpeg-install.ps1 -InstallDir "$env:RUNNER_TEMP\ffmpeg"
       - name: Install installer compiler
         shell: pwsh
         run: choco install nsis --no-progress -y
       - name: Test and package Windows application
         shell: pwsh
         run: ./build-windows.ps1 -Installer
-      # El mismo script que ejecutan el instalador y el botón de la app, en
-      # el PowerShell 5.1 que trae Windows: descarga, SHA-256 y arranque.
-      - name: Install FFmpeg with the shipped script
-        shell: powershell
-        run: ./installer/ffmpeg-install.ps1 -InstallDir "$env:RUNNER_TEMP\ffmpeg"
       # Con FFmpeg real, los renders de extremo a extremo (efectos, títulos,
       # subtítulos animados, siete formatos, vuelta a CPU) corren en Windows.
       # Solo se omite la prueba que necesita Whisper y la voz de macOS.

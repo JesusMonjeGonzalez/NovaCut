@@ -98,9 +98,11 @@ try {
                     if (Test-Path -LiteralPath $out) { throw 'Partial curl download not removed' }
                     Set-Content -LiteralPath $out 'mock archive'
                     $exit = if ($scenario -eq 'curl-failure' -or ($scenario -eq 'curl-retry' -and $state.Downloads -eq 1)) { 28 } else { 0 }
-                    $process = [pscustomobject]@{ ExitCode = $exit; HasExited = $false; Waits = 0 }
+                    $process = [pscustomobject]@{ ExitCode = $exit; HasExited = $false; Waits = 0; HandleCaptured = $false }
+                    $process | Add-Member ScriptProperty Handle { $this.HandleCaptured = $true; return 123 }
                     $process | Add-Member ScriptMethod WaitForExit {
                         param($Milliseconds)
+                        if (-not $this.HandleCaptured) { throw 'Process handle must be retained before waiting in PowerShell 5.1' }
                         $this.Waits++
                         if ($scenario -eq 'curl-progress' -and $this.Waits -eq 1) { return $false }
                         $this.HasExited = $true

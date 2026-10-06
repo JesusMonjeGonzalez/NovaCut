@@ -52,6 +52,10 @@ function Get-WithRetry([string[]]$Sources, [string]$OutFile) {
                 $download = Start-Process -FilePath $curl.Source -ArgumentList $arguments -NoNewWindow -PassThru
                 $clock = [Diagnostics.Stopwatch]::StartNew()
                 try {
+                    # En PowerShell 5.1, conservar el handle antes de esperar:
+                    # sin el, ExitCode puede ser null aunque curl haya terminado
+                    # correctamente (Start-Process sin -Wait).
+                    $null = $download.Handle
                     while (-not $download.WaitForExit(2000)) {
                         $size = if (Test-Path -LiteralPath $OutFile) {
                             (Get-Item -LiteralPath $OutFile).Length / 1MB
