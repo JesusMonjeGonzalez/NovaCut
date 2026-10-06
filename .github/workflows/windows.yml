@@ -79,6 +79,8 @@ jobs:
           $env:PATH = "$env:RUNNER_TEMP\ffmpeg;$env:PATH"
           cargo test --locked --features windows-host --bin novacut-windows render_real -- --skip text_based_editing
           if ($LASTEXITCODE -ne 0) { throw "Real render tests failed" }
+          cargo test --locked --features windows-host --bin novacut-windows mejoras::tests
+          if ($LASTEXITCODE -ne 0) { throw "Editing tools and voice cleanup tests failed" }
       # El script de Whisper tal cual se distribuye (modelo rápido, 60 MB) y
       # una transcripción real de una frase dicha por la voz de Windows.
       - name: Install Whisper with the shipped script and transcribe

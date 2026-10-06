@@ -1,4 +1,4 @@
-use super::{egui, navigation, parse_timecode, theme, timecode, BottomTab, NovaCutWindows};
+use super::{egui, mejoras, navigation, parse_timecode, theme, timecode, BottomTab, NovaCutWindows};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -39,6 +39,7 @@ enum Action {
     Markers,
     Clips,
     Shortcuts,
+    Herramienta(mejoras::Accion),
     Clip(usize),
     Marker(f64),
     Subtitle(f64),
@@ -207,6 +208,14 @@ impl NovaCutWindows {
                 detail: detail.into(),
                 action,
                 unavailable,
+            });
+        }
+        for accion in mejoras::Accion::TODAS {
+            entries.push(Entry {
+                title: accion.titulo().into(),
+                detail: format!("Herramienta | {}", accion.ayuda()),
+                action: Action::Herramienta(accion),
+                unavailable: self.no_disponible(accion),
             });
         }
         for (index, clip) in self.project.clips.iter().enumerate() {
@@ -478,6 +487,7 @@ impl NovaCutWindows {
                 };
             }
             Action::Shortcuts => self.show_shortcuts = true,
+            Action::Herramienta(accion) => self.ejecutar_mejora(accion),
             Action::Clip(i) => {
                 if let Some(clip) = self.project.clips.get(i) {
                     let start = clip.timeline_start;

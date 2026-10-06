@@ -28,8 +28,8 @@
 
 Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
 
-The latest published prerelease is **v0.3.0**: Premiere-style editing tools,
-keyframes, multiple sequences and one-click local transcription on Windows,
+The latest published prerelease is **v0.4.0**: linked audio/video editing,
+local voice cleanup, preview rendering, FCPXML interchange and one-click transcription on Windows,
 plus a universal macOS package and a `SHA256SUMS.txt` manifest. Intel
 binary execution is packaged but not yet validated; see Current Limits.
 

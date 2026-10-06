@@ -143,10 +143,117 @@ Fallos que ya existían y que se arreglaron por el camino:
 - **Exportar un rango** que empezaba en mitad de un fundido, una transición o
   un anidado no coincidía con el montaje completo.
 
+## Quinta ronda (28 sep 2026): veinte huecos frente a Premiere, Resolve, Descript y CapCut
+
+Todo en `src/windows/mejoras.rs`, en el menú **Herramientas ▾** de la barra
+superior (por grupos) y en el centro de comandos (Ctrl+Mayús+P). Ningún
+proyecto cambia de formato: todo usa campos que ya existían.
+
+| Referencia | NovaCut Windows | Grupo |
+|---|---|---|
+| Resolve «Delete gaps» / Premiere «Cerrar hueco» | Cerrar todos los huecos a la vez en todas las pistas: el audio separado no se desincroniza | Montaje |
+| Descript «Shorten word gaps» | Acortar pausas de más de 0,8 s entre palabras, dejando 0,3 s | Montaje |
+| Premiere/Descript multicámara automática | Elige la cámara de quien habla (histéresis de 3 dB y planos de 2 s mínimo) en una pista nueva | Montaje |
+| Enlace A/V de Premiere | Arrastrar o borrar un plano arrastra su audio separado y sincronizado | Montaje |
+| Premiere «Ajustar a relleno» | Estirar la velocidad de un clip hasta el siguiente o hasta el cabezal | Montaje |
+| CapCut «Beats» / Premiere «Automatizar a secuencia» | Montar los clips seleccionados entre marcadores consecutivos | Montaje |
+| Premiere «Igualar sonoridad» | Igualar cada voz a -16 LUFS midiendo con loudnorm | Audio |
+| Premiere «Detección de ritmo» | Marcadores en los golpes de la música (flujo de energía con umbral local) | Audio |
+| Pitido de censura | Silencia el audio del rango I–O y pone un tono de 1 kHz encima | Audio |
+| Premiere «Grabación de voz en off» | Graba el micrófono (DirectShow en Windows) mientras suena el montaje | Audio |
+| iMovie/Premiere Ken Burns | Zoom del 15 % y paseo lateral alterno en fotos y congelados | Imagen |
+| Imagen en imagen | Cuatro esquinas al 30 % con margen de 48 px | Imagen |
+| Difuminar caras o matrículas | Capa de ajuste con desenfoque dentro de una elipse | Imagen |
+| Zonas seguras / guías de redes | Recorte vertical o cuadrado, 90/93 %, tercios y la zona que tapa TikTok/Reels | Imagen (y menú Ver del monitor) |
+| Premiere «Reemplazar con clip» | Reemplazar el medio conservando efectos, audio y posición | Medios y entrega |
+| Premiere «Administrador de proyectos» | Recopilar medios y proyecto en una carpeta | Medios y entrega |
+| Capítulos de YouTube | Desde los marcadores, con las reglas de YouTube; al portapapeles y a .txt | Medios y entrega |
+| Descript «Exportar transcripción» | Texto por párrafos con hora | Medios y entrega |
+| Intercambio con Final Cut / Resolve | FCPXML 1.9 con carriles, tiempos exactos y aviso de lo que no viaja | Medios y entrega |
+| Normas de subtítulos | Partir subtítulos a dos líneas de 42 caracteres como máximo | Medios y entrega |
+
+Limitaciones conocidas: el zoom de Ken Burns y la imagen en imagen no se
+ven en exportaciones verticales o cuadradas, porque ese reencuadre llena el
+lienzo; el FCPXML no lleva cambios de velocidad ni títulos (lo avisa); la
+voz en off usa el primer micrófono que lista Windows.
+
+## Sexta ronda (28 sep 2026): deuda técnica frente a Premiere
+
+Las cinco razones técnicas por las que alguien elegiría Premiere, y qué se
+ha cubierto de cada una:
+
+| Razón | Qué se hizo | Estado |
+|---|---|---|
+| Reproducción no en tiempo real | «Renderizar previsualización» (Herramientas › Reproducción): compone I–O o todo el montaje en segundo plano; la reproducción lee ese tramo ya compuesto. Barra verde en la regla; cualquier edición la invalida | Hecho |
+| Monitor ≠ exportación | Posiciones proporcionales a la salida (en 720p y 4K caían en otro sitio); en vertical y cuadrado se respetan escala, posición y zoom animado; el monitor compone con la proporción de la exportación, con bandas | Hecho |
+| Color de 8 bits sin gestión de color | — | Pendiente: necesita medir con FFmpeg real |
+| Intercambio profesional | Stems de audio por pista (WAV alineados, sin máster) | Parcial: faltan AAF/OMF y plugins |
+| Audio y modelo de datos | Los recortes de borde arrastran el audio enlazado | Parcial: faltan 5.1, submezclas y un deshacer que no copie el proyecto entero |
+
+Cambio de comportamiento a tener en cuenta: un proyecto con capas
+desplazadas que se exportara a 720p o 4K salía distinto de lo que se veía;
+ahora sale como en el monitor.
+
+## Séptima ronda: bloque 1 de la hoja de ruta por niveles
+
+| Referencia | NovaCut Windows | Dónde |
+|---|---|---|
+| Premiere «Ease In / Ease Out» | Suavizar animación: los keyframes lineales (transformación, color, efectos y volumen) pasan a curvas de entrada y salida lentas; Ken Burns ya las usa | Herramientas › Imagen |
+| Adobe «Mejorar voz» / Descript «Studio Sound» | «Limpieza de voz» usa RNNoise (`arnndn`) si hay un modelo `.rnnn` en `%LOCALAPPDATA%\NovaCut\Modelos`, junto a la app en `modelos\` o en `NOVACUT_RNNOISE_MODEL`; si no, la limpieza clásica | Sonido esencial; Herramientas › Audio dice si lo encuentra |
+| Premiere «Clip no coincide con la secuencia» | Al importar el primer vídeo, si su tamaño (con el giro de los móviles) o su cadencia difieren, se propone ajustar la secuencia | Diálogo al importar |
+
+El suavizado inserta keyframes intermedios cada 0,2 s como máximo, en vez
+de guardar un tipo de curva: los proyectos no cambian de formato y aplicarlo
+dos veces no altera nada. El modelo RNNoise no se incluye todavía: falta
+fijar su descarga con huella SHA-256 en el instalador, como FFmpeg y Whisper.
+
+## Octava ronda: visores, multicámara e intercambio (bloque 3)
+
+| Referencia | NovaCut Windows | Dónde |
+|---|---|---|
+| Lumetri Scopes: parade RGB e histograma | Junto a la forma de onda y el vectorscopio, uno por esquina del monitor | Monitor › Ver ▾ |
+| Premiere «Monitor multicámara» | Ventana con los cuatro ángulos en el cabezal; clic (o 1-4) corta a ese ángulo | Herramientas › Montaje |
+| Importar XML de Final Cut / Resolve | FCPXML 1.8-1.11 como secuencia nueva: cortes, carriles, entradas con timecode de cámara, clips desactivados; avisa de títulos, transiciones, velocidad y compuestos | Herramientas › Medios y entrega |
+
+Pensado para equipos medianos: el visor multicámara saca fotogramas sueltos
+a 320×180 (del proxy si lo hay), de uno en uno, y al reproducir los refresca
+cada dos segundos; los visores solo se calculan si están activos y sobre la
+imagen de 640×360 del monitor. El analizador de XML es propio (sin
+dependencias) y la ida y vuelta NovaCut → FCPXML → NovaCut está probada.
+
+## Integración y UX de las rondas 5 a 8
+
+Cada herramienta está donde un montador la busca, no solo en un menú:
+
+| Dónde | Qué hay |
+|---|---|
+| Archivo ▾ | Importar FCPXML; exportar EDL, FCPXML, stems, capítulos y transcripción; recopilar proyecto |
+| Clic derecho en un clip › Herramientas | Solo las que aplican a ese clip: suavizar, Ken Burns (fotos), imagen en imagen, estirar, igualar voz, golpes, reemplazar |
+| Pestaña Transcripción | Acortar pausas, exportar texto |
+| Pestaña Subtítulos | Partir largos |
+| Pestaña Marcadores | Capítulos de YouTube, montar al ritmo |
+| Pestaña Mezclador | Igualar voces, mejora de voz, stems |
+| Monitor › Ver ▾ | Forma de onda, vectorscopio, parade, histograma, guías |
+| Intro | Renderizar I–O (solo si ningún control tiene el foco del teclado) |
+| Herramientas ▾ y Ctrl+Mayús+P | El catálogo completo, por grupos y con búsqueda |
+
+Todas usan el mismo botón: ayuda en el tooltip y, desactivadas, el motivo.
+La barra de estado recorta el mensaje con «…» en vez de pisar los datos de
+la derecha (el texto completo, en el tooltip). Textos a 11 px como mínimo.
+
+Pendiente de UX, por orden:
+1. El suavizado inserta keyframes intermedios y la navegación ◀◆▶ del
+   Inspector los recorre todos. Hay que guardar el tipo de curva en el
+   keyframe (campo nuevo en `animacion::Key` y `TransformKeyframe`).
+2. Revisión visual con la app abierta a 800×500, 1280×720 y 4K emulado: en
+   especial que «Herramientas ▾» no parta la barra superior en dos filas a
+   1280 px.
+
 ## Lo que sigue faltando frente a Premiere
 
-1. **Enlace A/V y bloqueo de sincronía**: el ripple actúa por pista; con audio
-   separado (J/L-cuts) puede desincronizar pistas que Premiere movería juntas.
+1. **Bloqueo de sincronía completo**: arrastrar, borrar y recortar un plano
+   lleva su audio enlazado y cerrar huecos no desincroniza; rodar, desplazar
+   y deslizar siguen actuando sobre un solo clip.
 2. **Previsualización en el monitor** de efectos temporales (estabilizar,
    grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
 3. **Curvas HSL dibujables** (tono contra saturación); hoy la HSL secundaria es
