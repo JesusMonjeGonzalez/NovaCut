@@ -33,7 +33,10 @@ $originals = @{}
 function Get-WithRetry([string[]]$Sources, [string]$OutFile) {
     # curl.exe viene con Windows 10 1803+ y Windows 11. Evita la descarga
     # lenta de Invoke-WebRequest 5.1 y limita conexion, inactividad y total.
-    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    # Puede haber varios curl.exe (Windows, Git, etc.) en PATH. Start-Process
+    # necesita una ruta, no el array que devuelve Get-Command en ese caso.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $Uri = $Sources[($attempt - 1) % $Sources.Count]
         try {

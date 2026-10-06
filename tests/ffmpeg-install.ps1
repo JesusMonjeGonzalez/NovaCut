@@ -7,7 +7,7 @@ $oldTemp = $env:TEMP
 $oldTls = [Net.ServicePointManager]::SecurityProtocol
 $names = @('ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt')
 $cases = @('success', 'fresh', 'hash', 'backup', 'rollback', 'installed', 'fresh-failure', 'mixed-failure')
-$cases += 'download-failure', 'download-retry', 'curl-success', 'curl-failure', 'curl-retry', 'curl-progress'
+$cases += 'download-failure', 'download-retry', 'curl-success', 'curl-failure', 'curl-retry', 'curl-progress', 'curl-multiple'
 foreach ($name in $names) { $cases += "missing-$name", "empty-$name", "replace-$name" }
 foreach ($name in $names[0..2]) { $cases += "startup-$name" }
 
@@ -36,6 +36,7 @@ try {
                 param($Name, $CommandType, $ErrorAction)
                 if ($Name -ne 'curl.exe' -or $CommandType -ne 'Application') { throw 'Unexpected command lookup' }
                 if ($scenario -like 'curl-*') { [pscustomobject]@{ Source = 'mock-curl.exe' } }
+                if ($scenario -eq 'curl-multiple') { [pscustomobject]@{ Source = 'another-curl.exe' } }
             }
 
             function Invoke-WebRequest {
@@ -141,7 +142,7 @@ try {
 
             $failure = $null
             try { & $installer -InstallDir $destinationDir } catch { $failure = $_ }
-            $success = $scenario -in @('success', 'fresh', 'download-retry', 'curl-success', 'curl-retry', 'curl-progress')
+            $success = $scenario -in @('success', 'fresh', 'download-retry', 'curl-success', 'curl-retry', 'curl-progress', 'curl-multiple')
             if ($success -and $failure) { throw $failure }
             if (-not $success -and -not $failure) { throw "${scenario}: expected failure" }
             $expectedError = switch -Wildcard ($scenario) {
