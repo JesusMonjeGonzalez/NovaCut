@@ -14,6 +14,10 @@ param(
 # Solo ASCII: PowerShell 5.1 lee los scripts sin BOM como ANSI.
 
 $ErrorActionPreference = 'Stop'
+# Si PowerShell 5.1 arranca desde pwsh 7 (o desde algo que lo hizo), hereda
+# su PSModulePath, carga los modulos de la 7 y Get-FileHash, Expand-Archive o
+# Get-AuthenticodeSignature dejan de existir. Usar solo los de Windows.
+$env:PSModulePath = "$PSHOME\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = `
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -40,12 +44,50 @@ $backup = $null
 $installed = $false
 
 function Get-WithRetry([string]$Uri, [string]$OutFile) {
+    # Como en ffmpeg-install.ps1: curl.exe (Windows 10 1803+) con limites de
+    # conexion, inactividad y total, y progreso visible. Sin limites, una
+    # conexion atascada dejaba el instalador "descargando" para siempre.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $name = Split-Path -Leaf $OutFile
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
+            Write-Host "Descargando $name, intento $attempt de 3 (limite de 10 minutos)..."
+            if (Test-Path -LiteralPath $OutFile) {
+                Remove-Item -LiteralPath $OutFile -Force
+            }
+            if ($curl) {
+                $arguments = @('--fail', '--location', '--silent', '--show-error',
+                    '--connect-timeout', '20', '--max-time', '600',
+                    '--speed-time', '30', '--speed-limit', '1024',
+                    '--output', ('"{0}"' -f $OutFile), ('"{0}"' -f $Uri))
+                $download = Start-Process -FilePath $curl.Source -ArgumentList $arguments -NoNewWindow -PassThru
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $null = $download.Handle
+                    while (-not $download.WaitForExit(2000)) {
+                        $size = if (Test-Path -LiteralPath $OutFile) {
+                            (Get-Item -LiteralPath $OutFile).Length / 1MB
+                        } else { 0 }
+                        Write-Host ('{0}: {1:N1} MB descargados ({2:N0} s)' -f $name, $size, $clock.Elapsed.TotalSeconds)
+                        if ($clock.Elapsed.TotalSeconds -gt 630) {
+                            throw 'La descarga ha superado el tiempo limite'
+                        }
+                    }
+                    if ($download.ExitCode -ne 0) {
+                        throw "La descarga fallo (curl $($download.ExitCode)); revisa la conexion o el proxy"
+                    }
+                } finally {
+                    if (-not $download.HasExited) { $download.Kill(); $download.WaitForExit() }
+                    $download.Dispose()
+                }
+            } else {
+                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 300
+            }
             return
         } catch {
             if ($attempt -eq 3) { throw "No se pudo descargar $Uri : $($_.Exception.Message)" }
+            Write-Host "Descarga interrumpida: $($_.Exception.Message). Reintentando..."
             Start-Sleep -Seconds (3 * $attempt)
         }
     }

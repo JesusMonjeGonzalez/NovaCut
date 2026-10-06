@@ -40,8 +40,14 @@ try {
             }
             $state = @{ Downloads = @(); Elevated = 0; Runs = 0 }
 
+            # Sin curl.exe: la ruta de PowerShell, acotada, se prueba aqui.
+            function Get-Command {
+                param($Name, $CommandType, $ErrorAction)
+                if ($Name -ne 'curl.exe' -or $CommandType -ne 'Application') { throw 'Unexpected command lookup' }
+            }
             function Invoke-WebRequest {
-                param($Uri, $OutFile, [switch]$UseBasicParsing)
+                param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec)
+                if (-not $TimeoutSec) { throw 'Unbounded PowerShell download' }
                 $state.Downloads += $Uri
                 if (-not $OutFile) { throw 'Download without destination' }
                 if ($Uri -ne $zipUrl -and $Uri -ne $redistUrl -and -not $Uri.StartsWith($modelBase)) {

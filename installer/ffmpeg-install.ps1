@@ -11,6 +11,10 @@ param(
 # tiene que funcionar en el PowerShell 5.1 que trae cualquier Windows 10/11.
 
 $ErrorActionPreference = 'Stop'
+# Si PowerShell 5.1 arranca desde pwsh 7 (o desde algo que lo hizo), hereda
+# su PSModulePath, carga los modulos de la 7 y Get-FileHash, Expand-Archive o
+# Get-AuthenticodeSignature dejan de existir. Usar solo los de Windows.
+$env:PSModulePath = "$PSHOME\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
 # Con la barra de progreso, Invoke-WebRequest de PowerShell 5.1 es diez veces
 # mas lento: 80 MB pasaban de segundos a minutos.
 $ProgressPreference = 'SilentlyContinue'
