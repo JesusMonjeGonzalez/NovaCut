@@ -86,7 +86,8 @@ Section "Acceso directo en el escritorio" SEC_DESKTOP
 SectionEnd
 
 Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
-    DetailPrint "Descargando e instalando FFmpeg (~80 MB)..."
+    SetDetailsView show
+    DetailPrint "Descargando e instalando FFmpeg (~115 MB). Progreso y fases abajo..."
     nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR"'
     Pop $0
     ${If} $0 <> 0

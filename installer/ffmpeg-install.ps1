@@ -18,7 +18,8 @@ $ProgressPreference = 'SilentlyContinue'
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $release = '9.0.2'
-$source = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$release-essentials_build.zip"
+$source = "https://github.com/GyanD/codexffmpeg/releases/download/$release/ffmpeg-$release-essentials_build.zip"
+$fallbackSource = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$release-essentials_build.zip"
 # SHA256 upstream consultado el 2026-09-25:
 # https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256
 # No descargar el hash durante la instalacion: forma parte de la version revisada.
@@ -29,16 +30,49 @@ $keepBackup = $false
 $touched = @()
 $originals = @{}
 
-function Get-WithRetry([string]$Uri, [string]$OutFile) {
+function Get-WithRetry([string[]]$Sources, [string]$OutFile) {
+    # curl.exe viene con Windows 10 1803+ y Windows 11. Evita la descarga
+    # lenta de Invoke-WebRequest 5.1 y limita conexion, inactividad y total.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $Uri = $Sources[($attempt - 1) % $Sources.Count]
         try {
-            if ($OutFile) {
-                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
-                return $null
+            Write-Host "Descargando FFmpeg, intento $attempt de 3 (limite de 5 minutos)..."
+            if (Test-Path -LiteralPath $OutFile) {
+                Remove-Item -LiteralPath $OutFile -Force
             }
-            return Invoke-WebRequest -UseBasicParsing -Uri $Uri
+            if ($curl) {
+                $arguments = @('--fail', '--location', '--silent', '--show-error',
+                    '--connect-timeout', '20', '--max-time', '300',
+                    '--speed-time', '30', '--speed-limit', '1024',
+                    '--output', ('"{0}"' -f $OutFile), ('"{0}"' -f $Uri))
+                $download = Start-Process -FilePath $curl.Source -ArgumentList $arguments -NoNewWindow -PassThru
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                try {
+                    while (-not $download.WaitForExit(2000)) {
+                        $size = if (Test-Path -LiteralPath $OutFile) {
+                            (Get-Item -LiteralPath $OutFile).Length / 1MB
+                        } else { 0 }
+                        Write-Host ('FFmpeg: {0:N1} MB descargados ({1:N0} s)' -f $size, $clock.Elapsed.TotalSeconds)
+                        if ($clock.Elapsed.TotalSeconds -gt 330) {
+                            throw 'La descarga ha superado el tiempo limite'
+                        }
+                    }
+                    if ($download.ExitCode -ne 0) {
+                        throw "La descarga fallo (curl $($download.ExitCode)); revisa la conexion o el proxy"
+                    }
+                } finally {
+                    if (-not $download.HasExited) { $download.Kill(); $download.WaitForExit() }
+                    $download.Dispose()
+                }
+            } else {
+                Write-Host 'Usando PowerShell (Windows sin curl.exe), limite de 120 segundos...'
+                Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec 120
+            }
+            return
         } catch {
             if ($attempt -eq 3) { throw "No se pudo descargar $Uri : $($_.Exception.Message)" }
+            Write-Host "Descarga interrumpida: $($_.Exception.Message). Reintentando..."
             Start-Sleep -Seconds (3 * $attempt)
         }
     }
@@ -47,13 +81,15 @@ function Get-WithRetry([string]$Uri, [string]$OutFile) {
 try {
     New-Item $work -ItemType Directory | Out-Null
     $zip = Join-Path $work 'ffmpeg.zip'
-    Write-Host 'Descargando FFmpeg (~100 MB)...'
-    Get-WithRetry $source $zip | Out-Null
+    Write-Host 'Descargando FFmpeg (~115 MB). El progreso aparece en los detalles.'
+    Get-WithRetry -Sources @($source, $fallbackSource) -OutFile $zip | Out-Null
 
+    Write-Host 'Verificando SHA-256 de FFmpeg...'
     $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $expected) { throw 'La descarga de FFmpeg esta corrupta (SHA-256 distinto); vuelve a intentarlo' }
 
     $unzip = Join-Path $work 'x'
+    Write-Host 'Descomprimiendo FFmpeg. Puede tardar unos minutos...'
     Expand-Archive -Path $zip -DestinationPath $unzip -Force
     $root = Join-Path $unzip "ffmpeg-$release-essentials_build"
     $names = @('ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt')
@@ -67,11 +103,13 @@ try {
         }
         $staged[$name] = $path
     }
+    Write-Host 'Comprobando los ejecutables de FFmpeg...'
     foreach ($name in $names[0..2]) {
         $process = Start-Process -FilePath $staged[$name] -ArgumentList '-hide_banner', '-version' -Wait -PassThru -NoNewWindow
         if ($process.ExitCode -ne 0) { throw "$name no arranca en staging" }
     }
 
+    Write-Host 'Copiando FFmpeg a la carpeta de NovaCut...'
     New-Item $InstallDir -ItemType Directory -Force | Out-Null
     # En el destino, no en TEMP: una restauracion fallida debe ser recuperable.
     $backup = Join-Path $InstallDir ('ffmpeg-backup-' + [guid]::NewGuid())

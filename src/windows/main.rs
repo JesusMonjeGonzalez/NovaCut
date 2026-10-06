@@ -6069,7 +6069,7 @@ impl NovaCutWindows {
         };
         let (sender, receiver) = mpsc::channel();
         self.setup_result = Some(receiver);
-        self.status = "Descargando FFmpeg (~80 MB). Esto puede tardar varios minutos...".to_owned();
+        self.status = "Descargando FFmpeg (~115 MB). Esto puede tardar varios minutos...".to_owned();
         std::thread::spawn(move || {
             let result = if winget_available() {
                 match run_winget_install() {
@@ -12329,7 +12329,7 @@ impl eframe::App for NovaCutWindows {
                             ui.spinner();
                             ui.label(
                                 egui::RichText::new(
-                                    "Descargando e instalando FFmpeg (~100 MB)...\nEsto puede tardar varios minutos.",
+                                    "Descargando e instalando FFmpeg (~115 MB)...\nEsto puede tardar varios minutos.",
                                 )
                                 .size(11.5)
                                 .color(theme::TEXT_DIM),
