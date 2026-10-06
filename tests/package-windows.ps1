@@ -34,7 +34,7 @@ $installDir = Join-Path $sandbox "Installed NovaCut"
 $uninstaller = Join-Path $installDir 'Desinstalar-NovaCut.exe'
 $uninstalled = $false
 
-function Invoke-BoundedProcess([string]$File, [string]$Arguments, [switch]$Smoke) {
+function Invoke-BoundedProcess([string]$File, [string]$Arguments, [switch]$Smoke, [int]$TimeoutSeconds = 120) {
     $process = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru -WorkingDirectory (Split-Path -Parent $File)
     try {
         if ($Smoke) {
@@ -44,13 +44,13 @@ function Invoke-BoundedProcess([string]$File, [string]$Arguments, [switch]$Smoke
             $process.Refresh()
             if ($process.HasExited) { throw "Application is not alive: $File" }
         } else {
-            if (-not $process.WaitForExit(120000)) { throw "Timed out: $File" }
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) { throw "Timed out: $File" }
             if ($process.ExitCode -ne 0) { throw "Exit $($process.ExitCode): $File" }
         }
     } finally {
         # Kill only the process we started, never all processes with its name.
         if (-not $process.HasExited) {
-            $process.Kill()
+            $process.Kill($true)
             if (-not $process.WaitForExit(5000)) { throw "Could not stop PID $($process.Id)" }
         }
         $process.Dispose()
@@ -99,6 +99,30 @@ try {
         throw 'Uninstall removed or changed the user project'
     }
     Write-Host 'PASS: silent install without FFmpeg, 10s process smoke, uninstall preserves user project'
+
+    # Reproduce la ruta del usuario: NSIS -> nsExec -> PowerShell 5.1 ->
+    # descarga real, no solo ejecutar el script aislado. El limite cubre
+    # los tres intentos de red mas descompresion y copia.
+    $uninstalled = $false
+    try {
+        Invoke-BoundedProcess $Installer "/S /NOWHISPER /D=$installDir" -TimeoutSeconds 1050
+    } finally {
+        $downloadLog = Join-Path $installDir 'ffmpeg-install.log'
+        if (Test-Path -LiteralPath $downloadLog) { Get-Content -LiteralPath $downloadLog | Write-Host }
+    }
+    Assert-Package $installDir
+    foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe', 'FFmpeg-LICENSE.txt') {
+        $path = Join-Path $installDir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+            throw "Installer did not install FFmpeg component: $name"
+        }
+    }
+    Invoke-BoundedProcess (Join-Path $installDir 'ffmpeg.exe') '-hide_banner -version'
+    Invoke-BoundedProcess (Join-Path $installDir 'novacut-windows.exe') ' ' -Smoke
+    Invoke-BoundedProcess $uninstaller "/S _?=$installDir"
+    $uninstalled = $true
+    if ((Get-FileHash -LiteralPath $fixture).Hash -ne $fixtureHash) { throw 'FFmpeg install/uninstall changed user project' }
+    Write-Host 'PASS: NSIS installs FFmpeg over the network, binaries launch, uninstall preserves user project'
 
     if (Test-Path -LiteralPath $Portable -PathType Container) {
         $portableDir = Join-Path $sandbox 'Portable NovaCut'

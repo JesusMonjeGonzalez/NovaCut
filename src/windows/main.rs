@@ -6069,22 +6069,12 @@ impl NovaCutWindows {
         };
         let (sender, receiver) = mpsc::channel();
         self.setup_result = Some(receiver);
-        self.status = "Descargando FFmpeg (~80 MB). Esto puede tardar varios minutos...".to_owned();
+        self.status = "Descargando FFmpeg (~115 MB). Esto puede tardar varios minutos...".to_owned();
+        // Solo el script incrustado: descarga acotada en tiempo y verificada.
+        // WinGet podía quedarse esperando sin límite (acuerdos de la Store,
+        // actualización de fuentes) y dejaba el botón «descargando» para siempre.
         std::thread::spawn(move || {
-            let result = if winget_available() {
-                match run_winget_install() {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        let _ = sender.send(Err(format!(
-                            "WinGet fallo ({error}); intentando descarga directa..."
-                        )));
-                        run_powershell_install(&app_dir)
-                    }
-                }
-            } else {
-                run_powershell_install(&app_dir)
-            };
-            let _ = sender.send(result);
+            let _ = sender.send(run_powershell_install(&app_dir));
         });
     }
 
@@ -12329,7 +12319,7 @@ impl eframe::App for NovaCutWindows {
                             ui.spinner();
                             ui.label(
                                 egui::RichText::new(
-                                    "Descargando e instalando FFmpeg (~100 MB)...\nEsto puede tardar varios minutos.",
+                                    "Descargando e instalando FFmpeg (~115 MB)...\nEsto puede tardar varios minutos.",
                                 )
                                 .size(11.5)
                                 .color(theme::TEXT_DIM),
@@ -17946,42 +17936,6 @@ fn save_recovery(project: &RoughProject) {
 fn load_recovery() -> Option<RoughProject> {
     let json = std::fs::read_to_string(recovery_path()?).ok()?;
     serde_json::from_str(&json).ok()
-}
-
-/// ¿Está disponible el instalador `winget` (App Installer)?
-fn winget_available() -> bool {
-    Command::new("winget.exe")
-        .arg("--version")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Intenta instalar Gyan.FFmpeg con WinGet.
-fn run_winget_install() -> Result<(), String> {
-    let output = Command::new("winget.exe")
-        .args([
-            "install",
-            "--id",
-            "Gyan.FFmpeg",
-            "--exact",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--silent",
-            "--disable-interactivity",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("WinGet no se pudo ejecutar: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Err(if stderr.is_empty() { stdout } else { stderr })
-    }
 }
 
 /// Descarga el build "release essentials" de gyan.dev y copia los binarios

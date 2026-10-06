@@ -7,8 +7,8 @@
   ],
   "scope": "Transitive normal and build dependencies; dev dependencies excluded; first-party LICENSE separate.",
   "limitations": "Cargo source inventory, not binary/linker inspection. Excludes Rust toolchain, system SDKs/runtimes, external FFmpeg/Whisper, models, user media/fonts and non-Cargo components. Other targets require a separate report.",
-  "cargo_lock_sha256": "b047705cb97be68f76fd69e47fda0bfd45bb451084d0f7d57627f7c216a01a77",
-  "cargo_toml_sha256": "d51a2d4a52114e0f19e5f42c0762aaf4d557a68a92a3c6722c3ea0154a852cfa",
+  "cargo_lock_sha256": "731ebc6fc7c0384c4cafd428f106636319cf3d41ec509bd62536f898b090fb51",
+  "cargo_toml_sha256": "6a5d3e018190cf8f60362f31fd4b46b943695b995ec184d2739cc23ffadf0ffa",
   "packages": [
     {
       "name": "ab_glyph",

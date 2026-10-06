@@ -86,12 +86,13 @@ Section "Acceso directo en el escritorio" SEC_DESKTOP
 SectionEnd
 
 Section "Motor multimedia FFmpeg (recomendado)" SEC_FFMPEG
-    DetailPrint "Descargando e instalando FFmpeg (~80 MB)..."
-    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR"'
+    SetDetailsView show
+    DetailPrint "Descargando e instalando FFmpeg (~115 MB). Progreso y fases abajo..."
+    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\ffmpeg-install.ps1" -InstallDir "$INSTDIR" -LogPath "$INSTDIR\ffmpeg-install.log"'
     Pop $0
     ${If} $0 <> 0
         IfSilent ffmpeg_silent_failure
-        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo descargar FFmpeg (revisa la conexion). NovaCut se ha instalado igualmente: al abrirlo te ofrecera instalar FFmpeg con un boton."
+        MessageBox MB_ICONEXCLAMATION|MB_OK "No se pudo instalar FFmpeg. Detalles en $INSTDIR\ffmpeg-install.log. NovaCut se ha instalado igualmente: al abrirlo te ofrecera instalar FFmpeg con un boton."
         Goto ffmpeg_failure_done
         ffmpeg_silent_failure:
         DetailPrint "No se pudo instalar FFmpeg."
@@ -172,6 +173,7 @@ Section "Uninstall"
     Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
     Delete "$INSTDIR\THIRD_PARTY_LICENSES-Windows.html"
     Delete "$INSTDIR\ffmpeg-install.ps1"
+    Delete "$INSTDIR\ffmpeg-install.log"
     Delete "$INSTDIR\whisper-install.ps1"
     ; Whisper ocupa ~200 MB en la carpeta de datos del usuario.
     RMDir /r "$LOCALAPPDATA\NovaCut\Whisper"
