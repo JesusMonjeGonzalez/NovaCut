@@ -26,7 +26,9 @@ mod command_center;
 mod efectos;
 mod fuentes;
 mod estabilizar;
+mod intercambio;
 mod exportacion;
+mod mejoras;
 mod montaje;
 mod navigation;
 mod proyecto;
@@ -1748,12 +1750,15 @@ fn rotate_filter(clip: &RoughClip, animation: &efectos::Animation) -> String {
             ",rotate=a='{}':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0",
             animacion::expression(&animacion::mapped(keys, f64::to_radians), "t")
         ),
-        None => format!(
-            ",rotate={:.8}:ow=rotw(iw):oh=roth(ih):c=black@0",
-            animation
+        // `rotw`/`roth` reciben el ángulo, no un tamaño: con `rotw(iw)` el
+        // lienzo era el de un giro de `iw` radianes y en 720p recortaba la
+        // imagen por los lados.
+        None => {
+            let angle = animation
                 .constant(animacion::Param::Rotation, clip.rotation)
-                .to_radians()
-        ),
+                .to_radians();
+            format!(",rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0")
+        }
     }
 }
 
@@ -3000,6 +3005,9 @@ struct NovaCutWindows {
     /// Hoja de atajos de teclado abierta.
     show_shortcuts: bool,
     command_center: command_center::State,
+    /// Herramientas de la quinta ronda: enlace A/V, guías, análisis en
+    /// segundo plano y grabación de voz en off.
+    mejoras: mejoras::Estado,
     /// Clip cuyo menú contextual se está mostrando, para resaltarlo.
     context_menu_clip: Option<usize>,
     /// Píxeles por segundo de la última timeline dibujada; base del imán.
@@ -4125,6 +4133,7 @@ impl NovaCutWindows {
             bottom_open: false,
             show_shortcuts: false,
             command_center: command_center::State::default(),
+            mejoras: mejoras::Estado::default(),
             context_menu_clip: None,
             timeline_pps: 0.0,
             selection: std::collections::BTreeSet::new(),
@@ -5676,6 +5685,17 @@ impl NovaCutWindows {
             return;
         }
         if imported > 0 {
+            // Primer vídeo en una secuencia vacía: se comprobará si coincide.
+            let first_video = before
+                .clips
+                .is_empty()
+                .then(|| {
+                    clips_to_add
+                        .iter()
+                        .find(|clip| clip.has_video && !is_image_file(&clip.path))
+                        .cloned()
+                })
+                .flatten();
             let bin = self.project_bin.clone();
             self.project.register_media(&clips_to_add, &bin);
             self.project.clips.extend(clips_to_add);
@@ -5688,6 +5708,9 @@ impl NovaCutWindows {
                 format!("{imported} medio(s) importado(s)")
             };
             self.finish_edit(before);
+            if let Some(clip) = first_video {
+                self.proponer_secuencia(&clip);
+            }
         } else {
             self.status = if errors.is_empty() {
                 "No se encontraron medios validos".to_owned()
@@ -6209,8 +6232,10 @@ impl NovaCutWindows {
         let (sender, receiver) = mpsc::channel();
         self.preview_result = Some(receiver);
         self.preview_refresh_pending = false;
+        // El monitor compone con la proporción de la exportación.
+        let canvas = monitor_canvas(self.export_size);
         std::thread::spawn(move || {
-            let result = render_preview_frame(&sources, timebase);
+            let result = render_preview_frame_at(&sources, timebase, canvas);
             let _ = sender.send(result);
         });
     }
@@ -7106,6 +7131,22 @@ impl NovaCutWindows {
                         }
                     }
                 }
+                // Enlace A/V: el audio o vídeo separado se recorta igual.
+                if self.mejoras.enlace_av {
+                    let locked: Vec<bool> = before
+                        .clips
+                        .iter()
+                        .map(|clip| self.project.clip_locked(clip))
+                        .collect();
+                    mejoras::recortar_parejas(
+                        &mut self.project.clips,
+                        &before.clips,
+                        index,
+                        (delta_t, 0.0),
+                        ripple,
+                        &locked,
+                    );
+                }
                 self.request_preview();
             }
             Some(TimelineDragEvent::TrimEnd(index, target_time)) => {
@@ -7146,6 +7187,21 @@ impl NovaCutWindows {
                     return;
                 };
                 self.project.clips[index] = trimmed;
+                if self.mejoras.enlace_av {
+                    let locked: Vec<bool> = before
+                        .clips
+                        .iter()
+                        .map(|clip| self.project.clip_locked(clip))
+                        .collect();
+                    mejoras::recortar_parejas(
+                        &mut self.project.clips,
+                        &before.clips,
+                        index,
+                        (0.0, new_end - orig_end),
+                        ripple,
+                        &locked,
+                    );
+                }
                 if ripple {
                     let orig_end = orig.timeline_start + orig.duration();
                     let delta_t = new_end - orig_end;
@@ -7439,6 +7495,8 @@ impl NovaCutWindows {
                 )
                 .on_hover_text("Capa de subtítulos palabra a palabra al estilo TikTok/CapCut")
                 .clicked();
+            self.boton_de_herramienta(ui, mejoras::Accion::AcortarPausas, "Acortar pausas");
+            self.boton_de_herramienta(ui, mejoras::Accion::ExportarTranscripcion, "Exportar texto…");
         });
         if self.project.transcript.is_empty() {
             ui.add_space(8.0);
@@ -7525,6 +7583,11 @@ impl NovaCutWindows {
             }
             return;
         }
+        ui.horizontal_wrapped(|ui| {
+            self.boton_de_herramienta(ui, mejoras::Accion::CapitulosYoutube, "Capítulos de YouTube…");
+            self.boton_de_herramienta(ui, mejoras::Accion::MontarAlRitmo, "Montar al ritmo");
+        });
+        ui.add_space(4.0);
         let mut marker_delete: Option<usize> = None;
         let mut marker_jump: Option<f64> = None;
         for (marker_index, marker) in self.project.markers.iter_mut().enumerate() {
@@ -7633,6 +7696,12 @@ impl NovaCutWindows {
                              Pulsa Medir LUFS antes de exportar para más precisión.",
             );
         }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            self.boton_de_herramienta(ui, mejoras::Accion::IgualarVoces, "Igualar voces");
+            self.boton_de_herramienta(ui, mejoras::Accion::MejoraDeVoz, "Mejora de voz…");
+            self.boton_de_herramienta(ui, mejoras::Accion::ExportarStems, "Exportar stems…");
+        });
     }
 
     /// Subtítulos: edición, estilo, SRT y transcripción.
@@ -7664,6 +7733,7 @@ impl NovaCutWindows {
             {
                 self.import_srt();
             }
+            self.boton_de_herramienta(ui, mejoras::Accion::DividirSubtitulos, "Partir largos");
             if ui
                 .add_enabled(
                     self.transcription_result.is_none(),
@@ -8013,12 +8083,14 @@ impl NovaCutWindows {
                         }
                         ui.separator();
                     }
-                    let failed = self.status.contains("FALLO") || self.status.contains("error");
-                    ui.label(
-                        egui::RichText::new(&self.status)
-                            .size(11.5)
-                            .color(if failed { theme::WARN } else { theme::TEXT_DIM }),
-                    );
+                    let failed = self.status.contains("FALLO")
+                        || self.status.contains("error")
+                        || self.status.starts_with("No se pudo")
+                        || self.status.starts_with("Fall");
+                    let status_text = egui::RichText::new(&self.status)
+                        .size(11.5)
+                        .color(if failed { theme::WARN } else { theme::TEXT_DIM });
+                    let full_status = self.status.clone();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let total = self.project.duration();
                         ui.label(
@@ -8057,6 +8129,12 @@ impl NovaCutWindows {
                                     .color(theme::DANGER),
                             );
                         }
+                        // El mensaje ocupa lo que queda a la izquierda, recortado
+                        // con «…» si no cabe: nunca pisa los datos de la derecha.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(status_text).truncate())
+                                .on_hover_text(full_status);
+                        });
                     });
                 });
             });
@@ -9431,6 +9509,7 @@ impl NovaCutWindows {
                             ("Inicio / Fin", "Principio / final del montaje"),
                             ("Ctrl+G", "Ir a timecode (HH:MM:SS:FF)"),
                             ("+ / −", "Zoom adelante / atrás"),
+                            ("Intro", "Renderizar I–O (o todo) para verlo fluido"),
                         ],
                     ),
                     (
@@ -9487,6 +9566,8 @@ impl NovaCutWindows {
                             ("I / O", "Entrada / salida de trabajo"),
                             ("Alt+X", "Limpiar rango de trabajo"),
                             ("1…4", "Corte a la cámara indicada"),
+                            ("Clic derecho", "Herramientas del clip: Ken Burns, imagen en imagen, voces…"),
+                            ("Ctrl+Mayús+P", "Buscar cualquier herramienta por nombre"),
                         ],
                     ),
                     (
@@ -10238,9 +10319,19 @@ impl NovaCutWindows {
 
     /// Elimina la selección, opcionalmente cerrando los huecos (ripple).
     fn remove_selected_clip(&mut self, ripple: bool) {
-        let indices: Vec<usize> = self.selected_indices();
+        let mut indices: Vec<usize> = self.selected_indices();
         if indices.is_empty() {
             return;
+        }
+        // Enlace A/V: borrar un plano borra también su audio separado.
+        if self.mejoras.enlace_av {
+            let parejas: Vec<usize> = indices
+                .iter()
+                .flat_map(|index| mejoras::enlazados(&self.project.clips, *index))
+                .collect();
+            indices.extend(parejas);
+            indices.sort_unstable();
+            indices.dedup();
         }
         let locked = indices
             .iter()
@@ -10554,18 +10645,22 @@ impl NovaCutWindows {
         }
         let timebase = self.project.timebase();
         let start_playhead = timebase.seconds(timebase.frames(self.playhead));
+        // Con un render de previsualización vigente, su tramo se lee ya
+        // compuesto y suena y se ve en tiempo real.
         let (windowed, preroll) =
-            montaje::window(&self.effective_clips(), start_playhead, f64::INFINITY);
+            montaje::window(&self.clips_para_reproducir(), start_playhead, f64::INFINITY);
         let mut prepared = prepare_render_clips(&windowed);
         if self.use_proxies {
             use_proxy_paths(&mut prepared);
         }
+        let canvas = monitor_canvas(self.export_size);
+        let canvas_size = (canvas.0 as u32, canvas.1 as u32);
         let mut command = Command::new(tool_path("ffmpeg.exe"));
         command.args(["-v", "error"]);
         let (input_indices, is_title_input) = push_render_inputs(
             &mut command,
             &prepared,
-            (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32),
+            canvas_size,
             self.use_proxies,
             timebase,
         );
@@ -10573,7 +10668,7 @@ impl NovaCutWindows {
             &prepared,
             &input_indices,
             &is_title_input,
-            (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32),
+            canvas_size,
             true,
             false,
             &self.project.track_gains,
@@ -10585,8 +10680,7 @@ impl NovaCutWindows {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
             return;
         };
-        let monitor_label =
-            append_monitor_scopes(&mut filters, self.show_waveform, self.show_vectorscope);
+        let monitor_label = append_monitor_view(&mut filters, canvas, self.monitor_scopes());
         let video_graph = match attach_graph(&mut command, &filters) {
             Ok(graph) => graph,
             Err(error) => {
@@ -10783,12 +10877,13 @@ impl NovaCutWindows {
             return;
         }
         let step = rate.unsigned_abs().clamp(1, 8) as i64;
-        let clips = self.effective_clips();
+        let clips = self.clips_para_reproducir();
         let use_proxies = self.use_proxies;
-        let (waveform, vectorscope) = (self.show_waveform, self.show_vectorscope);
+        let scopes = self.monitor_scopes();
+        let canvas = monitor_canvas(self.export_size);
         let (sender, receiver) = mpsc::channel::<Option<PreviewFrame>>();
         std::thread::spawn(move || {
-            let size = (MONITOR_WIDTH as u32, MONITOR_HEIGHT as u32);
+            let size = (canvas.0 as u32, canvas.1 as u32);
             let frame_len = MONITOR_WIDTH * MONITOR_HEIGHT * 4;
             let started = std::time::Instant::now();
             let start_frame = timebase.frames(start_playhead);
@@ -10815,7 +10910,7 @@ impl NovaCutWindows {
                     let _ = sender.send(None);
                     return;
                 };
-                let label = append_monitor_scopes(&mut filters, waveform, vectorscope);
+                let label = append_monitor_view(&mut filters, canvas, scopes);
                 let skip = timebase.frames(preroll).max(0);
                 let wanted = end_frame - begin_frame;
                 let Ok(_graph) = attach_graph(&mut command, &filters) else {
@@ -11200,6 +11295,7 @@ impl eframe::App for NovaCutWindows {
         self.poll_silences();
         self.poll_scene_cuts();
         self.poll_transcription();
+        self.poll_mejoras(context);
         self.poll_pending_edit(context);
         if self.montage_render.is_some()
             || self.proxy_result.is_some()
@@ -11443,6 +11539,11 @@ impl eframe::App for NovaCutWindows {
             });
         let add_marker_shortcut = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::M));
+        // Intro renderiza la previsualización de I–O, como en Premiere; si
+        // hay un control enfocado con el teclado, Intro sigue siendo suyo.
+        let render_key = keyboard_shortcuts
+            && context.memory(|memory| memory.focused().is_none())
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let cam1 = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let cam2 = keyboard_shortcuts
@@ -11647,6 +11748,9 @@ impl eframe::App for NovaCutWindows {
         if add_marker_shortcut {
             self.add_marker();
         }
+        if render_key && self.ffmpeg_ready {
+            self.ejecutar_mejora(mejoras::Accion::RenderizarRango);
+        }
         for (pressed, camera) in [(cam1, 1usize), (cam2, 2), (cam3, 3), (cam4, 4)] {
             if pressed {
                 self.multicam_cut(camera);
@@ -11742,7 +11846,15 @@ impl eframe::App for NovaCutWindows {
                         ui.separator();
                         item(ui, "Importar secuencia (.ncrough)…", "", 4);
                         item(ui, "Importar EDL…", "", 5);
+                        item(ui, "Importar FCPXML (Final Cut, Resolve)…", "", 7);
+                        ui.separator();
                         item(ui, "Exportar EDL…", "", 6);
+                        item(ui, "Exportar FCPXML…", "", 8);
+                        item(ui, "Exportar stems de audio…", "", 9);
+                        item(ui, "Exportar capítulos de YouTube…", "", 11);
+                        item(ui, "Exportar transcripción en texto…", "", 12);
+                        ui.separator();
+                        item(ui, "Recopilar proyecto en una carpeta…", "", 10);
                         if !self.recent_projects.is_empty() {
                             ui.separator();
                             ui.menu_button("Recientes", |ui| {
@@ -11764,7 +11876,7 @@ impl eframe::App for NovaCutWindows {
                                 }
                             });
                         }
-                    }).response.on_hover_text("Nuevo, abrir, guardar, recientes, EDL e importar secuencia");
+                    }).response.on_hover_text("Nuevo, abrir, guardar, recientes, importar y exportar (EDL, FCPXML, stems, capítulos) y recopilar");
                     match file_action {
                         Some(0) => self.request_document_action(DocumentAction::New),
                         Some(1) => self.request_document_action(DocumentAction::Open),
@@ -11773,6 +11885,12 @@ impl eframe::App for NovaCutWindows {
                         Some(4) => self.import_nested_project(),
                         Some(5) => self.import_edl(),
                         Some(6) => self.export_edl(),
+                        Some(7) => self.ejecutar_mejora(mejoras::Accion::ImportarFcpxml),
+                        Some(8) => self.ejecutar_mejora(mejoras::Accion::ExportarFcpxml),
+                        Some(9) => self.ejecutar_mejora(mejoras::Accion::ExportarStems),
+                        Some(10) => self.ejecutar_mejora(mejoras::Accion::Recopilar),
+                        Some(11) => self.ejecutar_mejora(mejoras::Accion::CapitulosYoutube),
+                        Some(12) => self.ejecutar_mejora(mejoras::Accion::ExportarTranscripcion),
                         _ => {}
                     }
                     theme::bar_separator(ui);
@@ -11948,6 +12066,7 @@ impl eframe::App for NovaCutWindows {
                         Some(7) => self.insert_at_playhead(),
                         _ => {}
                     }
+                    self.menu_herramientas(ui);
                     ui.toggle_value(&mut self.snap_enabled, egui::RichText::new("⊓ Imán").size(11.0))
                         .on_hover_text("Ajuste magnético a bordes, marcadores y cabezal");
                     theme::bar_separator(ui);
@@ -12172,6 +12291,7 @@ impl eframe::App for NovaCutWindows {
         self.show_export_window(context);
         self.show_queue_window(context);
         self.show_command_center(context);
+        self.ventanas_mejoras(context);
 
         if self.monitor_fullscreen {
             self.show_fullscreen_monitor(context);
@@ -13838,7 +13958,13 @@ impl eframe::App for NovaCutWindows {
                     // Visores y proxies en un menú: como casillas sueltas se
                     // metían bajo el volumen en ventanas estrechas.
                     let mut proxies_changed = false;
-                    let active_views = [self.show_waveform, self.show_vectorscope, self.use_proxies]
+                    let active_views = [
+                        self.show_waveform,
+                        self.show_vectorscope,
+                        self.mejoras.parade,
+                        self.mejoras.histograma,
+                        self.use_proxies,
+                    ]
                         .iter()
                         .filter(|active| **active)
                         .count();
@@ -13858,6 +13984,16 @@ impl eframe::App for NovaCutWindows {
                                 .checkbox(&mut self.show_vectorscope, "Vectorscopio")
                                 .on_hover_text("Tono y saturación, superpuesto abajo a la derecha")
                                 .changed();
+                            scopes_changed |= ui
+                                .checkbox(&mut self.mejoras.parade, "Parade RGB")
+                                .on_hover_text("Rojo, verde y azul por separado, arriba a la izquierda: para equilibrar el blanco")
+                                .changed();
+                            scopes_changed |= ui
+                                .checkbox(&mut self.mejoras.histograma, "Histograma")
+                                .on_hover_text("Distribución de luces y sombras, arriba a la derecha: para ver recortes")
+                                .changed();
+                            ui.checkbox(&mut self.mejoras.guias, "Guías de encuadre y zonas seguras")
+                                .on_hover_text("Recorte de la exportación vertical o cuadrada, zonas seguras, tercios y lo que tapa la interfaz de TikTok/Reels");
                             ui.separator();
                             proxies_changed |= ui
                                 .checkbox(&mut self.use_proxies, "Usar proxies")
@@ -13912,7 +14048,8 @@ impl eframe::App for NovaCutWindows {
                             ui.set_min_size(monitor_size);
                             ui.set_max_size(monitor_size);
                             if let Some(texture) = &self.preview_texture {
-                                ui.image((texture.id(), monitor_size));
+                                let image = ui.image((texture.id(), monitor_size));
+                                self.dibujar_guias(ui.painter(), image.rect);
                             } else {
                                 ui.centered_and_justified(|ui| {
                                     ui.label(
@@ -14461,6 +14598,9 @@ impl eframe::App for NovaCutWindows {
                         }
                     }
                 }
+                // Barra de render: verde lo renderizado, amarillo lo que se
+                // está renderizando.
+                self.dibujar_barra_de_render(&painter, ruler_rect, lane_rect, &to_x);
                 // Regla de tiempo: marcas cada 1/5/10/30/60/300 s según el zoom.
                 {
                     let steps: [f64; 9] = [0.1, 0.25, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0];
@@ -14679,6 +14819,7 @@ impl eframe::App for NovaCutWindows {
                 const EDGE_GRAB: f32 = 6.0;
                 let mut timeline_drag = None;
                 let mut clip_command: Option<(usize, ClipCommand)> = None;
+                let mut clip_tool: Option<(usize, mejoras::Accion)> = None;
                 let mut tool_action: Option<TimelineToolAction> = None;
                 let mut open_menu: Option<usize> = None;
                 for (index, clip) in self.project.clips.iter().enumerate() {
@@ -14907,6 +15048,7 @@ impl eframe::App for NovaCutWindows {
                         if toggle_off { "Desactivar" } else { "Activar" }
                     );
                     let mut command: Option<ClipCommand> = None;
+                    let mut tool: Option<mejoras::Accion> = None;
                     let menu = response.context_menu(|ui| {
                         ui.set_min_width(220.0);
                         ui.label(
@@ -14982,6 +15124,24 @@ impl eframe::App for NovaCutWindows {
                             );
                         }
                         pick(ui, "Congelar fotograma (3 s)", ClipCommand::FreezeFrame);
+                        // Solo las herramientas que tienen sentido para
+                        // este clip; el catálogo entero está en la barra.
+                        let tools = mejoras::herramientas_de_clip(clip);
+                        if !tools.is_empty() {
+                            ui.menu_button("Herramientas", |ui| {
+                                ui.set_min_width(260.0);
+                                for accion in tools {
+                                    if ui
+                                        .button(accion.titulo())
+                                        .on_hover_text(accion.ayuda())
+                                        .clicked()
+                                    {
+                                        tool = Some(accion);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        }
                         ui.separator();
                         pick(ui, "Superponer en el cabezal (B)", ClipCommand::Overwrite);
                         pick(ui, "Insertar en el cabezal (V)", ClipCommand::Insert);
@@ -15008,6 +15168,9 @@ impl eframe::App for NovaCutWindows {
                     });
                     if let Some(value) = command {
                         clip_command = Some((index, value));
+                    }
+                    if let Some(accion) = tool {
+                        clip_tool = Some((index, accion));
                     }
                     if menu.is_some() {
                         open_menu = Some(index);
@@ -15114,6 +15277,11 @@ impl eframe::App for NovaCutWindows {
                             self.selected = Some(index);
                             self.selection.clear();
                             self.selection.insert(index);
+                            // Enlace A/V: el arrastre mueve también su pareja.
+                            if self.mejoras.enlace_av {
+                                self.selection
+                                    .extend(mejoras::enlazados(&self.project.clips, index));
+                            }
                         } else {
                             self.selected = Some(index);
                         }
@@ -15684,6 +15852,10 @@ impl eframe::App for NovaCutWindows {
                 if let Some((index, command)) = clip_command {
                     self.apply_clip_command(index, command);
                 }
+                if let Some((index, accion)) = clip_tool {
+                    self.select_only(index);
+                    self.ejecutar_mejora(accion);
+                }
                 if let Some(action) = tool_action {
                     match action {
                         TimelineToolAction::Split(index, time) => self.split_clip_at(index, time),
@@ -15996,8 +16168,52 @@ fn render_preview_frame(
     sources: &[(RoughClip, f64)],
     timebase: Timebase,
 ) -> Result<PreviewFrame, String> {
-    const WIDTH: usize = 640;
-    const HEIGHT: usize = 360;
+    render_preview_frame_at(sources, timebase, (MONITOR_WIDTH, MONITOR_HEIGHT))
+}
+
+/// Lienzo del monitor con la proporción de la exportación, encajado en
+/// 640×360: lo que se compone en él es lo que saldrá, y el resto son bandas.
+fn monitor_canvas(export_size: (u32, u32)) -> (usize, usize) {
+    let aspect = export_size.0.max(1) as f64 / export_size.1.max(1) as f64;
+    let monitor = MONITOR_WIDTH as f64 / MONITOR_HEIGHT as f64;
+    if (aspect - monitor).abs() < 1e-3 {
+        (MONITOR_WIDTH, MONITOR_HEIGHT)
+    } else if aspect < monitor {
+        (
+            even_dimension(MONITOR_HEIGHT as f64 * aspect) as usize,
+            MONITOR_HEIGHT,
+        )
+    } else {
+        (
+            MONITOR_WIDTH,
+            even_dimension(MONITOR_WIDTH as f64 / aspect) as usize,
+        )
+    }
+}
+
+/// Centra `[input]` en el monitor de 640×360 con bandas negras y lo deja en
+/// `[output]`; sin bandas si el lienzo ya es el del monitor.
+fn fit_to_monitor(input: &str, output: &str, canvas: (usize, usize)) -> String {
+    if canvas == (MONITOR_WIDTH, MONITOR_HEIGHT) {
+        format!("[{input}]null[{output}]")
+    } else {
+        format!(
+            "[{input}]format=rgba,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black[{output}]",
+            MONITOR_WIDTH, MONITOR_HEIGHT
+        )
+    }
+}
+
+/// Fotograma del monitor compuesto en `canvas` (ver `monitor_canvas`) con
+/// las mismas reglas de encaje, escala y posición que la exportación.
+fn render_preview_frame_at(
+    sources: &[(RoughClip, f64)],
+    timebase: Timebase,
+    canvas: (usize, usize),
+) -> Result<PreviewFrame, String> {
+    const WIDTH: usize = MONITOR_WIDTH;
+    const HEIGHT: usize = MONITOR_HEIGHT;
+    let (canvas_w, canvas_h) = (canvas.0.max(2), canvas.1.max(2));
     let frame_rate = timebase.ffmpeg_rate();
     let mut command = Command::new(tool_path("ffmpeg.exe"));
     command.args(["-v", "error"]);
@@ -16011,7 +16227,7 @@ fn render_preview_frame(
                 // `format=rgba` es imprescindible: sin él la fuente `color`
                 // sale opaca y el título tapaba con negro todo lo de debajo.
                 &format!(
-                    "color=c=black@0.0:s=640x360:r={},format=rgba",
+                    "color=c=black@0.0:s={canvas_w}x{canvas_h}:r={},format=rgba",
                     timebase.ffmpeg_rate()
                 ),
             ]);
@@ -16024,7 +16240,7 @@ fn render_preview_frame(
         }
     }
     let mut filters = vec![format!(
-        "color=c=black:s={WIDTH}x{HEIGHT}:r={}:d=0.1[base]",
+        "color=c=black:s={canvas_w}x{canvas_h}:r={}:d=0.1[base]",
         timebase.ffmpeg_rate()
     )];
     for (index, (clip, source_time)) in sources.iter().enumerate() {
@@ -16041,33 +16257,36 @@ fn render_preview_frame(
                 return Err("No se encontro una fuente TTF del sistema para los titulos".to_owned());
             };
             // El tamano se define sobre 1080p y se escala al monitor.
-            let fontsize = title.size.max(8.0) * HEIGHT as f64 / 1080.0;
+            let fontsize = title.size.max(8.0) * canvas_h as f64 / 1080.0;
             let local = (source_time - clip.in_seconds) / clip.speed.clamp(0.1, 8.0);
             let drawing = title_layer_filters(
                 title,
                 &font,
                 fontsize,
-                (WIDTH as u32, HEIGHT as u32),
+                (canvas_w as u32, canvas_h as u32),
                 Some(local.max(0.0)),
             );
             filters.push(format!(
-                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0,colorchannelmixer=aa={opacity:.6}[pv{index}]",
+                "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0,colorchannelmixer=aa={opacity:.6}[pv{index}]",
             ));
         } else {
             let is_blend = clip.fusion.blend_mode().is_some();
+            // Mismo encaje que `build_render_filters`: vertical y cuadrado
+            // rellenan; el horizontal ajusta.
+            let cover_canvas = is_blend || canvas_h >= canvas_w;
             let width = if is_blend {
-                WIDTH as u32
+                canvas_w as u32
             } else {
-                even_dimension(WIDTH as f64 * clip.scale_percent / 100.0)
+                even_dimension(canvas_w as f64 * clip.scale_percent / 100.0)
             };
             let height = if is_blend {
-                HEIGHT as u32
+                canvas_h as u32
             } else {
-                even_dimension(HEIGHT as f64 * clip.scale_percent / 100.0)
+                even_dimension(canvas_h as f64 * clip.scale_percent / 100.0)
             };
             let eq = color_eq_filter(clip.exposure, clip.contrast, clip.saturation);
             let vig = vignette_filter(clip.vignette);
-            let blur = blur_filter(clip.blur, WIDTH.min(HEIGHT) as f64);
+            let blur = blur_filter(clip.blur, canvas_w.min(canvas_h) as f64);
             let wheels = wheels_filter(clip.wheels.as_ref());
             let chroma = chroma_filter(clip.chroma.as_ref());
             let curves = curves_filter(clip.curves.as_ref());
@@ -16077,15 +16296,15 @@ fn render_preview_frame(
             let geometry = clip.fx.geometry_chain(false, false);
             let fx_color = clip.fx.video_color_chain();
             let fx_alpha = clip.fx.alpha_chain();
-            let scale_mode = if is_blend { "increase" } else { "decrease" };
-            let crop = if is_blend {
-                format!(",crop={WIDTH}:{HEIGHT}")
+            let scale_mode = if cover_canvas { "increase" } else { "decrease" };
+            let crop = if cover_canvas {
+                format!(",crop={width}:{height}")
             } else {
                 String::new()
             };
             let blend_canvas = if is_blend {
                 format!(
-                    ",scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
+                    ",scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=increase,crop={canvas_w}:{canvas_h}"
                 )
             } else {
                 String::new()
@@ -16094,19 +16313,19 @@ fn render_preview_frame(
                 // `setpts=PTS-STARTPTS`: tras `-ss` el primer fotograma no
                 // empieza en 0 si el cabezal cae entre dos fotogramas del
                 // medio, y `overlay` componía el fondo negro sin él.
-                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw(iw):oh=roth(ih):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
     let mut previous = "base".to_owned();
     for (index, (clip, _)) in sources.iter().enumerate() {
         let output = if index + 1 == sources.len() {
-            "vout".to_owned()
+            "vcomp".to_owned()
         } else {
             format!("po{index}")
         };
-        let x = clip.position_x * WIDTH as f64 / 1920.0;
-        let y = clip.position_y * HEIGHT as f64 / 1080.0;
+        let x = clip.position_x * canvas_w as f64 / 1920.0;
+        let y = clip.position_y * canvas_h as f64 / 1080.0;
         if clip.is_adjustment {
             // El monitor ya solo compone clips activos en el cabezal, así
             // que no hace falta puerta temporal: solo máscara y opacidad.
@@ -16116,11 +16335,11 @@ fn render_preview_frame(
             let lut = lut_filter(clip.lut.as_deref());
             let eq = color_eq_filter(clip.exposure, clip.contrast, clip.saturation);
             let vig = vignette_filter(clip.vignette);
-            let blur = blur_filter(clip.blur, WIDTH.min(HEIGHT) as f64);
+            let blur = blur_filter(clip.blur, canvas_w.min(canvas_h) as f64);
             let spatial = clip
                 .mask
                 .as_ref()
-                .map(|mask| mask.alpha_expression(WIDTH as f64, HEIGHT as f64))
+                .map(|mask| mask.alpha_expression(canvas_w as f64, canvas_h as f64))
                 .unwrap_or_else(|| "alpha(X,Y)".to_owned())
                 .replace(',', "\\,");
             let alpha_expr = format!("{spatial}*{opacity:.6}");
@@ -16159,6 +16378,7 @@ fn render_preview_frame(
         }
         previous = output;
     }
+    filters.push(fit_to_monitor("vcomp", "vout", (canvas_w, canvas_h)));
     let _graph = attach_graph(&mut command, &filters)?;
     let result = command
         .args(["-map", "[vout]"])
@@ -16454,40 +16674,92 @@ fn push_render_inputs(
     (input_indices, is_title_input)
 }
 
+/// Visores del monitor sobre la composición ya encajada en 640×360 con la
+/// proporción de la exportación (`canvas`, ver `monitor_canvas`).
+fn append_monitor_view(
+    filters: &mut Vec<String>,
+    canvas: (usize, usize),
+    scopes: MonitorScopes,
+) -> &'static str {
+    filters.push(fit_to_monitor("vout", "vmonitor", canvas));
+    append_monitor_scopes_from(filters, "vmonitor", scopes)
+}
+
+/// Visores superpuestos al monitor, uno por esquina: forma de onda abajo a
+/// la izquierda, vectorscopio abajo a la derecha, parade RGB arriba a la
+/// izquierda e histograma arriba a la derecha.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MonitorScopes {
+    waveform: bool,
+    vectorscope: bool,
+    parade: bool,
+    histogram: bool,
+}
+
+#[allow(dead_code)]
 fn append_monitor_scopes(
     filters: &mut Vec<String>,
     waveform: bool,
     vectorscope: bool,
 ) -> &'static str {
-    match (waveform, vectorscope) {
-        (false, false) => "vout",
-        (true, false) => {
-            filters.push("[vout]split=2[scopebase][wavein]".to_owned());
-            filters.push(
-                "[wavein]waveform=mode=column:components=7:display=overlay,scale=240:135[wave]"
-                    .to_owned(),
-            );
-            filters.push("[scopebase][wave]overlay=0:H-h[vscoped]".to_owned());
-            "vscoped"
-        }
-        (false, true) => {
-            filters.push("[vout]split=2[scopebase][vecin]".to_owned());
-            filters.push("[vecin]vectorscope=mode=color3,scale=240:135[vec]".to_owned());
-            filters.push("[scopebase][vec]overlay=W-w:H-h[vscoped]".to_owned());
-            "vscoped"
-        }
-        (true, true) => {
-            filters.push("[vout]split=3[scopebase][wavein][vecin]".to_owned());
-            filters.push(
-                "[wavein]waveform=mode=column:components=7:display=overlay,scale=240:135[wave]"
-                    .to_owned(),
-            );
-            filters.push("[vecin]vectorscope=mode=color3,scale=240:135[vec]".to_owned());
-            filters.push("[scopebase][wave]overlay=0:H-h[scopewave]".to_owned());
-            filters.push("[scopewave][vec]overlay=W-w:H-h[vscoped]".to_owned());
-            "vscoped"
-        }
+    append_monitor_scopes_from(
+        filters,
+        "vout",
+        MonitorScopes {
+            waveform,
+            vectorscope,
+            ..MonitorScopes::default()
+        },
+    )
+}
+
+fn append_monitor_scopes_from(
+    filters: &mut Vec<String>,
+    input: &'static str,
+    scopes: MonitorScopes,
+) -> &'static str {
+    // Formato explícito delante de cada visor: `waveform` se cae con
+    // entrada RGBA (segfault en FFmpeg 9.0.1), y la composición del monitor
+    // puede llegar en RGBA. La forma de onda mide luminancia (YUV) y el
+    // parade, cada canal RGB.
+    let active: Vec<(&str, &str)> = [
+        (
+            scopes.waveform,
+            "format=yuv444p,waveform=mode=column:components=7:display=overlay",
+            "0:H-h",
+        ),
+        (scopes.vectorscope, "format=yuv444p,vectorscope=mode=color3", "W-w:H-h"),
+        (
+            scopes.parade,
+            "format=gbrp,waveform=mode=column:display=parade:components=7",
+            "0:0",
+        ),
+        (scopes.histogram, "format=yuv444p,histogram=display_mode=overlay", "W-w:0"),
+    ]
+    .into_iter()
+    .filter(|(on, _, _)| *on)
+    .map(|(_, filter, position)| (filter, position))
+    .collect();
+    if active.is_empty() {
+        return input;
     }
+    let branches: String = (0..active.len()).map(|index| format!("[scopein{index}]")).collect();
+    filters.push(format!(
+        "[{input}]split={}[scopebase]{branches}",
+        active.len() + 1
+    ));
+    let mut previous = "scopebase".to_owned();
+    for (index, (filter, position)) in active.iter().enumerate() {
+        filters.push(format!("[scopein{index}]{filter},scale=240:135[scope{index}]"));
+        let output = if index + 1 == active.len() {
+            "vscoped".to_owned()
+        } else {
+            format!("scopelayer{index}")
+        };
+        filters.push(format!("[{previous}][scope{index}]overlay={position}[{output}]"));
+        previous = output;
+    }
+    "vscoped"
 }
 
 /// Grafo de composición compartido por exportación y reproducción del monitor.
@@ -16589,18 +16861,20 @@ fn build_render_filters(
                 ));
             } else {
                 let is_blend = clips[index].fusion.blend_mode().is_some();
-                // Los lienzos verticales usan reframe centrado; evita pillarbox sin
-                // cambiar el comportamiento de proyectos horizontales existentes.
                 // Vertical y cuadrado (Shorts/Reels/TikTok, Instagram) rellenan
-                // el lienzo recortando en vez de dejar barras; el horizontal
-                // clásico (16:9) conserva el comportamiento previo (ajustar).
+                // el lienzo en vez de dejar barras; el horizontal clásico
+                // (16:9) ajusta. En ambos casos la escala del clip se aplica
+                // sobre ese encaje, así que en vertical también se puede
+                // encuadrar, reducir o animar el zoom; lo que sobresale lo
+                // recorta el propio overlay. Solo los modos de fusión necesitan
+                // la capa exactamente del tamaño del lienzo.
                 let cover_canvas = is_blend || out_h >= out_w;
-                let width = if cover_canvas {
+                let width = if is_blend {
                     out_w
                 } else {
                     even_dimension(out_w as f64 * static_scale / 100.0)
                 };
-                let height = if cover_canvas {
+                let height = if is_blend {
                     out_h
                 } else {
                     even_dimension(out_h as f64 * static_scale / 100.0)
@@ -16618,8 +16892,11 @@ fn build_render_filters(
                 let lut = lut_filter(clips[index].lut.as_deref());
                 let mask = mask_filter(clips[index].mask.as_ref(), width as f64, height as f64);
                 let scale_mode = if cover_canvas { "increase" } else { "decrease" };
+                // Al rellenar, la capa es el encuadre de relleno a su escala:
+                // se recorta a esa caja (al 100 %, el lienzo entero), lo que
+                // además mantiene la máscara en las coordenadas de la capa.
                 let crop = if cover_canvas {
-                    format!(",crop={out_w}:{out_h}")
+                    format!(",crop={width}:{height}")
                 } else {
                     String::new()
                 };
@@ -16659,7 +16936,7 @@ fn build_render_filters(
                 // lienzo transparente del tamaño máximo antes de girar.
                 let zoom = transform
                     .as_ref()
-                    .filter(|tracks| !cover_canvas && animacion::varies(&tracks[2]));
+                    .filter(|tracks| !is_blend && animacion::varies(&tracks[2]));
                 let size_filter = match zoom {
                     Some(tracks) => {
                         let percent = animacion::expression(&tracks[2], "t");
@@ -16682,6 +16959,10 @@ fn build_render_filters(
                 match zoom {
                     Some(tracks) => {
                         let largest = tracks[2].iter().map(|key| key.v).fold(1.0, f64::max);
+                        // Al rellenar, la capa desborda el lienzo en un eje: el
+                        // lienzo intermedio debe cubrir al menos toda la salida
+                        // para no recortar lo que el overlay final sí mostraría.
+                        let largest = if cover_canvas { largest.max(100.0) } else { largest };
                         let canvas_w = even_dimension(out_w as f64 * largest / 100.0);
                         let canvas_h = even_dimension(out_h as f64 * largest / 100.0);
                         filters.push(format!("{head}[zoom{index}]"));
@@ -16739,7 +17020,8 @@ fn build_render_filters(
                 "[{media}:a:0]{}asetpts=PTS-STARTPTS,{},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo{pan_filter}{},volume={volume:.8}{}{afade_filters},adelay={delay_ms}|{delay_ms},asetpts=N/SR/TB[a{index}]",
                 fx.audio_prefix(),
                 atempo_filter(speed),
-                fx.audio_chain(),
+                // RNNoise en «Limpieza de voz» si hay modelo instalado.
+                mejoras::cadena_de_voz(fx),
                 fx.volume_envelope(),
             ));
             audio_inputs.push(efectos::MixInput {
@@ -16768,7 +17050,19 @@ fn build_render_filters(
         } else {
             format!("overlay{layer}")
         };
+        // La posición se guarda en píxeles de 1920×1080 (como la ve el
+        // monitor, que la escala a su tamaño): se lleva a la salida real para
+        // que 720p, 4K o vertical coloquen la capa donde se ve.
+        let (scale_x, scale_y) = (out_w as f64 / 1920.0, out_h as f64 / 1080.0);
         let (x, y, _, _) = clips[index].evaluate_transform(0.0);
+        let (x, y) = (x * scale_x, y * scale_y);
+        let scaled_position = |(px, py): (String, String)| {
+            if (scale_x - 1.0).abs() < 1e-9 && (scale_y - 1.0).abs() < 1e-9 {
+                (px, py)
+            } else {
+                (format!("({px})*{scale_x:.6}"), format!("({py})*{scale_y:.6}"))
+            }
+        };
         if clips[index].is_adjustment {
             // Capa de ajuste: sin overlay de medio propio. Gradúa una copia
             // de todo lo compuesto debajo (`[previous]`) y la recompone solo
@@ -16861,7 +17155,9 @@ fn build_render_filters(
                     format!("+{expression}")
                 }
             };
-            let (px, py) = moving_position(&clips[index]).unwrap_or((px, py));
+            let (px, py) = moving_position(&clips[index])
+                .map(scaled_position)
+                .unwrap_or((px, py));
             filters.push(format!(
                 "[{previous}][v{index}]overlay=x='(W-w)/2+{px}{}':y='(H-h)/2+{py}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
                 term(dx),

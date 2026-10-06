@@ -7,8 +7,8 @@
   ],
   "scope": "Transitive normal and build dependencies; dev dependencies excluded; first-party LICENSE separate.",
   "limitations": "Cargo source inventory, not binary/linker inspection. Excludes Rust toolchain, system SDKs/runtimes, external FFmpeg/Whisper, models, user media/fonts and non-Cargo components. Other targets require a separate report.",
-  "cargo_lock_sha256": "499431b6f3e25a7e08b9e6bee9e2c253a7c8fef6b11d23675ad9fa7ccd092b01",
-  "cargo_toml_sha256": "6aba6daa75c0e3e485a29f06c5d305def12c1df2e0ac14b90455271094988a2e",
+  "cargo_lock_sha256": "b047705cb97be68f76fd69e47fda0bfd45bb451084d0f7d57627f7c216a01a77",
+  "cargo_toml_sha256": "d51a2d4a52114e0f19e5f42c0762aaf4d557a68a92a3c6722c3ea0154a852cfa",
   "packages": [
     {
       "name": "ab_glyph",
@@ -1060,16 +1060,17 @@
     },
     {
       "name": "rfd",
-      "version": "0.15.4",
+      "version": "0.17.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "ef2bee61e6cffa4635c72d7d81a84294e28f0930db0ddcb0f66d10244674ebed",
+      "checksum": "20dafead71c16a34e1ff357ddefc8afc11e7d51d6d2b9fbd07eaa48e3e540220",
       "declared_license": "MIT",
       "repository": "https://github.com/PolyMeilex/rfd",
       "selected_licenses": [
         "MIT"
       ],
       "texts": [
-        "MIT:65fc947f4bac882a2cd104ef73c246b1b037059df9f2b3a58b7f77f0b9e56071"
+        "MIT:65fc947f4bac882a2cd104ef73c246b1b037059df9f2b3a58b7f77f0b9e56071",
+        "MIT:ae26bc7b1bc91fb8648f6a298decbb1a77090a56c9d04e2c23b8365e5f54acb5"
       ]
     },
     {
@@ -1572,6 +1573,20 @@
       "version": "0.60.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb",
+      "declared_license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/microsoft/windows-rs",
+      "selected_licenses": [
+        "MIT"
+      ],
+      "texts": [
+        "MIT:c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+      ]
+    },
+    {
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
       "declared_license": "MIT OR Apache-2.0",
       "repository": "https://github.com/microsoft/windows-rs",
       "selected_licenses": [
@@ -2146,7 +2161,7 @@
       "sha256": "65fc947f4bac882a2cd104ef73c246b1b037059df9f2b3a58b7f77f0b9e56071",
       "text": "MIT License\n\nCopyright (c) 2022 Bart\u0142omiej Mary\u0144czak\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
       "sources": [
-        "rfd@0.15.4/LICENSE"
+        "rfd@0.17.2/LICENSE"
       ]
     },
     "MIT:6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6": {
@@ -2245,6 +2260,14 @@
         "document-features@0.2.12/LICENSE-MIT"
       ]
     },
+    "MIT:ae26bc7b1bc91fb8648f6a298decbb1a77090a56c9d04e2c23b8365e5f54acb5": {
+      "license": "MIT",
+      "sha256": "ae26bc7b1bc91fb8648f6a298decbb1a77090a56c9d04e2c23b8365e5f54acb5",
+      "text": "MIT License\n\nCopyright (c) 2020 Bilal Elmoussaoui\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+      "sources": [
+        "rfd@0.17.2/src/backend/xdg_desktop_portal/window_identifier/LICENSE"
+      ]
+    },
     "MIT:b1d6df41ed3aa96806e74c729444d7c121d90e6660a6aed01d298e03fde475a0": {
       "license": "MIT",
       "sha256": "b1d6df41ed3aa96806e74c729444d7c121d90e6660a6aed01d298e03fde475a0",
@@ -2288,6 +2311,7 @@
         "windows-sys@0.52.0/license-mit",
         "windows-sys@0.59.0/license-mit",
         "windows-sys@0.60.2/license-mit",
+        "windows-sys@0.61.2/license-mit",
         "windows-targets@0.52.6/license-mit",
         "windows-targets@0.53.5/license-mit",
         "windows@0.54.0/license-mit",

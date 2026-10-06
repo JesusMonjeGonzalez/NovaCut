@@ -1,7 +1,11 @@
 # Third-Party Notices
 
-NovaCut does not vendor third-party source code or media fixtures in this
-repository.
+NovaCut includes the `beguiling-drafter` RNNoise model from
+[GregorR/rnnoise-models](https://github.com/GregorR/rnnoise-models), embedded
+in the Windows executable for local voice cleanup (`assets/modelos/voz.rnnn`).
+The upstream README states that, except for its tools directory and README,
+the work is not creative and is not subject to copyright.
+Model SHA-256: `ae3f7411e1e6a884f839a4a145c394408398f09854dbc1216ee02faafc98a17b`.
 
 The native application uses Apple system frameworks, including AVFoundation,
 AVAudio, Core Image, Core Media, Core Video, Speech, Vision and SwiftUI.
