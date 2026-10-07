@@ -251,6 +251,13 @@ pub(super) struct Estado {
     angulos_pedido: Option<Instant>,
 }
 
+impl Estado {
+    /// Hay una propuesta de ajustar la secuencia esperando respuesta.
+    pub(super) fn hay_propuesta(&self) -> bool {
+        self.propuesta.is_some()
+    }
+}
+
 /// Lo que haría la secuencia para coincidir con su primer clip, como el
 /// aviso de «Clip no coincide» de Premiere.
 struct PropuestaSecuencia {
@@ -388,6 +395,7 @@ impl NovaCutWindows {
                 }
             },
         );
+        self.tutorial.marcar("menu_herramientas", respuesta.response.rect);
         respuesta.response.on_hover_text(
             "Cerrar huecos, multicámara automática, voces, pitido, voz en off, capítulos, FCPXML y más",
         );

@@ -28,7 +28,8 @@
 
 Get the latest build from **[Releases](https://github.com/JesusMonjeGonzalez/NovaCut/releases)**.
 
-The latest published prerelease is **v0.4.1**: fixes stalled FFmpeg downloads during installation, with linked audio/video editing,
+The latest published prerelease is **v0.4.2**: mouse-first timeline editing on Windows (visible trim and fade handles,
+editing while playing, live scrubbing, on-monitor text placement) and a first-run guided tour, with linked audio/video editing,
 local voice cleanup, preview rendering, FCPXML interchange and one-click transcription on Windows,
 plus a universal macOS package and a `SHA256SUMS.txt` manifest. Intel
 binary execution is packaged but not yet validated; see Current Limits.
