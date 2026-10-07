@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
@@ -34,6 +34,7 @@ mod navigation;
 mod proyecto;
 mod subtitulos_animados;
 mod transcripcion;
+mod tutorial;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -688,6 +689,70 @@ enum DragKind {
     Slip { grab: f64 },
     /// Deslizar el clip entre sus vecinos.
     Slide { grab: f64 },
+    /// Tiradores de fundido de entrada y de salida.
+    FadeIn,
+    FadeOut,
+}
+
+/// Zona de un clip bajo el puntero con la herramienta de selección.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ClipZone {
+    TrimStart,
+    TrimEnd,
+    FadeIn,
+    FadeOut,
+}
+
+/// Ancho de la franja de recorte en cada borde: 10 px, menos en clips
+/// cortos para que siempre quede cuerpo por donde agarrarlos.
+fn clip_edge_grab(rect: egui::Rect) -> f32 {
+    (rect.width() / 4.0).clamp(3.0, 10.0)
+}
+
+/// Fundidos del clip en píxeles de timeline, sin pasar del clip.
+fn clip_fade_px(clip: &RoughClip, rect: egui::Rect, pps: f64) -> (f32, f32) {
+    let px = |seconds: f64| ((seconds.max(0.0) * pps) as f32).min(rect.width());
+    (px(clip.fade_in_seconds), px(clip.fade_out_seconds))
+}
+
+/// Centro del tirador de fundido: en la esquina superior, desplazado lo que
+/// dura el fundido y nunca encima de la franja de recorte.
+fn fade_handle_center(rect: egui::Rect, fade_px: f32, fade_in: bool) -> egui::Pos2 {
+    let inset = (clip_edge_grab(rect) + 4.0).min(rect.width() / 2.0);
+    let x = if fade_in {
+        (rect.left() + fade_px).clamp(rect.left() + inset, rect.center().x)
+    } else {
+        (rect.right() - fade_px).clamp(rect.center().x, rect.right() - inset)
+    };
+    egui::pos2(x, rect.top() + 6.0)
+}
+
+/// Qué hará un arrastre que empiece en `pointer`: fundido si está en un
+/// tirador de fundido, recorte en los bordes y mover (None) en el resto.
+fn clip_hit_zone(
+    clip: &RoughClip,
+    rect: egui::Rect,
+    pps: f64,
+    pointer: Option<egui::Pos2>,
+) -> Option<ClipZone> {
+    let pointer = pointer.filter(|pointer| rect.expand(1.0).contains(*pointer))?;
+    if rect.height() >= 18.0 && rect.width() > 24.0 {
+        let (fade_in_px, fade_out_px) = clip_fade_px(clip, rect, pps);
+        if fade_handle_center(rect, fade_in_px, true).distance(pointer) <= 8.0 {
+            return Some(ClipZone::FadeIn);
+        }
+        if fade_handle_center(rect, fade_out_px, false).distance(pointer) <= 8.0 {
+            return Some(ClipZone::FadeOut);
+        }
+    }
+    let edge = clip_edge_grab(rect);
+    if pointer.x - rect.left() <= edge {
+        Some(ClipZone::TrimStart)
+    } else if rect.right() - pointer.x <= edge {
+        Some(ClipZone::TrimEnd)
+    } else {
+        None
+    }
 }
 
 /// Herramienta activa del montaje. Cambia tanto el cursor como el significado
@@ -846,6 +911,8 @@ struct Playback {
     /// Mantiene vivo el dispositivo de audio mientras se reproduce.
     _stream: Option<rodio::OutputStream>,
     sink: Option<Arc<rodio::Sink>>,
+    /// Trozos de audio metidos en el sink por el hilo lector.
+    audio_chunks: Arc<AtomicU64>,
     /// Grafos de los procesos en curso; se borran al parar.
     _graphs: Vec<GraphFile>,
 }
@@ -855,7 +922,14 @@ impl Playback {
     /// evitar deriva; sin audio, el reloj de pared.
     fn elapsed(&self) -> f64 {
         match &self.sink {
-            Some(sink) => sink.get_pos().as_secs_f64(),
+            Some(sink) => {
+                let queued = sink.len();
+                audio_clock(
+                    self.audio_chunks.load(Ordering::Acquire),
+                    queued,
+                    sink.get_pos().as_secs_f64(),
+                )
+            }
             None => self.started.elapsed().as_secs_f64(),
         }
     }
@@ -900,6 +974,18 @@ fn next_shuttle_rate(current: Option<i32>, forward: bool) -> i32 {
         Some(rate) if rate.signum() == sign => sign * (rate.abs() * 2).min(8),
         _ => sign,
     }
+}
+
+/// Duración de cada trozo de audio que el lector mete en el sink.
+const AUDIO_CHUNK_SECONDS: f64 = 0.05;
+
+/// Segundos de audio ya sonados. `Sink::get_pos` de rodio solo da la
+/// posición dentro del trozo que suena, así que hay que sumarle los
+/// trozos que ya terminaron: los añadidos menos los que siguen en cola
+/// (el que suena cuenta como en cola).
+fn audio_clock(appended: u64, queued: usize, position_in_chunk: f64) -> f64 {
+    let finished = appended.saturating_sub(queued as u64);
+    finished as f64 * AUDIO_CHUNK_SECONDS + position_in_chunk
 }
 
 /// Extrae un fotograma escalado de un medio para previsualizaciones.
@@ -957,6 +1043,8 @@ enum TimelineDragEvent {
     TrimEnd(usize, f64),
     /// Rodar, desplazar o deslizar: instante bajo el puntero.
     Tool(usize, f64),
+    /// Tirador de fundido: entrada (`true`) o salida, en segundos.
+    Fade(usize, bool, f64),
     Commit(usize),
     Select(usize, SelectionMode),
 }
@@ -2400,6 +2488,21 @@ fn free_track(clips: &[RoughClip], video: bool, preferred: usize, start: f64, en
         .unwrap_or(15)
 }
 
+/// Pista de vídeo libre por encima de todo lo que se ve entre `start` y
+/// `end`: donde van textos y capas de ajuste para quedar delante sin
+/// solaparse con el clip de debajo.
+fn track_above(clips: &[RoughClip], start: f64, end: f64) -> usize {
+    let covered = clips
+        .iter()
+        .filter(|clip| {
+            clip.has_video && clip.timeline_start < end && start < clip.timeline_start + clip.duration()
+        })
+        .map(|clip| clip.track + 1)
+        .max()
+        .unwrap_or(0);
+    free_track(clips, true, covered.min(15), start, end)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RoughProject {
     version: u32,
@@ -2886,6 +2989,23 @@ struct NovaCutWindows {
     /// recuperar correctamente el estado limpio del documento.
     clean_project_json: Option<String>,
     drag_edit: Option<(usize, DragKind, RoughProject)>,
+    /// Ayuda de la línea bajo las herramientas: lo que hará el ratón sobre
+    /// el clip bajo el puntero (fotograma anterior).
+    timeline_hint: Option<String>,
+    /// Hay alto para la línea de ayuda bajo las herramientas.
+    timeline_hint_visible: bool,
+    /// Velocidad a la que reanudar al soltar el cabezal arrastrado.
+    scrub_resume: Option<i32>,
+    /// Se está arrastrando la línea del cabezal sobre las pistas.
+    lane_scrub: bool,
+    /// Cabezal al empezar el arrastre en curso (para el imán).
+    drag_playhead: f64,
+    /// Altura de fila al empezar a mover un clip entre pistas.
+    drag_row_height: f32,
+    /// Recorrido guiado de la primera visita.
+    tutorial: tutorial::Tutorial,
+    /// El recorrido ya se vio (o se descartó); se guarda en los ajustes.
+    tutorial_visto: bool,
     export_cancel: Option<Arc<AtomicBool>>,
     /// Calidad, bitrate y audio de la exportación.
     encode_settings: exportacion::EncodeSettings,
@@ -3222,7 +3342,15 @@ struct UiSettings {
     ui_scale: Option<f32>,
     #[serde(default)]
     encode: exportacion::EncodeSettings,
+    /// El recorrido guiado ya se vio: no vuelve a salir solo.
+    #[serde(default)]
+    tutorial_done: bool,
 }
+
+/// Ancho del centro a partir del cual las herramientas de edición caben en
+/// la misma fila que la secuencia, Pistas, Sobrescribir y el zoom (unos
+/// 1150 px desde que llevan deshacer, rehacer y Partir).
+const TOOLS_INLINE_WIDTH: f32 = 1160.0;
 
 /// Tamaños de interfaz ofrecidos en el menú «Aa».
 const UI_SCALES: [f32; 6] = [0.9, 1.0, 1.1, 1.25, 1.4, 1.5];
@@ -3598,6 +3726,7 @@ impl NovaCutWindows {
             hardware_encoding: self.hardware_encoding,
             encode: self.encode_settings,
             ui_scale: Some(self.ui_scale),
+            tutorial_done: self.tutorial_visto,
         }
     }
 
@@ -3661,6 +3790,7 @@ impl NovaCutWindows {
             self.ui_scale = scale.clamp(0.75, 2.0);
             self.ui_scale_chosen = true;
         }
+        self.tutorial_visto = settings.tutorial_done;
         self.saved_settings_json = serde_json::to_string(&settings).ok();
     }
 
@@ -3725,6 +3855,142 @@ impl NovaCutWindows {
         if let Some((baseline, _)) = self.pending_edit.take() {
             self.finish_edit(baseline);
         }
+    }
+
+    /// Clip que se puede mover en el monitor: el seleccionado, si se ve en
+    /// el cabezal y es imagen, vídeo o texto.
+    fn monitor_target(&self) -> Option<usize> {
+        let index = self.selected?;
+        let clip = self.project.clips.get(index)?;
+        let visible = clip.has_video || clip.title.is_some();
+        let here = self.playhead >= clip.timeline_start - 1e-6
+            && self.playhead < clip.timeline_start + clip.duration();
+        (visible && here && !clip.is_adjustment && !self.project.clip_locked(clip)).then_some(index)
+    }
+
+    /// Edición directa en el monitor: arrastrar mueve el clip seleccionado
+    /// (o su texto) y la rueda lo escala. Antes el monitor solo se miraba y
+    /// colocar un rótulo exigía teclear píxeles en el Inspector.
+    fn monitor_direct_edit(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.interact(rect, ui.id().with("monitor-direct"), egui::Sense::click_and_drag());
+        let Some(index) = self.monitor_target() else {
+            if response.hovered() && !self.project.clips.is_empty() && self.playback.is_none() {
+                response.on_hover_text(
+                    "Selecciona en la timeline el clip o texto que está en el cabezal para moverlo aquí con el ratón",
+                );
+            }
+            return;
+        };
+        let local_t = self.playhead - self.project.clips[index].timeline_start;
+        let painter = ui.painter().with_clip_rect(rect);
+        // Marco del clip: dónde está y qué se va a mover.
+        let outline = egui::Stroke::new(1.5_f32, theme::ACCENT);
+        let frame = if let Some(title) = &self.project.clips[index].title {
+            let center = egui::pos2(
+                rect.left() + rect.width() * title.position_x.clamp(0.0, 1.0) as f32,
+                rect.top() + rect.height() * title.position_y.clamp(0.0, 1.0) as f32,
+            );
+            let half = egui::vec2(
+                (rect.width() * 0.22).max(40.0),
+                (rect.height() * title.size as f32 / 1080.0).max(10.0),
+            );
+            egui::Rect::from_center_size(center, half * 2.0)
+        } else {
+            let (x, y, scale, _) = self.project.clips[index].evaluate_transform(local_t);
+            let size = rect.size() * (scale / 100.0) as f32;
+            let center = rect.center()
+                + egui::vec2(
+                    x as f32 * rect.width() / 1920.0,
+                    y as f32 * rect.height() / 1080.0,
+                );
+            egui::Rect::from_center_size(center, size)
+        };
+        if response.hovered() || response.dragged() {
+            painter.rect_stroke(frame, 2.0, outline, egui::StrokeKind::Middle);
+            ui.ctx().set_cursor_icon(if response.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Move
+            });
+        }
+        let drag = if response.dragged() { response.drag_delta() } else { egui::Vec2::ZERO };
+        let scroll = if response.hovered() {
+            ui.input(|input| input.smooth_scroll_delta.y)
+        } else {
+            0.0
+        };
+        // Rótulo dentro del monitor: un tooltip tapaba el transporte.
+        if response.hovered() && !response.dragged() {
+            let text = "Arrastra para mover · rueda: tamaño · Mayús+rueda: fino";
+            let galley = painter.layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            let at = rect.left_bottom() + egui::vec2(6.0, -galley.size().y - 6.0);
+            painter.rect_filled(
+                egui::Rect::from_min_size(at - egui::vec2(4.0, 2.0), galley.size() + egui::vec2(8.0, 4.0)),
+                3.0,
+                egui::Color32::from_black_alpha(170),
+            );
+            painter.galley(at, galley, egui::Color32::WHITE);
+        }
+        if drag == egui::Vec2::ZERO && scroll == 0.0 {
+            return;
+        }
+        if self.pending_edit.is_none() {
+            let baseline = self.project.clone();
+            self.queue_edit(baseline);
+        } else if let Some((_, since)) = &mut self.pending_edit {
+            *since = std::time::Instant::now();
+        }
+        let fine = ui.input(|input| input.modifiers.shift);
+        let factor = (1.0 + scroll as f64 * if fine { 0.0005 } else { 0.002 }).clamp(0.5, 2.0);
+        let clip = &mut self.project.clips[index];
+        if let Some(title) = clip.title.as_mut() {
+            title.position_x = (title.position_x + (drag.x / rect.width()) as f64).clamp(0.0, 1.0);
+            title.position_y = (title.position_y + (drag.y / rect.height()) as f64).clamp(0.0, 1.0);
+            title.size = (title.size * factor).clamp(8.0, 400.0);
+            self.status = format!(
+                "Texto en {:.0} %, {:.0} % · tamaño {:.0}",
+                title.position_x * 100.0,
+                title.position_y * 100.0,
+                title.size
+            );
+        } else {
+            let (x, y, scale, opacity) = clip.evaluate_transform(local_t);
+            let moved = TransformKeyframe {
+                t: local_t,
+                x: x + (drag.x * 1920.0 / rect.width()) as f64,
+                y: y + (drag.y * 1080.0 / rect.height()) as f64,
+                scale: (scale * factor).clamp(1.0, 800.0),
+                opacity,
+            };
+            // Con keyframes, el cambio crea o corrige el del cabezal, como
+            // en el Inspector; sin ellos, es la posición fija del clip.
+            match clip.keyframes.as_mut().filter(|keys| !keys.is_empty()) {
+                Some(keyframes) => match keyframes
+                    .iter_mut()
+                    .find(|existing| (existing.t - local_t).abs() < animacion::SAME_KEY)
+                {
+                    Some(existing) => *existing = moved,
+                    None => {
+                        keyframes.push(moved);
+                        keyframes.sort_by(|left, right| left.t.total_cmp(&right.t));
+                    }
+                },
+                None => {
+                    clip.position_x = moved.x;
+                    clip.position_y = moved.y;
+                    clip.scale_percent = moved.scale;
+                }
+            }
+            self.status = format!(
+                "Posición X {:.0} · Y {:.0} px · escala {:.0} %",
+                moved.x, moved.y, moved.scale
+            );
+        }
+        self.request_preview();
     }
 
     fn poll_pending_edit(&mut self, context: &egui::Context) {
@@ -4079,6 +4345,14 @@ impl NovaCutWindows {
             export_format: ExportFormat::Mp4Video,
             playback: None,
             meter_display: (0.0, 0.0),
+            timeline_hint: None,
+            timeline_hint_visible: true,
+            scrub_resume: None,
+            lane_scrub: false,
+            drag_playhead: 0.0,
+            drag_row_height: 0.0,
+            tutorial: tutorial::Tutorial::default(),
+            tutorial_visto: false,
             monitor_volume: 1.0,
             frame_result: None,
             burn_subtitles: false,
@@ -4127,7 +4401,7 @@ impl NovaCutWindows {
             stabilization: None,
             whisper_setup: None,
             media_file_status: media_browser::FileStatus::default(),
-            bottom_tab: BottomTab::Mixer,
+            bottom_tab: BottomTab::Inspector,
             subtitle_query: String::new(),
             subtitle_offset_ms: 0.0,
             bottom_open: false,
@@ -4170,7 +4444,9 @@ impl NovaCutWindows {
             app.ui_scale_chosen = true;
         }
         context.egui_ctx.set_zoom_factor(app.ui_scale);
-        if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
+        // «Abrir con» varios archivos en el Explorador los pasa todos.
+        let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+        if let Some(path) = args.first().cloned() {
             let extension = path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -4179,7 +4455,7 @@ impl NovaCutWindows {
             if extension == "ncrough" || extension == "editorcito" {
                 app.load_project_from(path);
             } else if app.ffmpeg_ready {
-                app.import_paths(vec![path]);
+                app.import_paths(args);
             }
         } else if let Some(mut project) = load_recovery() {
             project.normalize();
@@ -6555,18 +6831,28 @@ impl NovaCutWindows {
     /// Crea un clip de título en el cabezal, sobre la pista de vídeo superior.
     fn add_title_at_playhead(&mut self) {
         let before = self.project.clone();
-        let track = self.project.video_track_count().saturating_sub(1).min(15);
+        let start = self.playhead.min(self.project.duration());
+        let track = track_above(&self.project.clips, start, start + 5.0);
         self.project.clips.push(RoughClip {
             out_seconds: 5.0,
-            timeline_start: self.playhead.min(self.project.duration()),
+            timeline_start: start,
             track,
             has_audio: false,
-            title: Some(Titulo::default()),
+            // Con texto desde el principio: vacío no se veía nada en el
+            // monitor y parecía que el botón no había hecho nada.
+            title: Some(Titulo {
+                text: "Escribe aquí tu texto".to_owned(),
+                ..Titulo::default()
+            }),
             ..Default::default()
         });
         self.select_only(self.project.clips.len() - 1);
         self.finish_edit(before);
-        self.status = "Titulo creado; edita su texto en el inspector".to_owned();
+        self.bottom_tab = BottomTab::Inspector;
+        self.request_preview();
+        self.status =
+            "Texto creado: escríbelo en el Inspector y arrástralo en el monitor para colocarlo"
+                .to_owned();
     }
 
     /// Título con estilo predefinido (rótulo inferior, mate de color…) en el
@@ -6579,7 +6865,7 @@ impl NovaCutWindows {
         let track = if is_matte {
             free_track(&self.project.clips, true, 0, start, start + 5.0)
         } else {
-            self.project.video_track_count().min(15)
+            track_above(&self.project.clips, start, start + 5.0)
         };
         self.project.clips.push(RoughClip {
             out_seconds: 5.0,
@@ -6598,10 +6884,11 @@ impl NovaCutWindows {
     /// gradúe todo lo compuesto por debajo (como en Premiere/DaVinci).
     fn add_adjustment_layer_at_playhead(&mut self) {
         let before = self.project.clone();
-        let track = self.project.video_track_count().min(15);
+        let start = self.playhead.min(self.project.duration());
+        let track = track_above(&self.project.clips, start, start + 5.0);
         self.project.clips.push(RoughClip {
             out_seconds: 5.0,
-            timeline_start: self.playhead.min(self.project.duration()),
+            timeline_start: start,
             track,
             has_audio: false,
             is_adjustment: true,
@@ -7004,7 +7291,23 @@ impl NovaCutWindows {
                 {
                     // El clip principal define el desplazamiento real (ya
                     // imantado) y el resto de la selección lo sigue en bloque.
-                    let origin = self.project.clips[index].timeline_start;
+                    // `delta` es el desplazamiento total desde que se pulsó,
+                    // medido contra la posición de antes del gesto: sumarlo
+                    // fotograma a fotograma e imantar cada paso dejaba el clip
+                    // clavado en cuanto pasaba cerca de un imán.
+                    let Some(before) = self.drag_edit.as_ref().map(|state| &state.2) else {
+                        return;
+                    };
+                    let mut starts: Vec<f64> =
+                        before.clips.iter().map(|clip| clip.timeline_start).collect();
+                    // Alt+arrastre añadió copias al final: su origen es el actual.
+                    if starts.len() > self.project.clips.len() {
+                        return;
+                    }
+                    for clip in &self.project.clips[starts.len()..] {
+                        starts.push(clip.timeline_start);
+                    }
+                    let origin = starts[index];
                     let target = (origin + delta).max(0.0);
                     let snapped_start = snap_time(
                         target,
@@ -7041,7 +7344,7 @@ impl NovaCutWindows {
                     // Ningún clip del grupo puede cruzar el cero.
                     let earliest = group
                         .iter()
-                        .map(|other| self.project.clips[*other].timeline_start)
+                        .map(|other| starts[*other])
                         .fold(f64::INFINITY, f64::min);
                     let shift = (snapped - origin).max(-earliest);
                     let track_shift = track as isize - self.project.clips[index].track as isize;
@@ -7056,7 +7359,7 @@ impl NovaCutWindows {
                     }
                     for other in group {
                         let clip = &mut self.project.clips[other];
-                        clip.timeline_start = (clip.timeline_start + shift).max(0.0);
+                        clip.timeline_start = (starts[other] + shift).max(0.0);
                         clip.track = (clip.track as isize + track_shift).clamp(0, 15) as usize;
                     }
                     self.selected = Some(index);
@@ -7093,7 +7396,7 @@ impl NovaCutWindows {
                     &before.clips,
                     Some(index),
                     &before.markers,
-                    self.playhead,
+                    self.drag_playhead,
                     self.snap_tolerance(),
                 )
                 .clamp(
@@ -7137,7 +7440,7 @@ impl NovaCutWindows {
                         &locked,
                     );
                 }
-                self.request_preview();
+                self.show_trim_frame(index, true);
             }
             Some(TimelineDragEvent::TrimEnd(index, target_time)) => {
                 let Some((_, kind, before)) = self
@@ -7169,7 +7472,7 @@ impl NovaCutWindows {
                     &before.clips,
                     Some(index),
                     &before.markers,
-                    self.playhead,
+                    self.drag_playhead,
                     self.snap_tolerance(),
                 )
                 .clamp(orig_end + tail_min, orig_end + tail_max.max(tail_min));
@@ -7206,7 +7509,7 @@ impl NovaCutWindows {
                         }
                     }
                 }
-                self.request_preview();
+                self.show_trim_frame(index, false);
             }
             Some(TimelineDragEvent::Tool(index, pointer)) => {
                 let Some((kind, before)) = self
@@ -7266,6 +7569,27 @@ impl NovaCutWindows {
                     }
                 }
             }
+            Some(TimelineDragEvent::Fade(index, fade_in, seconds)) => {
+                if !self
+                    .drag_edit
+                    .as_ref()
+                    .is_some_and(|state| state.0 == index && matches!(state.1, DragKind::FadeIn | DragKind::FadeOut))
+                {
+                    return;
+                }
+                let fps = self.project.fps.max(1.0);
+                let clip = &mut self.project.clips[index];
+                let other = if fade_in { clip.fade_out_seconds } else { clip.fade_in_seconds };
+                let limit = (clip.duration() - other).max(0.0);
+                // A fotogramas enteros, como el resto de la edición.
+                let value = ((seconds.clamp(0.0, limit) * fps).round() / fps).min(limit);
+                if fade_in {
+                    clip.fade_in_seconds = value;
+                } else {
+                    clip.fade_out_seconds = value;
+                }
+                self.request_preview();
+            }
             Some(TimelineDragEvent::Commit(index)) => {
                 if let Some((active, kind, before)) = self.drag_edit.take() {
                     if active != index {
@@ -7290,7 +7614,9 @@ impl NovaCutWindows {
                     let changed = now.timeline_start != orig.timeline_start
                         || now.track != orig.track
                         || now.in_seconds != orig.in_seconds
-                        || now.out_seconds != orig.out_seconds;
+                        || now.out_seconds != orig.out_seconds
+                        || now.fade_in_seconds != orig.fade_in_seconds
+                        || now.fade_out_seconds != orig.fade_out_seconds;
                     if changed {
                         // Al soltar, lo que quede debajo se recorta o se parte
                         // en vez de quedar solapado sin criterio.
@@ -7358,6 +7684,14 @@ impl NovaCutWindows {
                                 format!("Clip movido; {overwritten} clip(s) sobrescrito(s)")
                             }
                             DragKind::Move => "Clip movido".to_owned(),
+                            DragKind::FadeIn => format!(
+                                "Fundido de entrada: {:.2} s",
+                                self.project.clips[index].fade_in_seconds
+                            ),
+                            DragKind::FadeOut => format!(
+                                "Fundido de salida: {:.2} s",
+                                self.project.clips[index].fade_out_seconds
+                            ),
                             DragKind::RippleTrimStart | DragKind::RippleTrimEnd => {
                                 "Clip recortado con ripple".to_owned()
                             }
@@ -8579,13 +8913,15 @@ impl NovaCutWindows {
                 let icon = if !item.clip.has_video { "♪" } else { "▶" };
                 let clip = item.clip.clone();
                 let response = row(ui, icon, &name, &detail, false).on_hover_text(format!(
-                    "{}\nDoble clic: monitor de fuente · Arrastra a la timeline o a un bin",
+                    "{}\nClic: verlo y recortarlo antes de usarlo · Arrastra a la timeline o a un bin",
                     clip.path.display()
                 ));
                 if response.drag_started() {
                     egui::DragAndDrop::set_payload(ui.ctx(), LibraryPayload(*index));
                 }
-                if response.double_clicked() {
+                // Un clic basta para previsualizar: con doble clic, nadie
+                // descubría el monitor de fuente.
+                if response.clicked() {
                     source = Some(clip.clone());
                 }
                 response.context_menu(|ui| {
@@ -9008,6 +9344,32 @@ impl NovaCutWindows {
     /// una barra vertical); el nombre, el atajo y lo que hace van en el
     /// tooltip. Ocupa una fracción del alto del antiguo bloque de botones.
     fn show_edit_toolbar(&mut self, ui: &mut egui::Ui) {
+        let desde = ui.cursor().min;
+        // Deshacer, rehacer y partir al lado de las herramientas: estaban
+        // solo en la barra superior, lejos de donde se edita.
+        let small = |text: &str| egui::Button::new(egui::RichText::new(text).size(15.0)).min_size(egui::vec2(30.0, 28.0));
+        if ui
+            .add_enabled(!self.undo_stack.is_empty(), small("↶"))
+            .on_hover_text("Deshacer (Ctrl+Z)")
+            .clicked()
+        {
+            self.undo();
+        }
+        if ui
+            .add_enabled(!self.redo_stack.is_empty(), small("↷"))
+            .on_hover_text("Rehacer (Ctrl+Mayús+Z)")
+            .clicked()
+        {
+            self.redo();
+        }
+        if ui
+            .add_enabled(!self.project.clips.is_empty(), egui::Button::new(egui::RichText::new("✂ Partir").size(12.5)).min_size(egui::vec2(30.0, 28.0)))
+            .on_hover_text("Partir en el cabezal (S): corta el clip seleccionado, o el que esté bajo el cabezal")
+            .clicked()
+        {
+            self.split_at_playhead();
+        }
+        ui.add(egui::Separator::default().vertical().spacing(6.0));
         for tool in EditTool::ALL {
             let active = self.edit_tool == tool;
             let response = ui
@@ -9032,6 +9394,10 @@ impl NovaCutWindows {
                 self.set_edit_tool(tool);
             }
         }
+        // Toda la fila, de deshacer a la última herramienta.
+        let hasta = ui.min_rect().max;
+        self.tutorial
+            .marcar("herramientas", egui::Rect::from_min_max(desde, hasta));
     }
 
     /// Índices seleccionados válidos, en orden ascendente.
@@ -9061,11 +9427,19 @@ impl NovaCutWindows {
     }
 
     fn timeline_extent(&self) -> f64 {
-        let duration = self.project.duration();
-        if duration < 1.0 {
-            10.0
-        } else {
-            (duration * 1.08).max(duration + 2.0).min(duration + 30.0)
+        let extent = |duration: f64| {
+            if duration < 1.0 {
+                10.0
+            } else {
+                (duration * 1.08).max(duration + 2.0).min(duration + 30.0)
+            }
+        };
+        let current = extent(self.project.duration());
+        // Mientras se arrastra, la escala no encoge: si la regla se
+        // reajustaba al recortar, el borde se escapaba del cursor.
+        match &self.drag_edit {
+            Some((_, _, before)) => current.max(extent(before.duration())),
+            None => current,
         }
     }
 
@@ -9479,12 +9853,17 @@ impl NovaCutWindows {
             return;
         }
         let mut open = true;
+        let mut recorrido = false;
         egui::Window::new("Atajos de teclado")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(context, |ui| {
+                recorrido = theme::accent_button(ui, "▶ Ver el recorrido guiado")
+                    .on_hover_text("Te enseña paso a paso dónde está cada cosa")
+                    .clicked();
+                ui.add_space(6.0);
                 let groups: [(&str, &[(&str, &str)]); 6] = [
                     (
                         "Reproducción",
@@ -9603,7 +9982,10 @@ impl NovaCutWindows {
                         }
                     });
             });
-        self.show_shortcuts = open;
+        self.show_shortcuts = open && !recorrido;
+        if recorrido {
+            self.tutorial.empezar();
+        }
     }
 
     /// Duración de un fotograma del montaje.
@@ -10596,6 +10978,7 @@ impl NovaCutWindows {
     fn toggle_playback(&mut self) {
         if self.playback.is_some() {
             self.stop_playback();
+            self.status = format!("En pausa en {}", timecode(self.playhead, self.project.fps));
             return;
         }
         self.start_playback(1);
@@ -10796,12 +11179,15 @@ impl NovaCutWindows {
             return;
         };
         let sink = Arc::new(sink);
+        let audio_chunks = Arc::new(AtomicU64::new(0));
         if let Some(audio_stdout) = audio_child.stdout.take() {
             let meter_thread = Arc::clone(&meter);
+            let chunks_thread = Arc::clone(&audio_chunks);
             let sink = Arc::clone(&sink);
             std::thread::spawn(move || {
                 use std::io::Read;
-                const CHUNK: usize = 9600; // 50 ms a 48 kHz estéreo s16
+                // 50 ms a 48 kHz estéreo s16: AUDIO_CHUNK_SECONDS.
+                const CHUNK: usize = 9600;
                 let mut reader = audio_stdout;
                 let mut buffer = vec![0u8; CHUNK];
                 loop {
@@ -10828,6 +11214,7 @@ impl NovaCutWindows {
                         }
                     }
                     sink.append(rodio::buffer::SamplesBuffer::new(2, 48000, samples));
+                    chunks_thread.fetch_add(1, Ordering::Release);
                     // Contrapresión: no acumular más de ~1 s en el sink.
                     while sink.len() > 20 {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -10847,6 +11234,7 @@ impl NovaCutWindows {
             meter,
             _stream: Some(stream),
             sink: Some(sink),
+            audio_chunks,
             _graphs: vec![video_graph, audio_graph],
         });
         self.status = if rate == 1 {
@@ -10974,12 +11362,47 @@ impl NovaCutWindows {
             meter: Arc::new(std::sync::Mutex::new((0.0, 0.0))),
             _stream: None,
             sink: None,
+            audio_chunks: Arc::new(AtomicU64::new(0)),
             _graphs: Vec::new(),
         });
         self.status = format!("Marcha atrás a {step}× (J acelera, K para)");
     }
 
     /// Consume vídeo al ritmo del reloj de la reproducción.
+    /// Medidor de nivel compacto (L arriba, R abajo) para la fila del
+    /// transporte; ocupa lo que quede libre, hasta 160 px.
+    fn transport_meter(&self, ui: &mut egui::Ui) {
+        let width = (ui.available_width() - 12.0).min(160.0);
+        if width < 40.0 {
+            return;
+        }
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let (left, right) = self.meter_display;
+        for (row, level) in [left, right].into_iter().enumerate() {
+            let top = rect.top() + row as f32 * 9.0;
+            let track = egui::Rect::from_min_size(
+                egui::pos2(rect.left(), top),
+                egui::vec2(rect.width(), 7.0),
+            );
+            painter.rect_filled(track, 2.0, theme::STROKE_SOFT);
+            let fill = egui::Rect::from_min_size(
+                track.min,
+                egui::vec2(track.width() * level.clamp(0.0, 1.0), track.height()),
+            );
+            let color = if level > 0.89 { theme::DANGER } else { theme::ACCENT };
+            painter.rect_filled(fill, 2.0, color);
+        }
+        let peak = left.max(right);
+        let db = if peak > 0.0001 {
+            format!("{:.1} dBFS", 20.0 * peak.log10())
+        } else {
+            "-inf dBFS".to_owned()
+        };
+        response.on_hover_text(format!("Nivel de audio · L arriba, R abajo · {db}"));
+    }
+
     fn poll_playback(&mut self, context: &egui::Context) {
         // Con "solo rango" activo, la reproducción se detiene en la salida.
         let total = match self.work_range() {
@@ -11188,12 +11611,32 @@ impl NovaCutWindows {
         }
     }
 
+    /// Mientras se arrastra un borde, el monitor enseña el fotograma del
+    /// corte: el cabezal salta a la entrada o al último fotograma del clip.
+    /// Reproduciendo, el cabezal sigue su curso y se ve al soltar.
+    fn show_trim_frame(&mut self, index: usize, start: bool) {
+        if self.playback.is_none() {
+            if let Some(clip) = self.project.clips.get(index) {
+                let frame = 1.0 / self.project.fps.max(1.0);
+                self.playhead = if start {
+                    clip.timeline_start
+                } else {
+                    (clip.timeline_start + clip.duration() - frame).max(clip.timeline_start)
+                };
+            }
+        }
+        self.request_preview();
+    }
+
     fn finish_edit(&mut self, previous: RoughProject) {
         // Si una edición de inspector seguía viva, conserva su baseline como
         // paso independiente antes del comando explícito que llega ahora.
         if let Some((pending_baseline, _)) = self.pending_edit.take() {
             self.undo_stack.push(pending_baseline);
         }
+        // Editar no corta la reproducción: sigue desde donde iba, ya con
+        // el cambio, como en cualquier montador.
+        let resume = self.playback.as_ref().map(|playback| playback.rate).filter(|rate| *rate > 0);
         self.stop_playback();
         self.undo_stack.push(previous);
         while self.undo_stack.len() > 100 {
@@ -11202,10 +11645,18 @@ impl NovaCutWindows {
         self.redo_stack.clear();
         self.dirty = true;
         self.document_generation = self.document_generation.wrapping_add(1);
-        self.preview_texture = None;
         save_recovery(&self.project);
-        if self.ffmpeg_ready {
-            self.request_preview();
+        match resume {
+            Some(rate) if self.ffmpeg_ready && !self.project.clips.is_empty() => {
+                self.playhead = self.playhead.min(self.project.duration());
+                self.start_playback(rate);
+            }
+            _ => {
+                self.preview_texture = None;
+                if self.ffmpeg_ready {
+                    self.request_preview();
+                }
+            }
         }
     }
 
@@ -11217,8 +11668,15 @@ impl NovaCutWindows {
         if let Some(previous) = self.undo_stack.pop() {
             self.stop_playback();
             self.redo_stack.push(self.project.clone());
+            // Deshacer un ajuste no debe sacarte del clip que editabas:
+            // la selección solo se pierde si cambian los clips.
+            let same_clips = previous.clips.len() == self.project.clips.len();
             self.project = previous;
-            self.clear_selection();
+            if same_clips {
+                self.prune_selection();
+            } else {
+                self.clear_selection();
+            }
             self.playhead = self.playhead.min(self.project.duration());
             save_recovery(&self.project);
             self.status = "Deshacer".to_owned();
@@ -11234,8 +11692,15 @@ impl NovaCutWindows {
         if let Some(next) = self.redo_stack.pop() {
             self.stop_playback();
             self.undo_stack.push(self.project.clone());
+            // Deshacer un ajuste no debe sacarte del clip que editabas:
+            // la selección solo se pierde si cambian los clips.
+            let same_clips = next.clips.len() == self.project.clips.len();
             self.project = next;
-            self.clear_selection();
+            if same_clips {
+                self.prune_selection();
+            } else {
+                self.clear_selection();
+            }
             save_recovery(&self.project);
             self.status = "Rehacer".to_owned();
             self.refresh_dirty_from_saved();
@@ -11501,7 +11966,15 @@ impl eframe::App for NovaCutWindows {
             });
         let select_all_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A));
+        // Con un menú abierto, Esc es para cerrarlo (y no quita la selección):
+        // se deja sin consumir para que el menú lo vea.
+        let menu_open =
+            self.context_menu_clip.is_some() || context.memory(|memory| memory.any_popup_open());
+        if menu_open && context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            context.memory_mut(|memory| memory.close_popup());
+        }
         let deselect_key = keyboard_shortcuts
+            && !menu_open
             && context
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let split_all_key = keyboard_shortcuts
@@ -11909,7 +12382,7 @@ impl eframe::App for NovaCutWindows {
                     theme::bar_separator(ui);
 
                     // Medio
-                    if ui
+                    let import = ui
                         .add_enabled(
                             self.ffmpeg_ready,
                             egui::Button::new(
@@ -11927,9 +12400,9 @@ impl eframe::App for NovaCutWindows {
                             } else {
                                 "Añadir vídeos o audio al montaje"
                             },
-                        )
-                        .clicked()
-                    {
+                        );
+                    self.tutorial.marcar("importar", import.rect);
+                    if import.clicked() {
                         self.import_media();
                     }
                     if self.import_result.is_some() {
@@ -11951,6 +12424,13 @@ impl eframe::App for NovaCutWindows {
                         self.split_all_tracks();
                     }
                     let mut insert_action: Option<u8> = None;
+                    // El texto a la vista: solo estaba dentro de «+ Insertar».
+                    let texto = theme::bar_button(ui, "T Texto")
+                        .on_hover_text("Añade un texto en el cabezal: escríbelo en el Inspector y arrástralo en el monitor para colocarlo");
+                    self.tutorial.marcar("texto", texto.rect);
+                    if texto.clicked() {
+                        insert_action = Some(0);
+                    }
                     egui::menu::menu_custom_button(
                         ui,
                         egui::Button::new(egui::RichText::new("+ Insertar").size(11.0)),
@@ -12168,7 +12648,7 @@ impl eframe::App for NovaCutWindows {
                             self.hardware_encoding = !self.hardware_encoding;
                         }
                     }
-                    if ui
+                    let exportar = ui
                         .add_enabled(
                             self.ffmpeg_ready,
                             egui::Button::new(
@@ -12187,9 +12667,9 @@ impl eframe::App for NovaCutWindows {
                             )
                             .fill(theme::ACCENT)
                             .min_size(egui::vec2(0.0, 24.0)),
-                        ).on_hover_text("Abre la exportación: preajustes, calidad, destino y cola (Ctrl+M)").on_disabled_hover_text("Hace falta FFmpeg para exportar")
-                        .clicked()
-                    {
+                        ).on_hover_text("Abre la exportación: preajustes, calidad, destino y cola (Ctrl+M)").on_disabled_hover_text("Hace falta FFmpeg para exportar");
+                    self.tutorial.marcar("exportar", exportar.rect);
+                    if exportar.clicked() {
                         self.export();
                     }
                     let pending = self
@@ -12256,10 +12736,10 @@ impl eframe::App for NovaCutWindows {
                     })
                     .response
                     .on_hover_text("Tamaño de la interfaz (Ctrl+= / Ctrl+-)");
-                    if theme::bar_button(ui, "?")
-                        .on_hover_text("Atajos de teclado")
-                        .clicked()
-                    {
+                    let ayuda = theme::bar_button(ui, "?")
+                        .on_hover_text("Atajos de teclado y recorrido guiado");
+                    self.tutorial.marcar("ayuda", ayuda.rect);
+                    if ayuda.clicked() {
                         self.show_shortcuts = !self.show_shortcuts;
                     }
                     if theme::bar_button(ui, "🔍")
@@ -12282,6 +12762,18 @@ impl eframe::App for NovaCutWindows {
         self.show_queue_window(context);
         self.show_command_center(context);
         self.ventanas_mejoras(context);
+        // Primera visita: el recorrido sale solo una vez, cuando ya hay
+        // motor multimedia y ningún diálogo de recuperación delante.
+        if !self.tutorial_visto
+            && !self.tutorial.activo
+            && !self.tutorial.ofrecido
+            && self.ffmpeg_ready
+            && self.pending_recovery.is_none()
+        {
+            self.tutorial.ofrecido = true;
+            self.tutorial.empezar();
+        }
+        self.mostrar_tutorial(context);
 
         if self.monitor_fullscreen {
             self.show_fullscreen_monitor(context);
@@ -12459,6 +12951,7 @@ impl eframe::App for NovaCutWindows {
             .show(context, |ui| {
                 use media_browser::{Kind, Proxy, Sort};
                 theme::panel_header(ui, "Medios", None);
+                self.tutorial.marcar("medios", ui.max_rect());
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.media_view_project, true, "Proyecto")
                         .on_hover_text("Bins, medios y secuencias del proyecto, estén o no montados");
@@ -12583,10 +13076,11 @@ impl eframe::App for NovaCutWindows {
             )
             .show(context, |ui| {
                 self.side_tabs(ui);
+                self.tutorial.marcar("inspector", ui.max_rect());
                 // El contenido se adapta a la columna; nunca la ensancha.
                 ui.set_max_width(ui.available_width());
                 if self.bottom_tab != BottomTab::Inspector {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.bottom_tab {
                             BottomTab::Mixer => self.mixer_tab(ui, &mut metadata_changed),
@@ -12600,7 +13094,15 @@ impl eframe::App for NovaCutWindows {
                         });
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                // Sin auto_shrink el área mide lo que la columna, y lo que no
+                // quepa se desplaza: el contenido ya no ensancha el panel.
+                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                    // Deslizadores a la medida de la columna: con el ancho fijo
+                    // de egui, una fila de color (texto, valor, ↺, keyframes)
+                    // no cabía y el panel se ensanchaba al seleccionar un
+                    // vídeo, reescalando la línea de tiempo bajo el ratón.
+                    ui.spacing_mut().slider_width =
+                        (ui.available_width() - 200.0).clamp(48.0, 220.0);
                     let fps = self.project.fps;
                     self.batch_paste_dialog(context);
                     let selection_size = self.selected_indices().len();
@@ -12647,6 +13149,29 @@ impl eframe::App for NovaCutWindows {
                                 }),
                             ).on_hover_text("Activa o desactiva el clip sin borrarlo (D)")
                             .clicked();
+                        let sections: &[(&str, &str)] = if clip.title.is_some() {
+                            &[
+                                ("🎨 Color", "Color"),
+                                ("Aa Apariencia", "Apariencia"),
+                                ("⏱ Tiempo", "Tiempo"),
+                                ("◢ Fundidos", "Fundidos y transición"),
+                            ]
+                        } else if clip.has_video {
+                            &[
+                                ("🎨 Color", "Color"),
+                                ("⛶ Encuadre", "Transformación"),
+                                ("🔊 Audio", "Audio"),
+                                ("◢ Fundidos", "Fundidos y transición"),
+                                ("⏱ Tiempo", "Tiempo"),
+                            ]
+                        } else {
+                            &[
+                                ("🔊 Audio", "Audio"),
+                                ("◢ Fundidos", "Fundidos y transición"),
+                                ("⏱ Tiempo", "Tiempo"),
+                            ]
+                        };
+                        theme::section_jumps(ui, sections);
                         ui.separator();
                         if clip.nested.is_some() {
                             ui.colored_label(
@@ -14014,20 +14539,29 @@ impl eframe::App for NovaCutWindows {
                 let visible_tracks = (self.project.video_track_count()
                     + self.project.audio_track_count())
                 .clamp(2, 4) as f32;
-                // En pantallas estrechas las herramientas ocupan otra fila.
-                let tools_row = if ui.available_width() >= 800.0 {
+                // En pantallas estrechas las herramientas van en sus propias
+                // filas (unos 560 px de botones), partidas en vez de cortadas.
+                let width = ui.available_width();
+                let tools_row = if width >= TOOLS_INLINE_WIDTH {
                     0.0
                 } else {
-                    34.0
+                    (560.0 / width.max(200.0)).ceil() * 34.0
                 };
-                let timeline_reserve = 36.0 + tools_row + 20.0 + visible_tracks * 38.0 + 18.0;
-                let transport_reserve = 48.0;
+                // Con poco alto, la línea de ayuda cede su sitio al montaje.
+                self.timeline_hint_visible = ui.available_height() >= 420.0;
+                let hint_row = if self.timeline_hint_visible { 18.0 } else { 0.0 };
+                let timeline_reserve =
+                    36.0 + tools_row + 20.0 + visible_tracks * 38.0 + 18.0 + hint_row;
+                // Por debajo de 640 px el timecode va en su propia fila.
+                let transport_reserve = if width < 640.0 { 48.0 + 34.0 } else { 48.0 };
+                // El monitor puede quedarse en 72 px de alto: antes, con 120
+                // fijos, en 800×500 el montaje salía de la ventana.
                 let monitor_height = (ui.available_height() - timeline_reserve - transport_reserve)
                     .min(ui.available_height() * 0.6)
-                    .max(120.0);
+                    .max(72.0);
                 let monitor_width = (monitor_height * 16.0 / 9.0).min(ui.available_width());
                 let monitor_size = egui::vec2(monitor_width, monitor_width * 9.0 / 16.0);
-                ui.vertical_centered(|ui| {
+                let monitor_frame = ui.vertical_centered(|ui| {
                     egui::Frame::new()
                         .fill(egui::Color32::BLACK)
                         .corner_radius(6.0)
@@ -14040,6 +14574,7 @@ impl eframe::App for NovaCutWindows {
                             if let Some(texture) = &self.preview_texture {
                                 let image = ui.image((texture.id(), monitor_size));
                                 self.dibujar_guias(ui.painter(), image.rect);
+                                self.monitor_direct_edit(ui, image.rect);
                             } else {
                                 ui.centered_and_justified(|ui| {
                                     ui.label(
@@ -14051,8 +14586,11 @@ impl eframe::App for NovaCutWindows {
                                     );
                                 });
                             }
-                        });
+                        })
+                        .response
+                        .rect
                 });
+                self.tutorial.marcar("monitor", monitor_frame.inner);
                 // Transporte: timecode grande, paso a paso y marcas de trabajo,
                 // como el visor de la app macOS.
                 ui.add_space(6.0);
@@ -14156,6 +14694,12 @@ impl eframe::App for NovaCutWindows {
                                     {
                                         transport = Some(0);
                                     }
+                                    // Medidor en el hueco entre el timecode y
+                                    // los botones: un bloque aparte empujaba la
+                                    // timeline fuera de la ventana al reproducir.
+                                    if self.playback.is_some() {
+                                        self.transport_meter(ui);
+                                    }
                                 },
                             );
                         },
@@ -14180,36 +14724,6 @@ impl eframe::App for NovaCutWindows {
                     Some(8) => self.monitor_fullscreen = true,
                     _ => {}
                 }
-                if self.playback.is_some() {
-                    let meter_width = monitor_size.x.min(420.0);
-                    ui.vertical_centered(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.monospace("L");
-                            ui.add_sized(
-                                [meter_width, 10.0],
-                                egui::ProgressBar::new(self.meter_display.0)
-                                    .desired_height(10.0)
-                                    .show_percentage(),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.monospace("R");
-                            ui.add_sized(
-                                [meter_width, 10.0],
-                                egui::ProgressBar::new(self.meter_display.1)
-                                    .desired_height(10.0)
-                                    .show_percentage(),
-                            );
-                        });
-                        let peak = self.meter_display.0.max(self.meter_display.1);
-                        let db = if peak > 0.0001 {
-                            format!("{:.1} dBFS", 20.0 * peak.log10())
-                        } else {
-                            "-inf dBFS".to_owned()
-                        };
-                        ui.small(db);
-                    });
-                }
                 ui.add_space(12.0);
                 let timeline_extent = self.timeline_extent();
                 let video_tracks = self.project.video_track_count();
@@ -14223,12 +14737,12 @@ impl eframe::App for NovaCutWindows {
                 // izquierda, zoom a la derecha. Una sola fila si cabe; en
                 // pantallas estrechas las herramientas van en su propia fila
                 // en vez de solaparse con el zoom.
-                let tools_inline = ui.available_width() >= 800.0;
+                let tools_inline = ui.available_width() >= TOOLS_INLINE_WIDTH;
                 // Por debajo de ~620 px se quitan el recuento de pistas y
                 // «Ajustar» (queda en el menú Pistas y en Mayús+Z).
                 let compact_header = ui.available_width() < 620.0;
                 if !tools_inline {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         self.show_edit_toolbar(ui);
                     });
@@ -14358,6 +14872,11 @@ impl eframe::App for NovaCutWindows {
                             self.hscroll = 0.0;
                             ui.close_menu();
                         }
+                        if compact_header {
+                            ui.checkbox(&mut self.overwrite_on_drop, "Sobrescribir al soltar")
+                                .on_hover_text("Al soltar un clip encima de otro, recorta lo que haya debajo");
+                            ui.separator();
+                        }
                         if ui.button("Pistas más altas (Alt+↑)").clicked() {
                             self.track_height = (self.track_height * 1.2).min(180.0);
                         }
@@ -14377,11 +14896,14 @@ impl eframe::App for NovaCutWindows {
                             ui.close_menu();
                         }
                     }).response.on_hover_text("Cadencia, pistas nuevas, altura de pistas y ajuste a la ventana");
-                    ui.toggle_value(
-                        &mut self.overwrite_on_drop,
-                        egui::RichText::new("Sobrescribir").size(11.5),
-                    )
-                    .on_hover_text("Al soltar un clip encima de otro, recorta lo que haya debajo");
+                    // Estrecho: pasa al menú Pistas para no montarse con el zoom.
+                    if !compact_header {
+                        ui.toggle_value(
+                            &mut self.overwrite_on_drop,
+                            egui::RichText::new("Sobrescribir").size(11.5),
+                        )
+                        .on_hover_text("Al soltar un clip encima de otro, recorta lo que haya debajo");
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !compact_header
                             && ui
@@ -14426,7 +14948,27 @@ impl eframe::App for NovaCutWindows {
                         }
                     });
                 });
-                ui.add_space(4.0);
+                // Qué hace el ratón ahora mismo: lo que hay bajo el puntero
+                // en la timeline o, si no, la herramienta activa. Los iconos
+                // solos no decían nada a quien no conoce Premiere.
+                let hint = self.timeline_hint.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} {} ({}) · {}",
+                        self.edit_tool.icon(),
+                        self.edit_tool.label(),
+                        self.edit_tool.shortcut(),
+                        self.edit_tool.hint()
+                    )
+                });
+                if self.timeline_hint_visible {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(hint).size(11.5).color(theme::TEXT_DIM),
+                        )
+                        .truncate(),
+                    );
+                    ui.add_space(2.0);
+                }
                 // Con el montaje vacío se muestra una regla de diez segundos
                 // en lugar de una escala degenerada.
                 let scale_total = timeline_extent;
@@ -14458,6 +15000,7 @@ impl eframe::App for NovaCutWindows {
                     lane_rect.min,
                     egui::pos2(lane_rect.right(), lane_rect.top() + RULER_HEIGHT),
                 );
+                self.tutorial.marcar("timeline", timeline_rect);
                 let tracks_bottom = timeline_rect.bottom() - 4.0;
                 let painter = ui.painter().with_clip_rect(timeline_rect);
                 let pps = lane_rect.width().max(1.0) as f64 / view_seconds.max(0.001);
@@ -14806,8 +15349,9 @@ impl eframe::App for NovaCutWindows {
                     egui::pos2(lane_rect.left(), ruler_rect.bottom()),
                     egui::pos2(lane_rect.right(), timeline_rect.bottom()),
                 ));
-                const EDGE_GRAB: f32 = 6.0;
                 let mut timeline_drag = None;
+                let mut clip_hover_hint: Option<String> = None;
+                let mut alt_duplicate: Option<usize> = None;
                 let mut clip_command: Option<(usize, ClipCommand)> = None;
                 let mut clip_tool: Option<(usize, mejoras::Accion)> = None;
                 let mut tool_action: Option<TimelineToolAction> = None;
@@ -14828,6 +15372,95 @@ impl eframe::App for NovaCutWindows {
                     // Fuera de la vista: ni se dibuja ni se interactúa.
                     if rect.right() < lane_rect.left() || rect.left() > lane_rect.right() {
                         continue;
+                    }
+                    // Audio de un vídeo: se ve en su pista A (la que usa el
+                    // mezclador), enlazado. Antes no aparecía en ninguna
+                    // pista y parecía que el vídeo no tenía sonido.
+                    if clip.has_video
+                        && clip.has_audio
+                        && clip.title.is_none()
+                        && !clip.is_adjustment
+                        && clip.track < audio_tracks
+                    {
+                        let audio_row = audio_tracks - clip.track - 1;
+                        let audio_bottom = tracks_bottom - audio_row as f32 * row_height;
+                        let audio_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), audio_bottom - row_height + 3.0),
+                            egui::pos2(rect.right(), audio_bottom - 2.0),
+                        );
+                        let silent = clip.muted || !self.project.track_audible(clip.track);
+                        let selected_parent =
+                            self.selected == Some(index) || self.selection.contains(&index);
+                        lane_painter.rect_filled(
+                            audio_rect,
+                            4.0,
+                            egui::Color32::from_rgb(30, 74, 62)
+                                .gamma_multiply(if silent || !clip.enabled { 0.45 } else { 1.0 }),
+                        );
+                        if let Some(envelope) = self.waveforms.get(&clip.path) {
+                            if !envelope.is_empty() && audio_rect.height() > 10.0 {
+                                let mid = audio_rect.center().y;
+                                let amplitude = (audio_rect.height() / 2.0 - 3.0).max(1.0);
+                                let speed = clip.speed.clamp(0.1, 8.0);
+                                let wave = egui::Color32::from_rgb(150, 235, 200).gamma_multiply(0.6);
+                                let mut x = audio_rect.left().max(lane_rect.left());
+                                let end_x = audio_rect.right().min(lane_rect.right());
+                                while x < end_x {
+                                    let local = (x - audio_rect.left()) as f64 / pps;
+                                    let source = clip.in_seconds + local * speed;
+                                    let level = envelope
+                                        .get((source * ENVELOPE_RATE) as usize)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        .clamp(0.0, 1.0);
+                                    let half = amplitude * level;
+                                    if half > 0.4 {
+                                        lane_painter.line_segment(
+                                            [egui::pos2(x, mid - half), egui::pos2(x, mid + half)],
+                                            egui::Stroke::new(1.0_f32, wave),
+                                        );
+                                    }
+                                    x += 1.0;
+                                }
+                            }
+                        }
+                        lane_painter.rect_stroke(
+                            audio_rect,
+                            4.0,
+                            egui::Stroke::new(
+                                if selected_parent { 1.5_f32 } else { 1.0_f32 },
+                                if selected_parent {
+                                    theme::ACCENT
+                                } else {
+                                    egui::Color32::from_rgb(16, 18, 22)
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        if audio_rect.width() > 42.0 {
+                            lane_painter.text(
+                                egui::pos2(audio_rect.left() + 5.0, audio_rect.top() + 9.0),
+                                egui::Align2::LEFT_CENTER,
+                                format!("🔊 {}{}", clip.name(), if clip.muted { " (silenciado)" } else { "" }),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_white_alpha(200),
+                            );
+                        }
+                        let linked = ui
+                            .interact(
+                                audio_rect,
+                                ui.id().with(("timeline-linked-audio", index)),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_text(
+                                "Audio de este vídeo. Clic: selecciona el clip (volumen y efectos en el Inspector). Clic derecho › Separar audio para moverlo o recortarlo aparte.",
+                            );
+                        if linked.clicked() {
+                            timeline_drag = Some(TimelineDragEvent::Select(
+                                index,
+                                SelectionMode::from_modifiers(context.input(|input| input.modifiers)),
+                            ));
+                        }
                     }
                     let locked = self.project.clip_locked(clip);
                     let inactive = (clip.has_video && !self.project.track_visible(clip.track))
@@ -14850,27 +15483,6 @@ impl eframe::App for NovaCutWindows {
                         color = color.gamma_multiply(0.45);
                     }
                     lane_painter.rect_filled(rect, 4.0, color);
-                    lane_painter.rect_stroke(
-                        rect,
-                        4.0,
-                        egui::Stroke::new(
-                            if primary {
-                                2.0_f32
-                            } else if selected {
-                                1.5_f32
-                            } else {
-                                1.0_f32
-                            },
-                            if primary {
-                                egui::Color32::WHITE
-                            } else if selected {
-                                theme::ACCENT
-                            } else {
-                                egui::Color32::from_rgb(16, 18, 22)
-                            },
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
                     // Miniatura del clip cuando ya está generada.
                     let thumb = if clip.has_video && clip.title.is_none() {
                         self.thumbnails.get(&clip.path).map(|texture| texture.id())
@@ -15006,15 +15618,16 @@ impl eframe::App for NovaCutWindows {
                                 EditTool::Hand => egui::CursorIcon::Grab,
                                 EditTool::Zoom => egui::CursorIcon::ZoomIn,
                                 EditTool::Magic => egui::CursorIcon::PointingHand,
-                                EditTool::Select
-                                    if pointer.is_some_and(|position| {
-                                        (position.x - rect.left()).abs() <= EDGE_GRAB
-                                            || (rect.right() - position.x).abs() <= EDGE_GRAB
-                                    }) =>
-                                {
-                                    egui::CursorIcon::ResizeHorizontal
-                                }
-                                EditTool::Select => egui::CursorIcon::Grab,
+                                EditTool::Select => match clip_hit_zone(clip, rect, pps, pointer) {
+                                    Some(ClipZone::TrimStart | ClipZone::TrimEnd) => {
+                                        egui::CursorIcon::ResizeHorizontal
+                                    }
+                                    Some(ClipZone::FadeIn | ClipZone::FadeOut) => {
+                                        egui::CursorIcon::ResizeColumn
+                                    }
+                                    None if response.dragged() => egui::CursorIcon::Grabbing,
+                                    None => egui::CursorIcon::Grab,
+                                },
                             }
                         };
                         context.set_cursor_icon(cursor);
@@ -15039,7 +15652,12 @@ impl eframe::App for NovaCutWindows {
                     );
                     let mut command: Option<ClipCommand> = None;
                     let mut tool: Option<mejoras::Accion> = None;
+                    let mut menu_shown = false;
                     let menu = response.context_menu(|ui| {
+                        menu_shown = true;
+                        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                            ui.close_menu();
+                        }
                         ui.set_min_width(220.0);
                         ui.label(
                             egui::RichText::new(clip.name())
@@ -15162,7 +15780,7 @@ impl eframe::App for NovaCutWindows {
                     if let Some(accion) = tool {
                         clip_tool = Some((index, accion));
                     }
-                    if menu.is_some() {
+                    if menu.is_some() || menu_shown {
                         open_menu = Some(index);
                     }
                     if locked && rect.width() > 24.0 {
@@ -15214,7 +15832,13 @@ impl eframe::App for NovaCutWindows {
                                 Some(TimelineToolAction::Zoom(pointer_time(pointer.x), factor));
                         }
                     } else if response.drag_started() {
-                        let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
+                        // El gesto se decide donde se pulsó: egui confirma el
+                        // arrastre unos píxeles después, y con esa posición
+                        // un recorte desde el borde acababa moviendo el clip.
+                        let pointer = context
+                            .input(|input| input.pointer.press_origin())
+                            .or_else(|| response.interact_pointer_pos())
+                            .unwrap_or(rect.center());
                         let kind = if self.edit_tool == EditTool::Trim {
                             if pointer.x < rect.center().x {
                                 DragKind::TrimStart
@@ -15247,20 +15871,34 @@ impl eframe::App for NovaCutWindows {
                             DragKind::Slide {
                                 grab: pointer_time(pointer.x),
                             }
-                        } else if (pointer.x - rect.left()).abs() <= EDGE_GRAB {
-                            DragKind::TrimStart
-                        } else if (rect.right() - pointer.x).abs() <= EDGE_GRAB {
-                            DragKind::TrimEnd
                         } else {
-                            DragKind::Move
+                            match clip_hit_zone(clip, rect, pps, Some(pointer)) {
+                                Some(ClipZone::TrimStart) => DragKind::TrimStart,
+                                Some(ClipZone::TrimEnd) => DragKind::TrimEnd,
+                                Some(ClipZone::FadeIn) => DragKind::FadeIn,
+                                Some(ClipZone::FadeOut) => DragKind::FadeOut,
+                                None => DragKind::Move,
+                            }
                         };
                         if matches!(kind, DragKind::Slip { grab } if grab.is_nan()) {
                             self.status =
                                 "Rodar necesita otro clip pegado a ese borde en la misma pista"
                                     .to_owned();
                         } else {
-                            self.drag_edit = Some((index, kind, self.project.clone()));
+                            let baseline = self.project.clone();
+                            // Alt+arrastre: deja una copia en su sitio y te
+                            // llevas el clip, como en Premiere y Resolve.
+                            if kind == DragKind::Move && modifiers.alt {
+                                alt_duplicate = Some(index);
+                            }
+                            self.drag_edit = Some((index, kind, baseline));
+                            // El imán usa el cabezal de antes del gesto: al
+                            // recortar, el cabezal sigue al borde.
+                            self.drag_playhead = self.playhead;
+                            self.drag_row_height = 0.0;
                         }
+                        // Lo que se toca se edita: el Inspector muestra sus ajustes.
+                        self.bottom_tab = BottomTab::Inspector;
                         // Arrastrar un clip no seleccionado pasa a moverlo solo
                         // a él; si ya estaba en la selección, se mueve el grupo.
                         if !self.selection.contains(&index) {
@@ -15281,20 +15919,37 @@ impl eframe::App for NovaCutWindows {
                             let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
                             match *kind {
                                 DragKind::Move => {
-                                    let target_row = (((tracks_bottom - pointer.y) / row_height)
-                                        .floor()
-                                        .max(0.0)
-                                        as usize)
-                                        .min(track_count - 1);
+                                    // Filas desplazadas desde donde se pulsó, con
+                                    // la altura de fila del inicio del gesto: al
+                                    // crearse una pista nueva la geometría cambia
+                                    // y el destino oscilaba entre pistas. Subir
+                                    // por encima de la última pista de vídeo (o
+                                    // bajar de la última de audio) crea otra.
+                                    let origin_y = context
+                                        .input(|input| input.pointer.press_origin())
+                                        .map_or(pointer.y, |origin| origin.y);
+                                    if self.drag_row_height <= 0.0 {
+                                        self.drag_row_height = row_height;
+                                    }
+                                    let rows = ((origin_y - pointer.y) / self.drag_row_height)
+                                        .round() as isize;
+                                    let start_track = self
+                                        .drag_edit
+                                        .as_ref()
+                                        .and_then(|state| state.2.clips.get(index))
+                                        .map_or(clip.track, |original| original.track)
+                                        as isize;
                                     let target_track = if clip.has_video {
-                                        target_row.saturating_sub(audio_tracks).min(15)
-                                    } else if target_row < audio_tracks {
-                                        audio_tracks - target_row - 1
+                                        (start_track + rows).clamp(0, video_tracks.min(15) as isize)
                                     } else {
-                                        0
-                                    };
-                                    let delta =
-                                        context.input(|input| input.pointer.delta().x) as f64 / pps;
+                                        (start_track - rows).clamp(0, audio_tracks.min(15) as isize)
+                                    } as usize;
+                                    // Desde donde se pulsó, no desde el umbral
+                                    // de arrastre: el clip va pegado al cursor.
+                                    let origin = context
+                                        .input(|input| input.pointer.press_origin())
+                                        .unwrap_or(pointer);
+                                    let delta = (pointer.x - origin.x) as f64 / pps;
                                     timeline_drag =
                                         Some(TimelineDragEvent::Move(index, delta, target_track));
                                 }
@@ -15309,6 +15964,16 @@ impl eframe::App for NovaCutWindows {
                                         index,
                                         pointer_time(pointer.x),
                                     ));
+                                }
+                                DragKind::FadeIn => {
+                                    let seconds = (pointer.x - rect.left()).max(0.0) as f64 / pps;
+                                    timeline_drag =
+                                        Some(TimelineDragEvent::Fade(index, true, seconds));
+                                }
+                                DragKind::FadeOut => {
+                                    let seconds = (rect.right() - pointer.x).max(0.0) as f64 / pps;
+                                    timeline_drag =
+                                        Some(TimelineDragEvent::Fade(index, false, seconds));
                                 }
                                 DragKind::Roll { .. }
                                 | DragKind::Slip { .. }
@@ -15408,6 +16073,141 @@ impl eframe::App for NovaCutWindows {
                             );
                         }
                     }
+                    // Rampas de fundido: la esquina oscurecida dice cuánto
+                    // dura sin abrir el Inspector.
+                    let (fade_in_px, fade_out_px) = clip_fade_px(clip, rect, pps);
+                    for (corner, inner, outer) in [
+                        (rect.left_bottom(), rect.left() + fade_in_px, rect.left_top()),
+                        (rect.right_bottom(), rect.right() - fade_out_px, rect.right_top()),
+                    ] {
+                        if (inner - corner.x).abs() < 1.0 {
+                            continue;
+                        }
+                        let apex = egui::pos2(inner, rect.top());
+                        lane_painter.add(egui::Shape::convex_polygon(
+                            vec![corner, outer, apex],
+                            egui::Color32::from_black_alpha(120),
+                            egui::Stroke::NONE,
+                        ));
+                        lane_painter.line_segment(
+                            [corner, apex],
+                            egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                        );
+                    }
+                    // Borde al final: pintado antes, la miniatura lo tapaba y
+                    // no se veía qué clip estaba seleccionado.
+                    lane_painter.rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(
+                            if primary {
+                                2.5_f32
+                            } else if selected {
+                                2.0_f32
+                            } else {
+                                1.0_f32
+                            },
+                            if primary {
+                                egui::Color32::WHITE
+                            } else if selected {
+                                theme::ACCENT
+                            } else {
+                                egui::Color32::from_rgb(16, 18, 22)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    // Tiradores visibles: bordes para recortar y esquinas
+                    // superiores para los fundidos. Antes solo cambiaba el
+                    // cursor en una franja de 6 px y nadie los encontraba.
+                    if self.edit_tool == EditTool::Select
+                        && !locked
+                        && (response.hovered() || selected)
+                        && rect.width() > 24.0
+                    {
+                        let pointer = context.input(|input| input.pointer.hover_pos());
+                        let zone = clip_hit_zone(clip, rect, pps, pointer);
+                        let edge = clip_edge_grab(rect);
+                        for (handle, active) in [
+                            (
+                                egui::Rect::from_min_max(
+                                    rect.left_top() + egui::vec2(1.0, 3.0),
+                                    egui::pos2(rect.left() + edge.min(6.0), rect.bottom() - 3.0),
+                                ),
+                                zone == Some(ClipZone::TrimStart),
+                            ),
+                            (
+                                egui::Rect::from_min_max(
+                                    egui::pos2(rect.right() - edge.min(6.0), rect.top() + 3.0),
+                                    rect.right_bottom() - egui::vec2(1.0, 3.0),
+                                ),
+                                zone == Some(ClipZone::TrimEnd),
+                            ),
+                        ] {
+                            lane_painter.rect_filled(
+                                handle,
+                                2.0,
+                                if active {
+                                    theme::ACCENT
+                                } else {
+                                    egui::Color32::from_white_alpha(200)
+                                },
+                            );
+                        }
+                        if rect.height() >= 18.0 {
+                            for (center, active) in [
+                                (
+                                    fade_handle_center(rect, fade_in_px, true),
+                                    zone == Some(ClipZone::FadeIn),
+                                ),
+                                (
+                                    fade_handle_center(rect, fade_out_px, false),
+                                    zone == Some(ClipZone::FadeOut),
+                                ),
+                            ] {
+                                lane_painter.circle(
+                                    center,
+                                    if active { 5.5 } else { 4.5 },
+                                    if active {
+                                        theme::ACCENT
+                                    } else {
+                                        egui::Color32::WHITE
+                                    },
+                                    egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(180)),
+                                );
+                            }
+                        }
+                        if response.hovered() {
+                            let hint = match zone {
+                                Some(ClipZone::TrimStart) => {
+                                    "Arrastra para recortar el principio".to_owned()
+                                }
+                                Some(ClipZone::TrimEnd) => "Arrastra para recortar el final".to_owned(),
+                                Some(ClipZone::FadeIn) => format!(
+                                    "Fundido de entrada: {:.2} s · arrastra para ajustarlo",
+                                    clip.fade_in_seconds
+                                ),
+                                Some(ClipZone::FadeOut) => format!(
+                                    "Fundido de salida: {:.2} s · arrastra para ajustarlo",
+                                    clip.fade_out_seconds
+                                ),
+                                None => "Clic: sus ajustes en el Inspector · arrastra para moverlo · bordes: recortar · círculos: fundidos · clic derecho: más opciones".to_owned(),
+                            };
+                            clip_hover_hint = Some(hint);
+                        }
+                    }
+                }
+                if let Some(index) = alt_duplicate {
+                    let group = self.selected_indices();
+                    let group = if group.contains(&index) { group } else { vec![index] };
+                    let copies: Vec<RoughClip> =
+                        group.iter().map(|other| self.project.clips[*other].clone()).collect();
+                    self.project.clips.extend(copies);
+                    self.status = "Duplicando: suelta la copia donde quieras".to_owned();
+                }
+                if self.timeline_hint != clip_hover_hint {
+                    self.timeline_hint = clip_hover_hint;
+                    context.request_repaint();
                 }
                 if let Some(pointer) = context.input(|input| input.pointer.hover_pos()) {
                     if lanes_area.contains(pointer)
@@ -15456,6 +16256,12 @@ impl eframe::App for NovaCutWindows {
                             (self.project.clips.get(*index), baseline.clips.get(*index))
                         {
                             let message = match kind {
+                                DragKind::FadeIn => {
+                                    format!("Fundido de entrada {:.2} s", current.fade_in_seconds)
+                                }
+                                DragKind::FadeOut => {
+                                    format!("Fundido de salida {:.2} s", current.fade_out_seconds)
+                                }
                                 DragKind::Move => format!(
                                     "Δ {:+.2} s  ·  {}{}",
                                     current.timeline_start - original.timeline_start,
@@ -15748,10 +16554,26 @@ impl eframe::App for NovaCutWindows {
                     }
                 } else if self.edit_tool != EditTool::Hand {
                     if let Some(pointer) = ruler_response.interact_pointer_pos() {
-                        self.stop_playback();
-                        self.playhead = pointer_time(pointer.x);
-                        if ruler_response.drag_stopped() || ruler_response.clicked() {
+                        // Reproduciendo: se para mientras se arrastra y sigue
+                        // desde el punto nuevo al soltar.
+                        if let Some(playback) = &self.playback {
+                            self.scrub_resume = Some(playback.rate.max(1));
+                            self.stop_playback();
+                        }
+                        let time = pointer_time(pointer.x);
+                        // El monitor sigue al cabezal mientras se arrastra
+                        // (las peticiones se encadenan, no se acumulan).
+                        if (time - self.playhead).abs() > 1e-6
+                            || ruler_response.clicked()
+                            || ruler_response.drag_stopped()
+                        {
+                            self.playhead = time;
                             self.request_preview();
+                        }
+                        if ruler_response.drag_stopped() || ruler_response.clicked() {
+                            if let Some(rate) = self.scrub_resume.take() {
+                                self.start_playback(rate);
+                            }
                         }
                     }
                 }
@@ -15773,7 +16595,41 @@ impl eframe::App for NovaCutWindows {
                 }
                 // Caja de selección: arrastrar sobre el fondo marca todos los
                 // clips que quedan dentro del rectángulo.
-                if self.edit_tool == EditTool::Select && lane_background.drag_started() {
+                // La línea del cabezal se agarra en cualquier pista, no solo
+                // en la regla: arrastrarla cerca (±6 px) hace scrub.
+                let playhead_x = to_x(self.playhead);
+                let near_playhead = |pos: Option<egui::Pos2>| {
+                    pos.is_some_and(|pos| (pos.x - playhead_x).abs() <= 6.0)
+                };
+                if lane_background.hovered()
+                    && near_playhead(context.input(|input| input.pointer.hover_pos()))
+                {
+                    context.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if lane_background.drag_started()
+                    && near_playhead(context.input(|input| input.pointer.press_origin()))
+                {
+                    self.lane_scrub = true;
+                    if let Some(playback) = &self.playback {
+                        self.scrub_resume = Some(playback.rate.max(1));
+                        self.stop_playback();
+                    }
+                }
+                if self.lane_scrub {
+                    if let Some(pointer) = lane_background.interact_pointer_pos() {
+                        let time = pointer_time(pointer.x);
+                        if (time - self.playhead).abs() > 1e-6 {
+                            self.playhead = time;
+                            self.request_preview();
+                        }
+                    }
+                    if lane_background.drag_stopped() || !lane_background.dragged() {
+                        self.lane_scrub = false;
+                        if let Some(rate) = self.scrub_resume.take() {
+                            self.start_playback(rate);
+                        }
+                    }
+                } else if self.edit_tool == EditTool::Select && lane_background.drag_started() {
                     self.marquee_origin = lane_background.interact_pointer_pos();
                 }
                 if self.edit_tool == EditTool::Select {
@@ -15818,8 +16674,19 @@ impl eframe::App for NovaCutWindows {
                                 format!("{} clip(s) seleccionado(s)", self.selection.len());
                         }
                     }
+                    // Clic en vacío: quita la selección y lleva el cabezal
+                    // ahí, como en CapCut o Resolve.
                     if lane_background.clicked() {
                         self.clear_selection();
+                        if let Some(pointer) = lane_background.interact_pointer_pos() {
+                            let resume = self.playback.as_ref().map(|playback| playback.rate.max(1));
+                            self.stop_playback();
+                            self.playhead = pointer_time(pointer.x);
+                            match resume {
+                                Some(rate) => self.start_playback(rate),
+                                None => self.request_preview(),
+                            }
+                        }
                     }
                 } else if self.edit_tool == EditTool::Zoom && lane_background.clicked() {
                     if let Some(pointer) = lane_background.interact_pointer_pos() {
@@ -18406,6 +19273,12 @@ mod theme {
         let height = 18.0;
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        // Salto pedido desde los accesos de arriba del Inspector.
+        let jump = egui::Id::new("inspector-jump");
+        if ui.ctx().data(|data| data.get_temp::<String>(jump)).as_deref() == Some(title) {
+            ui.ctx().data_mut(|data| data.remove::<String>(jump));
+            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+        }
         let painter = ui.painter();
         painter.rect_filled(
             egui::Rect::from_min_size(
@@ -18434,6 +19307,27 @@ mod theme {
             );
         }
         ui.add_space(4.0);
+    }
+
+    /// Accesos a los apartados del Inspector: cada botón salta a su
+    /// sección. Con todo en una columna larga, el color quedaba tan abajo
+    /// que parecía que la app no tenía.
+    pub fn section_jumps(ui: &mut Ui, sections: &[(&str, &str)]) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            ui.label(egui::RichText::new("Ir a:").size(11.5).color(TEXT_FAINT));
+            for (label, section) in sections {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(*label).size(11.5)).fill(CARD))
+                    .on_hover_text(format!("Salta al apartado {}", section.to_uppercase()))
+                    .clicked()
+                {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(egui::Id::new("inspector-jump"), section.to_string())
+                    });
+                }
+            }
+        });
     }
 
     /// Punto de estado del documento: naranja si hay cambios sin guardar,
@@ -19991,6 +20885,34 @@ mod tests {
         assert_eq!(next_shuttle_rate(Some(-8), true), 1);
         assert_eq!(atempo_chain(1), "");
         assert_eq!(atempo_chain(4), ",atempo=2,atempo=2");
+    }
+
+    #[test]
+    fn titles_go_above_what_is_on_screen_without_overlapping() {
+        let video = |track: usize, start: f64| RoughClip {
+            track,
+            timeline_start: start,
+            out_seconds: 10.0,
+            ..Default::default()
+        };
+        // Un clip en V1: el texto va a V2, no encima del clip en V1.
+        assert_eq!(track_above(&[video(0, 0.0)], 2.0, 7.0), 1);
+        // V2 ocupado en ese tramo: sube a V3.
+        assert_eq!(track_above(&[video(0, 0.0), video(1, 3.0)], 2.0, 7.0), 2);
+        // Nada debajo: V1.
+        assert_eq!(track_above(&[video(0, 20.0)], 2.0, 7.0), 0);
+    }
+
+    #[test]
+    fn audio_clock_accumulates_finished_chunks() {
+        // Recién arrancado: suena el primer trozo.
+        assert!((audio_clock(20, 20, 0.02) - 0.02).abs() < 1e-9);
+        // Diez trozos de 50 ms terminados y 30 ms del undécimo: 0,53 s.
+        assert!((audio_clock(30, 20, 0.03) - 0.53).abs() < 1e-9);
+        // Todo sonado y la cola vacía: lo añadido entero.
+        assert!((audio_clock(200, 0, 0.0) - 10.0).abs() < 1e-9);
+        // Carrera entre append y el contador: nunca negativo.
+        assert!(audio_clock(3, 4, 0.0) >= 0.0);
     }
 
     #[test]
