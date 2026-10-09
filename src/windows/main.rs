@@ -15568,7 +15568,28 @@ impl eframe::App for NovaCutWindows {
                 let mut clip_tool: Option<(usize, mejoras::Accion)> = None;
                 let mut tool_action: Option<TimelineToolAction> = None;
                 let mut open_menu: Option<usize> = None;
-                for (index, clip) in self.project.clips.iter().enumerate() {
+                // Lo que se arrastra se pinta al final, encima del resto: en
+                // orden de índice quedaba oculto bajo los clips que pisaba
+                // (y con Alt, bajo sus propias copias).
+                let dragging: std::collections::BTreeSet<usize> = match &self.drag_edit {
+                    Some((active, DragKind::Move, _)) => {
+                        let mut group: std::collections::BTreeSet<usize> =
+                            if self.selection.contains(active) {
+                                self.selection.clone()
+                            } else {
+                                Default::default()
+                            };
+                        group.insert(*active);
+                        group
+                    }
+                    _ => Default::default(),
+                };
+                let draw_order: Vec<usize> = (0..self.project.clips.len())
+                    .filter(|index| !dragging.contains(index))
+                    .chain(dragging.iter().copied().filter(|index| *index < self.project.clips.len()))
+                    .collect();
+                for index in draw_order {
+                    let clip = &self.project.clips[index];
                     let left = to_x(clip.timeline_start);
                     let right = to_x(clip.timeline_start + clip.duration());
                     let row = if clip.has_video {
