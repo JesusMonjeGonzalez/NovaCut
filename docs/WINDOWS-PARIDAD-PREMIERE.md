@@ -269,5 +269,9 @@ Pendiente de UX:
    `texto_animado.rs`): máquina de escribir, aparecer/subir por letras,
    aparecer por palabras y salida en ola; caja y mate entran con el texto.
    Plantillas en «+ Insertar › Plantillas animadas». Sigue sin leerse .mogrt.
-5. **Render en segundo plano de la timeline** (barra roja/amarilla/verde) para
-   reproducir en tiempo real efectos pesados como el flujo óptico.
+5. ~~**Render en segundo plano de la timeline**~~ (9 oct 2026,
+   `render_fondo.rs`): tramos entre cortes con barra roja (pesado),
+   amarilla (efectos, títulos, capas) o verde (renderizado); caché por firma
+   del contenido, así que editar otra parte o desplazar no invalida nada.
+   Manual («Renderizar lo rojo y amarillo») o automático tras 3 s sin editar
+   (desactivado por defecto; prioridad baja y respeta «Cuidar el equipo»).

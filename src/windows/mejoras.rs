@@ -18,6 +18,7 @@
 //! y cubierta por las pruebas del final.
 
 use super::*;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,7 @@ pub(super) enum Accion {
     ExportarFcpxml,
     DividirSubtitulos,
     RenderizarRango,
+    RenderAutomatico,
     ExportarStems,
     SuavizarAnimacion,
     MejoraDeVoz,
@@ -69,7 +71,8 @@ pub(super) enum Accion {
 }
 
 impl Accion {
-    pub(super) const TODAS: [Accion; 29] = [
+    pub(super) const TODAS: [Accion; 30] = [
+        Accion::RenderAutomatico,
         Accion::VisorMulticamara,
         Accion::ImportarFcpxml,
         Accion::SuavizarAnimacion,
@@ -126,7 +129,8 @@ impl Accion {
             Accion::ExportarTranscripcion => "Exportar transcripción en texto…",
             Accion::ExportarFcpxml => "Exportar FCPXML (Final Cut, Resolve)…",
             Accion::DividirSubtitulos => "Partir subtítulos largos",
-            Accion::RenderizarRango => "Renderizar previsualización (I-O o todo)",
+            Accion::RenderizarRango => "Renderizar lo rojo y amarillo (I-O o todo)",
+            Accion::RenderAutomatico => "Render automático en segundo plano",
             Accion::ExportarStems => "Exportar stems de audio por pista…",
             Accion::SuavizarAnimacion => "Suavizar animación (entrada y salida lentas)",
             Accion::MejoraDeVoz => "Mejora de voz con IA (RNNoise)",
@@ -157,7 +161,8 @@ impl Accion {
             Accion::ExportarTranscripcion => "Guarda la transcripción como texto por párrafos con marcas de tiempo, para notas del episodio o un blog",
             Accion::ExportarFcpxml => "Intercambio con Final Cut Pro y DaVinci Resolve: pistas, cortes y medios; avisa de lo que el formato no lleva",
             Accion::DividirSubtitulos => "Parte los subtítulos de más de dos líneas de 42 caracteres en varios, repartiendo el tiempo",
-            Accion::RenderizarRango => "Compone en segundo plano el rango I-O (o todo el montaje) para reproducirlo en tiempo real aunque lleve efectos pesados; la barra verde de la regla marca lo renderizado y cualquier cambio la invalida",
+            Accion::RenderizarRango => "Compone en segundo plano los tramos con efectos del rango I-O (o de todo el montaje) para reproducirlos en tiempo real. En la regla: rojo pesado, amarillo con efectos, verde ya renderizado. Editar un tramo solo invalida ese tramo",
+            Accion::RenderAutomatico => "Tras unos segundos sin editar, renderiza solo los tramos rojos y amarillos, de uno en uno y a prioridad baja (con «Cuidar el equipo», con la mitad de núcleos). Desactivado por defecto",
             Accion::ExportarStems => "Un WAV por pista de audio, alineados desde el segundo 0, con la ganancia de cada pista y sin máster: para mezclar en Pro Tools, Reaper o Audition",
             Accion::SuavizarAnimacion => "Convierte los keyframes lineales de los clips seleccionados (posición, escala, opacidad, color, efectos y volumen) en curvas que arrancan y frenan con suavidad, como el «Ease In/Ease Out» de Premiere",
             Accion::MejoraDeVoz => "«Limpieza de voz» (Sonido esencial) usa RNNoise, una red muy ligera que va en tiempo real en cualquier equipo, con el modelo incluido para voz grabada; un .rnnn propio en %LOCALAPPDATA%\\NovaCut\\Modelos tiene prioridad",
@@ -169,7 +174,7 @@ impl Accion {
 
 /// Grupos del menú Herramientas, en el orden en que se usan al montar.
 const GRUPOS: &[(&str, &[Accion])] = &[
-    ("Reproducción", &[Accion::RenderizarRango]),
+    ("Reproducción", &[Accion::RenderizarRango, Accion::RenderAutomatico]),
     (
         "Montaje",
         &[
@@ -231,8 +236,16 @@ pub(super) struct Estado {
     grabacion: Option<Grabacion>,
     /// Texto que se copia al portapapeles en el siguiente fotograma.
     portapapeles: Option<String>,
-    /// Último render de previsualización terminado.
-    cache: Option<CacheRender>,
+    /// Tramos ya renderizados, por la firma de su contenido.
+    renders: std::collections::HashMap<u64, PathBuf>,
+    /// Tramos del montaje y la clave con la que se calcularon.
+    tramos: Option<(ClaveRender, Vec<render_fondo::Tramo>)>,
+    /// Firmas pendientes de «Renderizar lo rojo y amarillo».
+    cola_render: Vec<u64>,
+    /// Renderizar solo al dejar de editar.
+    pub(super) render_auto: bool,
+    /// Generación del documento y cuándo cambió por última vez.
+    ultimo_cambio: Option<(u64, Instant)>,
     /// Render de previsualización en marcha.
     render: Option<RenderEnCurso>,
     /// Tamaño de exportación con el que se compuso el monitor por última vez.
@@ -274,7 +287,11 @@ impl Default for Estado {
             trabajo: None,
             grabacion: None,
             portapapeles: None,
-            cache: None,
+            renders: std::collections::HashMap::new(),
+            tramos: None,
+            cola_render: Vec::new(),
+            render_auto: false,
+            ultimo_cambio: None,
             render: None,
             ultimo_tamano: None,
             propuesta: None,
@@ -307,7 +324,7 @@ struct CacheRender {
     archivo: PathBuf,
     inicio: f64,
     fin: f64,
-    clave: ClaveRender,
+    firma: u64,
 }
 
 struct RenderEnCurso {
@@ -439,6 +456,10 @@ impl NovaCutWindows {
             Accion::RenderizarRango if self.mejoras.render.is_some() => {
                 "Cancelar el render de previsualización".to_owned()
             }
+            Accion::RenderAutomatico => format!(
+                "Render automático: {}",
+                if self.mejoras.render_auto { "activado" } else { "desactivado" }
+            ),
             Accion::VisorMulticamara if self.mejoras.multicam => {
                 "Cerrar el visor multicámara".to_owned()
             }
@@ -501,6 +522,7 @@ impl NovaCutWindows {
             Accion::GrabarVoz => (!self.ffmpeg_ready).then_some("Hace falta FFmpeg"),
             Accion::EnlaceAv | Accion::Guias => None,
             Accion::RenderizarRango if self.mejoras.render.is_some() => None,
+            Accion::RenderAutomatico => (!self.ffmpeg_ready).then_some("Hace falta FFmpeg"),
             Accion::RenderizarRango => {
                 if !self.ffmpeg_ready {
                     Some("Hace falta FFmpeg")
@@ -572,10 +594,19 @@ impl NovaCutWindows {
             Accion::RenderizarRango => {
                 if let Some(render) = &self.mejoras.render {
                     render.cancelar.store(true, Ordering::Relaxed);
+                    self.mejoras.cola_render.clear();
                     self.status = "Cancelando el render de previsualización…".to_owned();
                 } else {
-                    self.empezar_render_previsualizacion();
+                    self.encolar_render_del_rango();
                 }
+            }
+            Accion::RenderAutomatico => {
+                self.mejoras.render_auto = !self.mejoras.render_auto;
+                self.status = if self.mejoras.render_auto {
+                    "Render automático activado: los tramos rojos y amarillos se renderizan al dejar de editar".to_owned()
+                } else {
+                    "Render automático desactivado".to_owned()
+                };
             }
             Accion::ExportarStems => self.exportar_stems(),
             Accion::SuavizarAnimacion => self.suavizar_animacion(),
@@ -1096,50 +1127,105 @@ impl NovaCutWindows {
         }
     }
 
-    /// El render terminado, si sigue describiendo el montaje tal como está.
-    fn cache_vigente(&self) -> Option<&CacheRender> {
-        self.mejoras
-            .cache
-            .as_ref()
-            .filter(|cache| cache.clave == self.clave_render() && self.pending_edit.is_none())
-    }
-
-    /// Clips que reproduce el monitor: los del montaje, con el tramo ya
-    /// renderizado sustituido por su archivo si el render sigue vigente.
-    pub(super) fn clips_para_reproducir(&self) -> Vec<RoughClip> {
-        let clips = self.effective_clips();
-        match self.cache_vigente() {
-            Some(cache) if cache.archivo.is_file() => {
-                sustituir_por_render(&clips, cache).unwrap_or(clips)
-            }
-            _ => clips,
-        }
-    }
-
-    fn empezar_render_previsualizacion(&mut self) {
-        let (inicio, fin) = self
-            .work_range()
-            .unwrap_or((0.0, self.project.duration()));
-        if fin - inicio < montaje::MIN_CLIP {
-            self.status = "El rango a renderizar está vacío".to_owned();
+    /// Tramos del montaje actual; se recalculan solo si cambia algo.
+    fn actualizar_tramos(&mut self) {
+        let clave = self.clave_render();
+        if self.mejoras.tramos.as_ref().is_some_and(|(vigente, _)| *vigente == clave) {
             return;
         }
+        // Lienzo, subtítulos y mezcla entran en la firma de cada tramo.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        clave.lienzo.hash(&mut hasher);
+        clave.subtitulos.hash(&mut hasher);
+        serde_json::to_string(&self.project.track_gains).unwrap_or_default().hash(&mut hasher);
+        let tramos = render_fondo::tramos(&self.effective_clips(), hasher.finish());
+        self.mejoras.tramos = Some((clave, tramos));
+    }
+
+    /// Tramos vigentes (o nada si el montaje cambió y aún no se recalcularon).
+    fn tramos_vigentes(&self) -> &[render_fondo::Tramo] {
+        match &self.mejoras.tramos {
+            Some((clave, tramos)) if *clave == self.clave_render() && self.pending_edit.is_none() => tramos,
+            _ => &[],
+        }
+    }
+
+    /// Clips que reproduce el monitor: los del montaje con cada tramo ya
+    /// renderizado sustituido por su archivo.
+    pub(super) fn clips_para_reproducir(&self) -> Vec<RoughClip> {
+        let mut clips = self.effective_clips();
+        for tramo in self.tramos_vigentes() {
+            let Some(archivo) = self.mejoras.renders.get(&tramo.firma).filter(|archivo| archivo.is_file()) else {
+                continue;
+            };
+            let cache = CacheRender {
+                archivo: archivo.clone(),
+                inicio: tramo.inicio,
+                fin: tramo.fin,
+                firma: tramo.firma,
+            };
+            if let Some(sustituidos) = sustituir_por_render(&clips, &cache) {
+                clips = sustituidos;
+            }
+        }
+        clips
+    }
+
+    /// Pone en cola los tramos rojos y amarillos sin renderizar del rango
+    /// I-O (o de todo el montaje) y empieza por el primero.
+    fn encolar_render_del_rango(&mut self) {
+        self.actualizar_tramos();
+        let (inicio, fin) = self.work_range().unwrap_or((0.0, self.project.duration()));
+        let pendientes: Vec<u64> = self
+            .tramos_vigentes()
+            .iter()
+            .filter(|tramo| tramo.coste != render_fondo::Coste::Ligero)
+            .filter(|tramo| tramo.fin > inicio + 1e-6 && tramo.inicio < fin - 1e-6)
+            .filter(|tramo| !self.mejoras.renders.get(&tramo.firma).is_some_and(|archivo| archivo.is_file()))
+            .map(|tramo| tramo.firma)
+            .collect();
+        if pendientes.is_empty() {
+            self.status = "No hay tramos que renderizar: lo que hay se reproduce ya en tiempo real".to_owned();
+            return;
+        }
+        self.status = format!("Renderizando {} tramo(s) en segundo plano…", pendientes.len());
+        self.mejoras.cola_render = pendientes;
+        self.siguiente_render();
+    }
+
+    /// Lanza el siguiente tramo de la cola (o, en automático, el siguiente
+    /// pendiente). Un solo render a la vez.
+    fn siguiente_render(&mut self) {
+        if self.mejoras.render.is_some() {
+            return;
+        }
+        while let Some(firma) = (!self.mejoras.cola_render.is_empty()).then(|| self.mejoras.cola_render.remove(0)) {
+            if let Some(tramo) = self.tramos_vigentes().iter().find(|tramo| tramo.firma == firma).cloned() {
+                if !self.mejoras.renders.get(&firma).is_some_and(|archivo| archivo.is_file()) {
+                    self.empezar_render_de_tramo(&tramo);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn empezar_render_de_tramo(&mut self, tramo: &render_fondo::Tramo) {
         let carpeta = std::env::temp_dir().join("NovaCut Render");
         if let Err(error) = std::fs::create_dir_all(&carpeta) {
             self.status = format!("No se pudo preparar la caché de render: {error}");
             return;
         }
-        let archivo = carpeta.join(format!("render-{}-{}.mp4", std::process::id(), marca_de_tiempo()));
-        let clave = self.clave_render();
-        let (ventana, preroll) = montaje::window(&self.effective_clips(), inicio, fin);
+        let archivo = carpeta.join(format!("tramo-{:016x}.mp4", tramo.firma));
+        let lienzo = monitor_canvas(self.export_size);
+        let (ventana, preroll) = montaje::window(&self.effective_clips(), tramo.inicio, tramo.fin);
         // Sin máster ni normalización: el monitor los aplica encima al
         // reproducir, como al resto del montaje.
         let trabajo = RenderJob {
             clips: ventana,
             skip: preroll,
-            length: Some(fin - inicio),
+            length: Some(tramo.fin - tramo.inicio),
             fast: true,
-            size: (clave.lienzo.0 as u32, clave.lienzo.1 as u32),
+            size: (lienzo.0 as u32, lienzo.1 as u32),
             audio_only: false,
             format: ExportFormat::Mp4Video,
             master_gain_db: 0.0,
@@ -1161,17 +1247,35 @@ impl NovaCutWindows {
             cancelar,
             cache: CacheRender {
                 archivo,
-                inicio,
-                fin,
-                clave,
+                inicio: tramo.inicio,
+                fin: tramo.fin,
+                firma: tramo.firma,
             },
         });
-        self.status = format!("Renderizando previsualización de {}…", format_clock(fin - inicio));
     }
 
     fn sondear_render(&mut self, context: &egui::Context) {
+        self.actualizar_tramos();
+        // Al editar se apunta la hora: el automático espera a que pare.
+        let generacion = self.document_generation;
+        if self.mejoras.ultimo_cambio.is_none_or(|(vista, _)| vista != generacion) {
+            self.mejoras.ultimo_cambio = Some((generacion, Instant::now()));
+        }
+        // Un render cuyo tramo ya no existe (se editó) se cancela: no
+        // gastar CPU en algo que no se va a usar.
+        if let Some(render) = &self.mejoras.render {
+            let firma = render.cache.firma;
+            if self.pending_edit.is_none()
+                && !self.tramos_vigentes().iter().any(|tramo| tramo.firma == firma)
+            {
+                render.cancelar.store(true, Ordering::Relaxed);
+            }
+        }
         let estado = match &self.mejoras.render {
-            None => return,
+            None => {
+                self.render_automatico(context);
+                return;
+            }
             Some(render) => (
                 render.rx.try_recv(),
                 render.progreso.lock().map(|progreso| progreso.pct).unwrap_or(0.0),
@@ -1179,32 +1283,49 @@ impl NovaCutWindows {
         };
         match estado {
             (Err(mpsc::TryRecvError::Empty), pct) => {
-                self.status = format!("Renderizando previsualización · {:.0} %", pct * 100.0);
+                if !self.mejoras.cola_render.is_empty() || !self.mejoras.render_auto {
+                    self.status = format!(
+                        "Renderizando previsualización · {:.0} %{}",
+                        pct * 100.0,
+                        if self.mejoras.cola_render.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · quedan {}", self.mejoras.cola_render.len())
+                        }
+                    );
+                }
                 context.request_repaint_after(Duration::from_millis(250));
             }
             (Ok(Ok(())), _) => {
                 let Some(render) = self.mejoras.render.take() else {
                     return;
                 };
-                let vigente = render.cache.clave == self.clave_render();
-                if let Some(anterior) = self.mejoras.cache.replace(render.cache) {
-                    let _ = std::fs::remove_file(anterior.archivo);
-                }
-                self.status = if vigente {
-                    "Previsualización renderizada: ese tramo se reproduce en tiempo real (barra verde)"
-                        .to_owned()
+                self.mejoras.renders.insert(render.cache.firma, render.cache.archivo);
+                self.podar_renders();
+                if self.mejoras.cola_render.is_empty() {
+                    if !self.mejoras.render_auto {
+                        self.status =
+                            "Previsualización renderizada: esos tramos se reproducen en tiempo real (barra verde)"
+                                .to_owned();
+                    }
                 } else {
-                    "Render terminado, pero el montaje cambió mientras tanto: vuelve a renderizar"
-                        .to_owned()
-                };
+                    self.siguiente_render();
+                }
+                context.request_repaint();
             }
             (Ok(Err(error)), _) => {
-                self.mejoras.render = None;
-                self.status = if error == "Exportación cancelada" {
-                    "Render de previsualización cancelado".to_owned()
+                let render = self.mejoras.render.take();
+                if let Some(render) = render {
+                    let _ = std::fs::remove_file(render.cache.archivo);
+                }
+                if error == "Exportación cancelada" {
+                    if !self.mejoras.cola_render.is_empty() {
+                        self.siguiente_render();
+                    }
                 } else {
-                    format!("Fallo el render de previsualización: {error}")
-                };
+                    self.mejoras.cola_render.clear();
+                    self.status = format!("Falló el render de previsualización: {error}");
+                }
             }
             (Err(mpsc::TryRecvError::Disconnected), _) => {
                 self.mejoras.render = None;
@@ -1213,8 +1334,58 @@ impl NovaCutWindows {
         }
     }
 
-    /// Franja inferior de la regla: verde lo renderizado y vigente, naranja
-    /// lo que se está renderizando.
+    /// Con el automático activado: tras 3 s sin editar, ni reproducir, ni
+    /// exportar, renderiza el siguiente tramo pendiente (primero los que
+    /// vienen tras el cabezal).
+    fn render_automatico(&mut self, context: &egui::Context) {
+        const ESPERA: Duration = Duration::from_secs(3);
+        if !self.mejoras.render_auto
+            || !self.ffmpeg_ready
+            || self.playback.is_some()
+            || self.export_result.is_some()
+            || self.pending_edit.is_some()
+        {
+            return;
+        }
+        let pendiente = |tramo: &&render_fondo::Tramo| {
+            tramo.coste != render_fondo::Coste::Ligero
+                && !self.mejoras.renders.get(&tramo.firma).is_some_and(|archivo| archivo.is_file())
+        };
+        let tramos = self.tramos_vigentes();
+        let siguiente = tramos
+            .iter()
+            .filter(pendiente)
+            .find(|tramo| tramo.fin > self.playhead)
+            .or_else(|| tramos.iter().find(pendiente))
+            .cloned();
+        let Some(tramo) = siguiente else {
+            return;
+        };
+        let quieto = self.mejoras.ultimo_cambio.map_or(Duration::ZERO, |(_, cuando)| cuando.elapsed());
+        if quieto < ESPERA {
+            // Un único despertar cuando toque, no repintar sin parar.
+            context.request_repaint_after(ESPERA - quieto);
+            return;
+        }
+        self.empezar_render_de_tramo(&tramo);
+    }
+
+    /// Borra los renders de tramos que ya no existen cuando se acumulan.
+    fn podar_renders(&mut self) {
+        if self.mejoras.renders.len() <= 120 {
+            return;
+        }
+        let vivos: std::collections::HashSet<u64> =
+            self.tramos_vigentes().iter().map(|tramo| tramo.firma).collect();
+        self.mejoras.renders.retain(|firma, archivo| {
+            let conservar = vivos.contains(firma);
+            if !conservar {
+                let _ = std::fs::remove_file(archivo);
+            }
+            conservar
+        });
+    }
+
     pub(super) fn dibujar_barra_de_render(
         &self,
         painter: &egui::Painter,
@@ -1236,10 +1407,21 @@ impl NovaCutWindows {
                 );
             }
         };
-        if let Some(render) = &self.mejoras.render {
-            franja(render.cache.inicio, render.cache.fin, theme::WARN);
-        } else if let Some(cache) = self.cache_vigente() {
-            franja(cache.inicio, cache.fin, theme::OK);
+        let en_curso = self.mejoras.render.as_ref().map(|render| render.cache.firma);
+        for tramo in self.tramos_vigentes() {
+            let hecho = self.mejoras.renders.get(&tramo.firma).is_some_and(|archivo| archivo.is_file());
+            let color = if hecho {
+                theme::OK
+            } else if en_curso == Some(tramo.firma) {
+                theme::ACCENT
+            } else {
+                match tramo.coste {
+                    render_fondo::Coste::Ligero => continue,
+                    render_fondo::Coste::Medio => theme::WARN,
+                    render_fondo::Coste::Pesado => theme::DANGER,
+                }
+            };
+            franja(tramo.inicio, tramo.fin, color);
         }
     }
 
@@ -4564,11 +4746,7 @@ mod tests {
             archivo: PathBuf::from("render.mp4"),
             inicio: 2.0,
             fin: 6.0,
-            clave: ClaveRender {
-                generacion: 0,
-                lienzo: (640, 360),
-                subtitulos: false,
-            },
+            firma: 0,
         };
         let resultado = sustituir_por_render(&[fondo, encima], &cache).unwrap();
         let render: Vec<&RoughClip> = resultado
@@ -5055,11 +5233,7 @@ mod tests {
             archivo,
             inicio: 0.5,
             fin: 1.5,
-            clave: ClaveRender {
-                generacion: 0,
-                lienzo: (640, 360),
-                subtitulos: false,
-            },
+            firma: 0,
         };
         let sustituidos = sustituir_por_render(&clips, &cache).unwrap();
         assert_eq!(sustituidos.len(), 3, "cabeza, cola y el render");

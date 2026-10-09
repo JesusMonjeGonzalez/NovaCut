@@ -23,6 +23,7 @@ mod aceleracion;
 mod animacion;
 mod batch;
 mod curvas_hsl;
+mod render_fondo;
 mod texto_animado;
 mod command_center;
 mod efectos;
@@ -3468,6 +3469,9 @@ struct UiSettings {
     /// Exportar y transcribir con la mitad de los núcleos.
     #[serde(default)]
     eco_mode: bool,
+    /// Render automático de tramos rojos y amarillos al dejar de editar.
+    #[serde(default)]
+    render_auto: bool,
     /// Tamaño de la interfaz (1.0 = 100 %). Accesibilidad y pantallas
     /// grandes; también responde a Ctrl+= / Ctrl+- / Ctrl+0.
     /// `None` hasta que el usuario (o el primer arranque) lo fija.
@@ -3858,6 +3862,7 @@ impl NovaCutWindows {
             proxy_limit_gb: self.proxy_limit_gb,
             hardware_encoding: self.hardware_encoding,
             eco_mode: self.eco_mode,
+            render_auto: self.mejoras.render_auto,
             encode: self.encode_settings,
             ui_scale: Some(self.ui_scale),
             tutorial_done: self.tutorial_visto,
@@ -3920,6 +3925,7 @@ impl NovaCutWindows {
         self.proxy_limit_gb = settings.proxy_limit_gb.clamp(0.0, 1000.0);
         self.hardware_encoding = settings.hardware_encoding;
         self.eco_mode = settings.eco_mode;
+        self.mejoras.render_auto = settings.render_auto;
         ECO_MODE.store(self.eco_mode, Ordering::Relaxed);
         self.encode_settings = settings.encode;
         if let Some(scale) = settings.ui_scale {
@@ -16961,8 +16967,8 @@ impl eframe::App for NovaCutWindows {
                         continue;
                     }
                     let bar = egui::Rect::from_min_max(
-                        egui::pos2(left.max(lane_rect.left()), ruler_rect.bottom() - 5.0),
-                        egui::pos2((right - 1.0).max(left + 2.0).min(lane_rect.right()), ruler_rect.bottom() - 1.0),
+                        egui::pos2(left.max(lane_rect.left()), ruler_rect.bottom() - 9.0),
+                        egui::pos2((right - 1.0).max(left + 2.0).min(lane_rect.right()), ruler_rect.bottom() - 5.0),
                     );
                     let active = self.playhead >= cue.start && self.playhead < cue.end;
                     painter.rect_filled(
