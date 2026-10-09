@@ -4080,7 +4080,7 @@ impl NovaCutWindows {
         let project_name = project.name.clone();
         let mut recover = false;
         let mut discard = false;
-        egui::Window::new("Recuperacion disponible")
+        egui::Window::new("Recuperación disponible")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -4130,7 +4130,7 @@ impl NovaCutWindows {
         } else if discard {
             self.pending_recovery = None;
             clear_recovery();
-            self.status = "Recuperacion descartada".to_owned();
+            self.status = "Recuperación descartada".to_owned();
         }
     }
 
@@ -5947,7 +5947,7 @@ impl NovaCutWindows {
                     clips_to_add.push(clip);
                     imported += 1;
                 }
-                Ok(_) => errors.push("FFprobe no devolvio una duracion valida".to_owned()),
+                Ok(_) => errors.push("FFprobe no devolvió una duración válida".to_owned()),
                 Err(error) => errors.push(error),
             }
         }
@@ -6950,12 +6950,12 @@ impl NovaCutWindows {
     /// Guarda los subtítulos como archivo .srt.
     fn export_srt(&mut self) {
         if self.project.subtitles.is_empty() {
-            self.status = "No hay subtitulos que exportar".to_owned();
+            self.status = "No hay subtítulos que exportar".to_owned();
             return;
         }
         let Some(path) = FileDialog::new()
-            .add_filter("Subtitulos SRT", &["srt"])
-            .set_file_name("NovaCut Subtitulos.srt")
+            .add_filter("Subtítulos SRT", &["srt"])
+            .set_file_name("NovaCut Subtítulos.srt")
             .save_file()
         else {
             return;
@@ -9472,176 +9472,185 @@ impl NovaCutWindows {
             .default_width(460.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(context, |ui| {
-                theme::section_label(ui, "Preajustes");
-                ui.horizontal_wrapped(|ui| {
-                    for preset in &exportacion::PRESETS {
-                        let format = ExportFormat::from_code(preset.format);
-                        let active = self.export_format == format
-                            && (format.is_audio_only() || self.export_size == preset.size)
-                            && self.encode_settings == preset.settings;
-                        if ui
-                            .selectable_label(active, preset.name)
-                            .on_hover_text(preset.hint)
-                            .clicked()
-                        {
-                            self.export_format = format;
-                            if !format.is_audio_only() {
-                                self.export_size = preset.size;
-                            }
-                            self.encode_settings = preset.settings;
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                theme::section_label(ui, "Ajustes");
-                let audio_only = self.export_format.is_audio_only();
-                egui::Grid::new("export-settings")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
+                // En ventanas bajas (800×500) la ventana se salía por abajo
+                // y no se veía el botón de exportar: los ajustes se
+                // desplazan y los botones quedan siempre a la vista.
+                let max_body = (ui.ctx().screen_rect().height() - 180.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_body)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.label("Formato");
-                        egui::ComboBox::from_id_salt("export-window-format")
-                            .width(220.0)
-                            .selected_text(self.export_format.label())
-                            .show_ui(ui, |ui| {
-                                for format in ExportFormat::ALL {
-                                    ui.selectable_value(&mut self.export_format, format, format.label());
+                        theme::section_label(ui, "Preajustes");
+                        ui.horizontal_wrapped(|ui| {
+                            for preset in &exportacion::PRESETS {
+                                let format = ExportFormat::from_code(preset.format);
+                                let active = self.export_format == format
+                                    && (format.is_audio_only() || self.export_size == preset.size)
+                                    && self.encode_settings == preset.settings;
+                                if ui
+                                    .selectable_label(active, preset.name)
+                                    .on_hover_text(preset.hint)
+                                    .clicked()
+                                {
+                                    self.export_format = format;
+                                    if !format.is_audio_only() {
+                                        self.export_size = preset.size;
+                                    }
+                                    self.encode_settings = preset.settings;
                                 }
-                            });
-                        ui.end_row();
-                        if !audio_only {
-                            ui.label("Tamaño");
-                            egui::ComboBox::from_id_salt("export-window-size")
-                                .width(220.0)
-                                .selected_text(format!("{}×{}", self.export_size.0, self.export_size.1))
-                                .show_ui(ui, |ui| {
-                                    for (size, name) in [
-                                        ((854, 480), "480p · 854×480"),
-                                        ((1280, 720), "720p · 1280×720"),
-                                        ((1920, 1080), "1080p · 1920×1080"),
-                                        ((2560, 1440), "1440p · 2560×1440"),
-                                        ((3840, 2160), "4K · 3840×2160"),
-                                        ((1080, 1920), "Vertical · 1080×1920"),
-                                        ((1080, 1350), "Retrato 4:5 · 1080×1350"),
-                                        ((1080, 1080), "Cuadrado · 1080×1080"),
-                                    ] {
-                                        ui.selectable_value(&mut self.export_size, size, name);
-                                    }
-                                });
-                            ui.end_row();
-                            ui.label("Calidad");
-                            ui.vertical(|ui| {
-                                let mut by_bitrate = self.encode_settings.bitrate_mbps.is_some();
-                                ui.horizontal_wrapped(|ui| {
-                                    for quality in exportacion::Quality::ALL {
-                                        let chosen = !by_bitrate && self.encode_settings.quality == quality;
-                                        if ui
-                                            .selectable_label(chosen, quality.label())
-                                            .on_hover_text(quality.hint())
-                                            .clicked()
-                                        {
-                                            self.encode_settings.quality = quality;
-                                            self.encode_settings.bitrate_mbps = None;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        theme::section_label(ui, "Ajustes");
+                        let audio_only = self.export_format.is_audio_only();
+                        egui::Grid::new("export-settings")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Formato");
+                                egui::ComboBox::from_id_salt("export-window-format")
+                                    .width(220.0)
+                                    .selected_text(self.export_format.label())
+                                    .show_ui(ui, |ui| {
+                                        for format in ExportFormat::ALL {
+                                            ui.selectable_value(&mut self.export_format, format, format.label());
                                         }
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .checkbox(&mut by_bitrate, "Bitrate objetivo")
-                                        .on_hover_text("Tamaño previsible en vez de calidad constante: lo que piden algunas plataformas y emisoras")
-                                        .changed()
-                                    {
-                                        self.encode_settings.bitrate_mbps = by_bitrate.then_some(16.0);
-                                    }
-                                    if let Some(mbps) = self.encode_settings.bitrate_mbps.as_mut() {
-                                        ui.add(
-                                            egui::DragValue::new(mbps)
-                                                .speed(0.25)
-                                                .range(0.5..=400.0)
-                                                .max_decimals(1)
-                                                .suffix(" Mbps"),
-                                        );
-                                    }
-                                });
-                            });
-                            ui.end_row();
-                        }
-                        let compressed_audio = matches!(
-                            self.export_format,
-                            ExportFormat::Mp4Video
-                                | ExportFormat::Mp4Hevc
-                                | ExportFormat::Mp3Audio
-                                | ExportFormat::WebmVp9
-                        );
-                        if compressed_audio {
-                            ui.label("Audio");
-                            egui::ComboBox::from_id_salt("export-window-audio")
-                                .width(120.0)
-                                .selected_text(format!("{} kbps", self.encode_settings.audio_kbps))
-                                .show_ui(ui, |ui| {
-                                    for kbps in exportacion::AUDIO_KBPS {
-                                        ui.selectable_value(
-                                            &mut self.encode_settings.audio_kbps,
-                                            kbps,
-                                            format!("{kbps} kbps"),
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-                        }
-                        if let Some(backend) = self.hw_backends.first().copied() {
-                            if matches!(self.export_format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc) {
-                                ui.label("Aceleración");
-                                ui.checkbox(
-                                    &mut self.hardware_encoding,
-                                    format!("Codificar con {}", backend.label()),
-                                )
-                                .on_hover_text("Varias veces más rápido; si la GPU falla se repite con CPU");
+                                    });
                                 ui.end_row();
-                            }
-                        }
-                        ui.label("Duración");
-                        ui.horizontal(|ui| {
-                            let range = self.work_range();
-                            ui.add_enabled_ui(range.is_some(), |ui| {
-                                ui.checkbox(&mut self.export_range_only, "Solo el rango I–O")
-                                    .on_disabled_hover_text("Marca entrada (I) y salida (O) en la timeline");
+                                if !audio_only {
+                                    ui.label("Tamaño");
+                                    egui::ComboBox::from_id_salt("export-window-size")
+                                        .width(220.0)
+                                        .selected_text(format!("{}×{}", self.export_size.0, self.export_size.1))
+                                        .show_ui(ui, |ui| {
+                                            for (size, name) in [
+                                                ((854, 480), "480p · 854×480"),
+                                                ((1280, 720), "720p · 1280×720"),
+                                                ((1920, 1080), "1080p · 1920×1080"),
+                                                ((2560, 1440), "1440p · 2560×1440"),
+                                                ((3840, 2160), "4K · 3840×2160"),
+                                                ((1080, 1920), "Vertical · 1080×1920"),
+                                                ((1080, 1350), "Retrato 4:5 · 1080×1350"),
+                                                ((1080, 1080), "Cuadrado · 1080×1080"),
+                                            ] {
+                                                ui.selectable_value(&mut self.export_size, size, name);
+                                            }
+                                        });
+                                    ui.end_row();
+                                    ui.label("Calidad");
+                                    ui.vertical(|ui| {
+                                        let mut by_bitrate = self.encode_settings.bitrate_mbps.is_some();
+                                        ui.horizontal_wrapped(|ui| {
+                                            for quality in exportacion::Quality::ALL {
+                                                let chosen = !by_bitrate && self.encode_settings.quality == quality;
+                                                if ui
+                                                    .selectable_label(chosen, quality.label())
+                                                    .on_hover_text(quality.hint())
+                                                    .clicked()
+                                                {
+                                                    self.encode_settings.quality = quality;
+                                                    self.encode_settings.bitrate_mbps = None;
+                                                }
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .checkbox(&mut by_bitrate, "Bitrate objetivo")
+                                                .on_hover_text("Tamaño previsible en vez de calidad constante: lo que piden algunas plataformas y emisoras")
+                                                .changed()
+                                            {
+                                                self.encode_settings.bitrate_mbps = by_bitrate.then_some(16.0);
+                                            }
+                                            if let Some(mbps) = self.encode_settings.bitrate_mbps.as_mut() {
+                                                ui.add(
+                                                    egui::DragValue::new(mbps)
+                                                        .speed(0.25)
+                                                        .range(0.5..=400.0)
+                                                        .max_decimals(1)
+                                                        .suffix(" Mbps"),
+                                                );
+                                            }
+                                        });
+                                    });
+                                    ui.end_row();
+                                }
+                                let compressed_audio = matches!(
+                                    self.export_format,
+                                    ExportFormat::Mp4Video
+                                        | ExportFormat::Mp4Hevc
+                                        | ExportFormat::Mp3Audio
+                                        | ExportFormat::WebmVp9
+                                );
+                                if compressed_audio {
+                                    ui.label("Audio");
+                                    egui::ComboBox::from_id_salt("export-window-audio")
+                                        .width(120.0)
+                                        .selected_text(format!("{} kbps", self.encode_settings.audio_kbps))
+                                        .show_ui(ui, |ui| {
+                                            for kbps in exportacion::AUDIO_KBPS {
+                                                ui.selectable_value(
+                                                    &mut self.encode_settings.audio_kbps,
+                                                    kbps,
+                                                    format!("{kbps} kbps"),
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                }
+                                if let Some(backend) = self.hw_backends.first().copied() {
+                                    if matches!(self.export_format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc) {
+                                        ui.label("Aceleración");
+                                        ui.checkbox(
+                                            &mut self.hardware_encoding,
+                                            format!("Codificar con {}", backend.label()),
+                                        )
+                                        .on_hover_text("Varias veces más rápido; si la GPU falla se repite con CPU");
+                                        ui.end_row();
+                                    }
+                                }
+                                ui.label("Duración");
+                                ui.horizontal(|ui| {
+                                    let range = self.work_range();
+                                    ui.add_enabled_ui(range.is_some(), |ui| {
+                                        ui.checkbox(&mut self.export_range_only, "Solo el rango I–O")
+                                            .on_disabled_hover_text("Marca entrada (I) y salida (O) en la timeline");
+                                    });
+                                    let seconds = match range {
+                                        Some((start, end)) if self.export_range_only => end - start,
+                                        _ => self.project.duration(),
+                                    };
+                                    let size = exportacion::estimated_megabytes(
+                                        &self.encode_settings,
+                                        seconds,
+                                        !audio_only,
+                                    )
+                                    .filter(|_| self.export_format != ExportFormat::MovProRes)
+                                    .map(|mb| format!(" · ≈ {mb:.0} MB"))
+                                    .unwrap_or_default();
+                                    ui.label(
+                                        egui::RichText::new(format!("{}{size}", format_clock(seconds)))
+                                            .monospace()
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                });
+                                ui.end_row();
+                                ui.label("Destino");
+                                ui.horizontal(|ui| {
+                                    let shown = self
+                                        .export_target
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .unwrap_or_else(|| "Sin elegir".to_owned());
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(shown).color(theme::TEXT_DIM))
+                                            .truncate(),
+                                    );
+                                    if ui.button("Elegir…").clicked() {
+                                        choose_target = true;
+                                    }
+                                });
+                                ui.end_row();
                             });
-                            let seconds = match range {
-                                Some((start, end)) if self.export_range_only => end - start,
-                                _ => self.project.duration(),
-                            };
-                            let size = exportacion::estimated_megabytes(
-                                &self.encode_settings,
-                                seconds,
-                                !audio_only,
-                            )
-                            .filter(|_| self.export_format != ExportFormat::MovProRes)
-                            .map(|mb| format!(" · ≈ {mb:.0} MB"))
-                            .unwrap_or_default();
-                            ui.label(
-                                egui::RichText::new(format!("{}{size}", format_clock(seconds)))
-                                    .monospace()
-                                    .color(theme::TEXT_DIM),
-                            );
-                        });
-                        ui.end_row();
-                        ui.label("Destino");
-                        ui.horizontal(|ui| {
-                            let shown = self
-                                .export_target
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "Sin elegir".to_owned());
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(shown).color(theme::TEXT_DIM))
-                                    .truncate(),
-                            );
-                            if ui.button("Elegir…").clicked() {
-                                choose_target = true;
-                            }
-                        });
-                        ui.end_row();
                     });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -10461,7 +10470,7 @@ impl NovaCutWindows {
             return;
         };
         self.attribute_clipboard = Some(Box::new(self.project.clips[index].clone()));
-        self.status = "Atributos copiados; el pegado permite elegir categorias".to_owned();
+        self.status = "Atributos copiados; el pegado permite elegir categorías".to_owned();
     }
 
     /// Pega color, transformación y audio del clip fuente sin tocar sus puntos
@@ -12799,7 +12808,7 @@ impl eframe::App for NovaCutWindows {
                         self.show_shortcuts = !self.show_shortcuts;
                     }
                     if theme::bar_button(ui, "🔍")
-                        .on_hover_text("Ctrl+Mayus+P | Clips, marcadores, subtitulos y acciones")
+                        .on_hover_text("Ctrl+Mayús+P | Clips, marcadores, subtítulos y acciones")
                         .clicked()
                     {
                         self.command_center.open();
@@ -17049,7 +17058,7 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
                 .max_by(f64::total_cmp)
         })
         .filter(|value| *value > 0.0)
-        .ok_or_else(|| "FFprobe no pudo leer la duracion".to_owned())?;
+        .ok_or_else(|| "FFprobe no pudo leer la duración".to_owned())?;
     let frame_rate = video.and_then(|stream| {
         parse_frame_rate(stream.avg_frame_rate.as_deref())
             .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()))

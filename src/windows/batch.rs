@@ -385,16 +385,16 @@ impl NovaCutWindows {
         {
             self.paste_attributes();
         }
-        ui.collapsing("Restablecer categorias", |ui| {
+        ui.collapsing("Restablecer categorías", |ui| {
             for (category, label) in CATEGORIES.iter().enumerate() {
                 ui.checkbox(&mut self.batch_state.categories[category], *label);
             }
-            ui.small("Color incluye ruedas, curvas, chroma, LUT, mascara y fusion. No borra animacion ni transiciones.");
+            ui.small("Color incluye ruedas, curvas, chroma, LUT, máscara y fusión. No borra animación ni transiciones.");
             if ui.add_enabled(self.batch_state.categories.iter().any(|v| *v), egui::Button::new("Restablecer seleccionadas")).on_hover_text("Vuelve esos atributos a sus valores por defecto").on_disabled_hover_text("Vuelve esos atributos a sus valores por defecto").clicked() {
                 self.run_batch(indices, Operation::Reset(self.batch_state.categories));
             }
         });
-        ui.small("Titulos y nidos se omiten. Capas de ajuste: solo color y etiqueta. Los keyframes existentes pueden prevalecer sobre los valores estaticos.");
+        ui.small("Títulos y nidos se omiten. Capas de ajuste: solo color y etiqueta. Los keyframes existentes pueden prevalecer sobre los valores estáticos.");
     }
 
     pub(super) fn batch_paste_dialog(&mut self, context: &egui::Context) {
@@ -402,13 +402,13 @@ impl NovaCutWindows {
             return;
         };
         if generation != self.document_generation || indices != self.selected_indices() {
-            self.status = "Pegado cancelado: cambio el documento o la seleccion".to_owned();
+            self.status = "Pegado cancelado: cambió el documento o la selección".to_owned();
             return;
         }
         let mut open = true;
         let mut apply_now = false;
         let mut cancel = false;
-        egui::Window::new("Pegar atributos a la seleccion")
+        egui::Window::new("Pegar atributos a la selección")
             .id(egui::Id::new("batch-paste"))
             .collapsible(false).resizable(false).open(&mut open).show(context, |ui| {
                 ui.colored_label(theme::ACCENT, format!("Destino: {} clips", indices.len()));
@@ -418,8 +418,8 @@ impl NovaCutWindows {
                         ui.checkbox(&mut self.batch_state.categories[category], *label);
                     });
                 }
-                ui.small("Solo valores estaticos. Se conservan tiempos, rutas de medios, retiming y keyframes.");
-                ui.small("Color incluye ruedas, curvas, chroma, LUT, mascara y fusion. Fundidos limitados a media duracion por clip.");
+                ui.small("Solo valores estáticos. Se conservan tiempos, rutas de medios, retiming y keyframes.");
+                ui.small("Color incluye ruedas, curvas, chroma, LUT, máscara y fusión. Fundidos limitados a media duración por clip.");
                 ui.horizontal(|ui| {
                     apply_now = ui.add_enabled(self.batch_state.categories.iter().enumerate()
                         .any(|(i, v)| *v && supports(&source, i)), egui::Button::new("Pegar")).on_hover_text("Pega los atributos marcados").on_disabled_hover_text("Pega los atributos marcados").clicked();

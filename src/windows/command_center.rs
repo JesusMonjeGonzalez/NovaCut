@@ -89,67 +89,67 @@ impl NovaCutWindows {
                 "Documento | Ctrl+I",
                 Action::Import,
                 (!self.ffmpeg_ready || self.import_result.is_some())
-                    .then_some("Requiere FFmpeg y ninguna importacion en curso"),
+                    .then_some("Requiere FFmpeg y ninguna importación en curso"),
             ),
             (
                 "Exportar montaje",
-                "Entrega | Ctrl+Mayus+E",
+                "Entrega | Ctrl+Mayús+E",
                 Action::Export,
                 (!self.ffmpeg_ready
                     || self.export_result.is_some()
                     || self.project.clips.is_empty())
-                .then_some("Requiere medios, FFmpeg y ninguna exportacion en curso"),
+                .then_some("Requiere medios, FFmpeg y ninguna exportación en curso"),
             ),
             (
                 "Copiar atributos",
-                "Seleccion | Ctrl+Alt+C",
+                "Selección | Ctrl+Alt+C",
                 Action::CopyAttributes,
                 (!selected).then_some("Selecciona un clip"),
             ),
             (
                 "Pegar atributos selectivos",
-                "Seleccion | Ctrl+Alt+V",
+                "Selección | Ctrl+Alt+V",
                 Action::PasteAttributes,
                 (!editable || self.attribute_clipboard.is_none())
                     .then_some("Copia atributos y selecciona destinos editables"),
             ),
             (
-                "Fundidos rapidos en seleccion",
-                "Seleccion | Ambos bordes, hasta 1 s",
+                "Fundidos rápidos en selección",
+                "Selección | Ambos bordes, hasta 1 s",
                 Action::Fade,
                 (!editable).then_some("Selecciona clips en pistas desbloqueadas"),
             ),
             (
-                "Encuadrar seleccion",
+                "Encuadrar selección",
                 "Vista | Ajusta zoom y desplazamiento",
                 Action::FitSelection,
                 (!selected).then_some("Selecciona al menos un clip"),
             ),
             (
-                "Rango de trabajo desde seleccion",
-                "Rango | Entrada y salida sin activar exportacion parcial",
+                "Rango de trabajo desde selección",
+                "Rango | Entrada y salida sin activar exportación parcial",
                 Action::RangeSelection,
                 (!selected).then_some("Selecciona al menos un clip"),
             ),
             (
-                "Invertir seleccion",
-                "Seleccion | Intercambia seleccionados y no seleccionados",
+                "Invertir selección",
+                "Selección | Intercambia seleccionados y no seleccionados",
                 Action::InvertSelection,
                 self.project
                     .clips
                     .is_empty()
-                    .then_some("El montaje esta vacio"),
+                    .then_some("El montaje está vacío"),
             ),
             (
                 "Seleccionar clips desactivados",
-                "Revision | Material excluido del montaje",
+                "Revisión | Material excluido del montaje",
                 Action::SelectDisabled,
                 (!self.project.clips.iter().any(|c| !c.enabled))
                     .then_some("No hay clips desactivados"),
             ),
             (
                 "Marcador anterior",
-                "Navegacion | Marcador previo",
+                "Navegación | Marcador previo",
                 Action::PreviousMarker,
                 self.project
                     .markers
@@ -158,7 +158,7 @@ impl NovaCutWindows {
             ),
             (
                 "Marcador siguiente",
-                "Navegacion | Proximo marcador",
+                "Navegación | Próximo marcador",
                 Action::NextMarker,
                 self.project
                     .markers
@@ -167,20 +167,20 @@ impl NovaCutWindows {
             ),
             (
                 "Hueco anterior en pista",
-                "Revision | Pista del clip principal; cuenta clips activos",
+                "Revisión | Pista del clip principal; cuenta clips activos",
                 Action::PreviousGap,
                 (!selected).then_some("Selecciona un clip de la pista a revisar"),
             ),
             (
                 "Hueco siguiente en pista",
-                "Revision | Pista del clip principal; cuenta clips activos",
+                "Revisión | Pista del clip principal; cuenta clips activos",
                 Action::NextGap,
                 (!selected).then_some("Selecciona un clip de la pista a revisar"),
             ),
             ("Abrir mezclador", "Panel | Audio", Action::Mixer, None),
             (
-                "Abrir subtitulos",
-                "Panel | Texto y sincronizacion",
+                "Abrir subtítulos",
+                "Panel | Texto y sincronización",
                 Action::Subtitles,
                 None,
             ),
@@ -260,7 +260,7 @@ impl NovaCutWindows {
             ui.set_width((context.screen_rect().width() - 48.0).clamp(240.0, 680.0));
             ui.heading("Centro de comandos");
             ui.label(
-                egui::RichText::new("Comandos, clips, marcadores y subtitulos. Filtros: > @ # =")
+                egui::RichText::new("Comandos, clips, marcadores y subtítulos. Filtros: > @ # =")
                     .small()
                     .color(theme::TEXT_DIM),
             );
@@ -285,7 +285,7 @@ impl NovaCutWindows {
                 {
                     entries.push(Entry {
                         title: format!("Ir a {}", timecode(seconds, self.project.fps)),
-                        detail: "Posicion del cabezal".into(),
+                        detail: "Posición del cabezal".into(),
                         action: Action::Time(seconds),
                         unavailable: None,
                     });
@@ -402,7 +402,7 @@ impl NovaCutWindows {
                 if let Some((start, end)) = self.selection_span() {
                     (self.zoom, self.hscroll) =
                         navigation::fit_span(start, end, self.project.duration());
-                    self.status = "Vista ajustada a la seleccion".into();
+                    self.status = "Vista ajustada a la selección".into();
                 }
             }
             Action::RangeSelection => {
@@ -410,7 +410,7 @@ impl NovaCutWindows {
                     self.work_in = Some(start);
                     self.work_out = Some(end);
                     self.status =
-                        "Rango marcado desde la seleccion; el modo de exportacion no cambia".into();
+                        "Rango marcado desde la selección; el modo de exportación no cambia".into();
                 }
             }
             Action::InvertSelection | Action::SelectDisabled => {
@@ -443,7 +443,7 @@ impl NovaCutWindows {
                     self.stop_playback();
                     self.seek(t);
                 } else {
-                    self.status = "No hay otro marcador en esa direccion".into();
+                    self.status = "No hay otro marcador en esa dirección".into();
                 }
             }
             Action::PreviousGap | Action::NextGap => {
@@ -473,7 +473,7 @@ impl NovaCutWindows {
                         self.status = format!("Hueco en pista: {}", timecode(t, self.project.fps));
                     } else {
                         self.status =
-                            "No hay otro hueco en esa direccion en la pista elegida".into();
+                            "No hay otro hueco en esa dirección en la pista elegida".into();
                     }
                 }
             }

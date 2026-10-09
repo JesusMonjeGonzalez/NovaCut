@@ -45,9 +45,9 @@ pub fn validate_drop_destination(
     has_audio: bool,
 ) -> Result<(), &'static str> {
     if locked {
-        Err("La pista de destino esta bloqueada")
+        Err("La pista de destino está bloqueada")
     } else if is_video && !has_video {
-        Err("Ese medio no tiene video")
+        Err("Ese medio no tiene vídeo")
     } else if !is_video && !has_audio {
         Err("Ese medio no tiene audio")
     } else {
@@ -212,7 +212,7 @@ mod tests {
                 for has_audio in [false, true] {
                     assert_eq!(
                         validate_drop_destination(true, is_video, has_video, has_audio),
-                        Err("La pista de destino esta bloqueada"),
+                        Err("La pista de destino está bloqueada"),
                     );
                 }
             }
@@ -230,7 +230,7 @@ mod tests {
         for has_audio in [false, true] {
             assert_eq!(
                 validate_drop_destination(false, true, false, has_audio),
-                Err("Ese medio no tiene video"),
+                Err("Ese medio no tiene vídeo"),
             );
         }
     }
