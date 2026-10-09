@@ -265,6 +265,9 @@ Pendiente de UX:
 3. ~~**Curvas HSL dibujables**~~ (9 oct 2026, `curvas_hsl.rs`): tono/saturación,
    tono/tono, tono/luminancia y luminancia/saturación, aplicadas como LUT 3D
    (.cube 33³ cacheada por contenido) con `lut3d`; monitor y exportación iguales.
-4. **Plantillas de gráficos animadas** (.mogrt) y animación de texto por letra.
+4. ~~**Plantillas de gráficos animadas y texto por letra**~~ (9 oct 2026,
+   `texto_animado.rs`): máquina de escribir, aparecer/subir por letras,
+   aparecer por palabras y salida en ola; caja y mate entran con el texto.
+   Plantillas en «+ Insertar › Plantillas animadas». Sigue sin leerse .mogrt.
 5. **Render en segundo plano de la timeline** (barra roja/amarilla/verde) para
    reproducir en tiempo real efectos pesados como el flujo óptico.

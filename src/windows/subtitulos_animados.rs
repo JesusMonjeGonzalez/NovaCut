@@ -84,7 +84,7 @@ pub fn local_words(transcript: &[Word], start: f64, end: f64) -> Vec<Word> {
         .collect()
 }
 
-fn load_font(path: &Path) -> Option<FontArc> {
+pub(super) fn load_font(path: &Path) -> Option<FontArc> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, FontArc>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().ok()?;
@@ -103,7 +103,7 @@ fn load_font(path: &Path) -> Option<FontArc> {
 /// que `PxScale` de ab_glyph es el alto ascendente-descendente; sin esta
 /// conversión, en Arial los anchos salían un 15 % cortos y las palabras se
 /// pisaban.
-fn text_width(font: &FontArc, size: f64, text: &str) -> f64 {
+pub(super) fn text_width(font: &FontArc, size: f64, text: &str) -> f64 {
     let scale = match font.units_per_em() {
         Some(units) => PxScale::from(size as f32 * font.height_unscaled() / units),
         None => PxScale::from(size as f32),

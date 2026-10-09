@@ -527,6 +527,28 @@ pub struct TitleStyle {
     pub matte: Option<[f64; 3]>,
     /// Subtítulos animados palabra a palabra en lugar del texto fijo.
     pub captions: Option<super::subtitulos_animados::AnimatedCaptions>,
+    /// Entrada letra a letra (máquina de escribir, aparecer, subir…).
+    pub animacion: super::texto_animado::AnimacionTexto,
+    /// Las letras se van al final, en orden inverso.
+    pub salida_animada: bool,
+}
+
+/// Contorno y sombra de un título en formato `:clave=valor` de `drawtext`.
+pub fn title_outline_and_shadow(style: &TitleStyle, scale: f64) -> String {
+    let mut extra = String::new();
+    if style.outline > 0.01 {
+        extra.push_str(&format!(
+            ":borderw={:.0}:bordercolor=black",
+            (style.outline * scale).max(1.0)
+        ));
+    }
+    if style.shadow {
+        let offset = (4.0 * scale).max(1.0);
+        extra.push_str(&format!(
+            ":shadowx={offset:.0}:shadowy={offset:.0}:shadowcolor=black@0.65"
+        ));
+    }
+    extra
 }
 
 fn hex(rgb: [f64; 3]) -> String {

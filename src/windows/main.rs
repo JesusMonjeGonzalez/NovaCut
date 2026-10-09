@@ -23,6 +23,7 @@ mod aceleracion;
 mod animacion;
 mod batch;
 mod curvas_hsl;
+mod texto_animado;
 mod command_center;
 mod efectos;
 mod fuentes;
@@ -1202,9 +1203,60 @@ fn title_layer_filters(
     fontsize: f64,
     canvas: (u32, u32),
     preview_time: Option<f64>,
+    duration: f64,
 ) -> String {
     let fontcolor = hex_color(title.red, title.green, title.blue);
     let escaped_font = escape_filter_path(font);
+    if title.style.captions.is_none() {
+        let scale = canvas.1 as f64 / 1080.0;
+        let estilo = texto_animado::Estilo {
+            fuente: font,
+            fuente_escapada: &escaped_font,
+            escapar: &escape_drawtext,
+            tamano: fontsize,
+            color: &fontcolor,
+            posicion: (title.position_x, title.position_y),
+            lienzo: canvas,
+            extra: efectos::title_outline_and_shadow(&title.style, scale),
+            salida: title.style.salida_animada.then_some(duration),
+        };
+        if let Some(letras) =
+            texto_animado::filtros(title.style.animacion, &title.text, &estilo, preview_time)
+        {
+            // Mate y caja quedan fijos debajo; las letras se animan encima.
+            let mut fondo = Vec::new();
+            if title.style.matte.is_some() {
+                let mate = efectos::TitleStyle { matte: title.style.matte, ..Default::default() };
+                fondo.push(efectos::title_drawing(&mate, "", "", 0.0, "", (0.0, 0.0), 1.0));
+            }
+            if title.style.box_opacity > 0.001 {
+                // La caja entra y sale con el texto: un drawtext con el texto
+                // transparente y la opacidad de la primera y última pieza.
+                let caja = efectos::TitleStyle { box_opacity: title.style.box_opacity, ..Default::default() };
+                let alfa = texto_animado::alfa_caja(
+                    title.style.animacion,
+                    &title.text,
+                    estilo.salida,
+                    preview_time,
+                );
+                let alfa = if preview_time.is_some() { alfa } else { format!("'{alfa}'") };
+                fondo.push(format!(
+                    "{}:alpha={alfa}",
+                    efectos::title_drawing(
+                        &caja,
+                        &escape_drawtext(&title.text),
+                        &escaped_font,
+                        fontsize,
+                        &format!("{fontcolor}@0"),
+                        (title.position_x, title.position_y),
+                        scale,
+                    )
+                ));
+            }
+            fondo.push(letras);
+            return fondo.join(",");
+        }
+    }
     let Some(captions) = title.style.captions.as_ref() else {
         return efectos::title_drawing(
             &title.style,
@@ -2032,10 +2084,21 @@ impl RoughClip {
             return "Capa de ajuste".to_owned();
         }
         if let Some(title) = &self.title {
+            // En una sola línea: el salto salía como un recuadro en la timeline.
             return if title.text.trim().is_empty() {
-                "Titulo".to_owned()
+                "Título".to_owned()
             } else {
-                title.text.trim().chars().take(28).collect()
+                title
+                    .text
+                    .trim()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+                    .chars()
+                    .take(40)
+                    .collect()
             };
         }
         self.path
@@ -9441,7 +9504,7 @@ impl NovaCutWindows {
         let kind = match row.kind {
             media_browser::Kind::Video => "Video",
             media_browser::Kind::Audio => "Audio",
-            _ if clip.title.is_some() => "Titulo",
+            _ if clip.title.is_some() => "Título",
             _ if clip.is_adjustment => "Ajuste",
             _ if clip.nested.is_some() => "Anidada",
             _ => "Generado",
@@ -12720,6 +12783,19 @@ impl eframe::App for NovaCutWindows {
                                 insert_action = Some(20);
                                 ui.close_menu();
                             }
+                            ui.menu_button("Plantillas animadas", |ui| {
+                                ui.set_min_width(240.0);
+                                for (code, label, hint) in [
+                                    (22, "Título de entrada", "Grande y centrado: sube letra a letra y se va al final"),
+                                    (23, "Rótulo inferior animado", "Nombre en el tercio inferior con caja: aparece por palabras"),
+                                    (24, "Máquina de escribir", "Texto que se escribe solo, letra a letra"),
+                                ] {
+                                    if ui.button(label).on_hover_text(hint).clicked() {
+                                        insert_action = Some(code);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                             if ui
                                 .button("Mate de color")
                                 .on_hover_text("Fondo liso a pantalla completa, como Nuevo elemento › Mate de color")
@@ -12799,6 +12875,49 @@ impl eframe::App for NovaCutWindows {
                                 ..Titulo::default()
                             },
                             "Mate de color creado; elige su color en el inspector",
+                        ),
+                        Some(22) => self.add_styled_title_at_playhead(
+                            Titulo {
+                                text: "Tu título".to_owned(),
+                                size: 110.0,
+                                style: efectos::TitleStyle {
+                                    animacion: texto_animado::AnimacionTexto::SubirPorLetras,
+                                    salida_animada: true,
+                                    shadow: true,
+                                    ..Default::default()
+                                },
+                                ..Titulo::default()
+                            },
+                            "Título animado creado; escribe el texto en el inspector",
+                        ),
+                        Some(23) => self.add_styled_title_at_playhead(
+                            Titulo {
+                                text: "Nombre Apellido\nCargo o tema".to_owned(),
+                                position_x: 0.3,
+                                position_y: 0.84,
+                                size: 50.0,
+                                style: efectos::TitleStyle {
+                                    box_opacity: 0.6,
+                                    animacion: texto_animado::AnimacionTexto::AparecerPorPalabras,
+                                    salida_animada: true,
+                                    ..Default::default()
+                                },
+                                ..Titulo::default()
+                            },
+                            "Rótulo inferior animado creado; edita el texto en el inspector",
+                        ),
+                        Some(24) => self.add_styled_title_at_playhead(
+                            Titulo {
+                                text: "Escribe aquí tu texto".to_owned(),
+                                size: 72.0,
+                                style: efectos::TitleStyle {
+                                    animacion: texto_animado::AnimacionTexto::MaquinaDeEscribir,
+                                    outline: 3.0,
+                                    ..Default::default()
+                                },
+                                ..Titulo::default()
+                            },
+                            "Texto a máquina creado; escribe el texto en el inspector",
                         ),
                         Some(1) => self.add_adjustment_layer_at_playhead(),
                         Some(2) => self.add_marker(),
@@ -13626,6 +13745,27 @@ impl eframe::App for NovaCutWindows {
                                 .changed();
                             trim_changed |=
                                 ui.checkbox(&mut title.style.shadow, "Sombra paralela").on_hover_text("Sombra detrás del texto para leerlo sobre fondos claros").changed();
+                            theme::section_label(ui, "Animación");
+                            egui::ComboBox::from_id_salt("animacion-titulo")
+                                .selected_text(title.style.animacion.nombre())
+                                .show_ui(ui, |ui| {
+                                    for opcion in texto_animado::AnimacionTexto::TODAS {
+                                        trim_changed |= ui
+                                            .selectable_value(&mut title.style.animacion, opcion, opcion.nombre())
+                                            .changed();
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Cómo entra el texto: letra a letra o palabra a palabra");
+                            ui.add_enabled_ui(
+                                title.style.animacion != texto_animado::AnimacionTexto::Ninguna,
+                                |ui| {
+                                    trim_changed |= ui
+                                        .checkbox(&mut title.style.salida_animada, "Salida animada")
+                                        .on_hover_text("Las letras se van al final del clip, la última en llegar la primera")
+                                        .changed();
+                                },
+                            );
                             let mut matte = title.style.matte.is_some();
                             if ui.checkbox(&mut matte, "Fondo a pantalla completa").on_hover_text("Rellena todo el lienzo con un color bajo el texto").changed() {
                                 title.style.matte = matte.then_some([0.08, 0.08, 0.1]);
@@ -17634,6 +17774,7 @@ fn render_preview_frame_at(
                 fontsize,
                 (canvas_w as u32, canvas_h as u32),
                 Some(local.max(0.0)),
+                clip.duration(),
             );
             filters.push(format!(
                 "[{index}:v:0]{drawing},format=rgba,rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0,colorchannelmixer=aa={opacity:.6}[pv{index}]",
@@ -18221,7 +18362,14 @@ fn build_render_filters(
                 // El tamaño se define sobre 1080p, igual que en el monitor:
                 // así un 720p o un 4K conservan la proporción que se ve.
                 let fontsize = title.size.max(8.0) * out_h as f64 / 1080.0;
-                let drawing = title_layer_filters(title, &font, fontsize, (out_w, out_h), None);
+                let drawing = title_layer_filters(
+                    title,
+                    &font,
+                    fontsize,
+                    (out_w, out_h),
+                    None,
+                    clips[index].duration(),
+                );
                 // Todo en tiempo local del título y el desplazamiento al final:
                 // los fundidos van en su tiempo, no en el segundo 0.
                 let sendcmd = animacion::sendcmd(&commands);
@@ -22530,6 +22678,73 @@ mod render_real_tests {
             export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
             assert!((probe_duration(&output) - 1.0).abs() < 0.2);
         }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn letter_animation_reveals_and_removes_the_title_over_time() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("texto-animado");
+        let clip = RoughClip {
+            out_seconds: 2.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "Hola mundo\nsegunda".to_owned(),
+                size: 120.0,
+                style: efectos::TitleStyle {
+                    animacion: texto_animado::AnimacionTexto::SubirPorLetras,
+                    salida_animada: true,
+                    outline: 2.0,
+                    ..Default::default()
+                },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let lit = |pixels: &[u8], stride: usize| {
+            pixels.chunks(stride).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count()
+        };
+        let monitor = |time: f64| {
+            let frame = render_preview_frame(&[(clip.clone(), time)], Timebase::from_fps(25.0)).unwrap();
+            lit(&frame.pixels, 4)
+        };
+        let (start, middle, end) = (monitor(0.04), monitor(1.2), monitor(1.98));
+        assert!(middle > 300, "a mitad se lee el título ({middle})");
+        assert!(start * 4 < middle, "al empezar casi no hay letras ({start} vs {middle})");
+        assert!(end * 4 < middle, "al final ya se han ido ({end} vs {middle})");
+        let output = directory.join("letras.mp4");
+        export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
+        let early = lit(&frame_rgb(&output, 0.08), 3);
+        let full = lit(&frame_rgb(&output, 1.2), 3);
+        // `frame_rgb` lee el fotograma reducido: basta la proporción.
+        assert!(full > 10 && early * 4 < full, "exportación: {early} → {full}");
+        // Rótulo con caja que entra por palabras: el grafo con la caja
+        // animada también es válido y la caja no está al principio.
+        let lower_third = RoughClip {
+            out_seconds: 2.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "Nombre Apellido\nCargo".to_owned(),
+                size: 60.0,
+                position_y: 0.8,
+                style: efectos::TitleStyle {
+                    box_opacity: 0.8,
+                    animacion: texto_animado::AnimacionTexto::AparecerPorPalabras,
+                    salida_animada: true,
+                    ..Default::default()
+                },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let output = directory.join("rotulo.mp4");
+        export(&[lower_third.clone()], &output, ExportFormat::Mp4Video).unwrap();
+        assert!((probe_duration(&output) - 2.0).abs() < 0.2);
+        let frame = render_preview_frame(&[(lower_third, 0.0)], Timebase::from_fps(25.0)).unwrap();
+        let grey = frame.pixels.chunks(4).filter(|p| p[0] > 20 || p[1] > 20 || p[2] > 20).count();
+        assert_eq!(grey, 0, "la caja no debe verse antes que el texto");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
