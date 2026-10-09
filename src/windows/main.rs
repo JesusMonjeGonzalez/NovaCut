@@ -8016,23 +8016,72 @@ impl NovaCutWindows {
     /// Mezclador: buses por pista, master y sonoridad.
     fn mixer_tab(&mut self, ui: &mut egui::Ui, metadata_changed: &mut bool) {
         let tracks = self.project.audio_track_count().max(1);
+        self.project.sync_track_state();
         self.project.track_gains.resize(tracks, 0.0);
-        for (track, gain) in self.project.track_gains.iter_mut().enumerate() {
-            *metadata_changed |= ui
-                .add(
-                    egui::Slider::new(gain, -60.0..=12.0)
-                        .text(format!("Bus {}", track + 1))
-                        .suffix(" dB"),
+        // Una fila por pista con el nombre de la timeline (A1, A2…) y los
+        // mismos M/S que su cabecera: antes solo había «Bus 1» y un deslizador.
+        let mut toggles = Vec::new();
+        let any_solo = self.project.any_solo();
+        for track in 0..tracks {
+            let muted = self.project.track_mutes.get(track).copied().unwrap_or(false);
+            let solo = self.project.track_solos.get(track).copied().unwrap_or(false);
+            let audible = self.project.track_audible(track);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("A{}", track + 1))
+                        .monospace()
+                        .strong()
+                        .color(if audible { theme::TEXT } else { theme::TEXT_DIM }),
                 )
-                .changed();
+                .on_hover_text(if audible {
+                    "Se oye en la reproducción y en la exportación"
+                } else if any_solo && !solo {
+                    "No se oye: otra pista está en solo"
+                } else {
+                    "No se oye: pista silenciada"
+                });
+                if ui
+                    .selectable_label(muted, "M")
+                    .on_hover_text("Silenciar la pista")
+                    .clicked()
+                {
+                    toggles.push(TrackToggle::Mute(track));
+                }
+                if ui
+                    .selectable_label(solo, "S")
+                    .on_hover_text("Solo: escuchar solo esta pista (y las demás en solo)")
+                    .clicked()
+                {
+                    toggles.push(TrackToggle::Solo(track));
+                }
+                // Deslizador + valor + ↺ dentro de la columna, sin cortarse.
+                ui.spacing_mut().slider_width = (ui.available_width() - 100.0).clamp(50.0, 220.0);
+                let gain = &mut self.project.track_gains[track];
+                *metadata_changed |= ui
+                    .add(egui::Slider::new(gain, -60.0..=12.0).suffix(" dB"))
+                    .on_hover_text("Ganancia de la pista")
+                    .changed();
+                if ui
+                    .add_enabled(gain.abs() > 1e-6, egui::Button::new("↺").small())
+                    .on_hover_text("Volver a 0 dB")
+                    .clicked()
+                {
+                    *gain = 0.0;
+                    *metadata_changed = true;
+                }
+            });
+        }
+        if !toggles.is_empty() {
+            self.apply_track_toggles(&toggles);
         }
         ui.separator();
         *metadata_changed |= ui
             .add(
                 egui::Slider::new(&mut self.project.master_gain_db, -60.0..=12.0)
-                    .text("Master")
+                    .text("Máster")
                     .suffix(" dB"),
             )
+            .on_hover_text("Ganancia final de toda la mezcla")
             .changed();
         *metadata_changed |= ui
             .checkbox(
