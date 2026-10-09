@@ -37,6 +37,23 @@ mod transcripcion;
 mod tutorial;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Trabajos de fondo (exportar, proxies, transcribir, analizar): sin
+/// consola y con prioridad baja. Siguen usando la CPU libre, pero Windows
+/// atiende antes a la interfaz y a las demás aplicaciones; antes todo iba a
+/// prioridad normal y el equipo entero se quedaba al 100 %.
+const BACKGROUND_PROCESS: u32 = CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
+/// «Cuidar el equipo», leído por los trabajos en segundo plano al arrancar.
+static ECO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hilos para un trabajo pesado: todos los núcleos, o la mitad si el usuario
+/// pidió cuidar el equipo (portátiles que se calientan o se quedan sin batería).
+fn heavy_job_threads() -> Option<usize> {
+    ECO_MODE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(|| (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1))
+}
 
 /// Fuera de Windows no hay consola que ocultar: el host de desarrollo en
 /// macOS/Linux acepta la llamada y la ignora.
@@ -2282,7 +2299,7 @@ fn transcribe_mix(
                 "pcm_s16le",
             ])
             .arg(&wav)
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(BACKGROUND_PROCESS)
             .output()
             .map_err(|error| format!("No se pudo preparar audio: {error}"))?;
         if !output.status.success() {
@@ -2297,8 +2314,13 @@ fn transcribe_mix(
             // texto y de los subtítulos animados.
             .args(["-ml", "1", "-sow", "-oj", "-of"])
             .arg(&prefix)
+            .args(
+                heavy_job_threads()
+                    .map(|threads| vec!["-t".to_owned(), threads.to_string()])
+                    .unwrap_or_default(),
+            )
             .args(["-l", "auto"])
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(BACKGROUND_PROCESS)
             .output()
             .map_err(|error| format!("No se pudo iniciar Whisper: {error}"))?;
         if !output.status.success() {
@@ -3104,6 +3126,8 @@ struct NovaCutWindows {
     hw_backends: Vec<aceleracion::HwBackend>,
     hw_detect: Option<Receiver<Vec<aceleracion::HwBackend>>>,
     hardware_encoding: bool,
+    /// «Cuidar el equipo»: exportar y transcribir con la mitad de núcleos.
+    eco_mode: bool,
     ui_scale: f32,
     /// Falso en el primer arranque: se elige un tamaño según la pantalla.
     ui_scale_chosen: bool,
@@ -3157,6 +3181,8 @@ struct NovaCutWindows {
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
     subtitle_query: String,
+    /// Último título enviado a la ventana.
+    window_title: String,
     /// Subtítulo recién creado cuyo texto recibe el foco al dibujarse.
     focus_subtitle: Option<usize>,
     subtitle_offset_ms: f64,
@@ -3375,6 +3401,9 @@ struct UiSettings {
     /// Usa la GPU para H.264/HEVC cuando hay una disponible.
     #[serde(default = "enabled_by_default")]
     hardware_encoding: bool,
+    /// Exportar y transcribir con la mitad de los núcleos.
+    #[serde(default)]
+    eco_mode: bool,
     /// Tamaño de la interfaz (1.0 = 100 %). Accesibilidad y pantallas
     /// grandes; también responde a Ctrl+= / Ctrl+- / Ctrl+0.
     /// `None` hasta que el usuario (o el primer arranque) lo fija.
@@ -3764,6 +3793,7 @@ impl NovaCutWindows {
             loop_playback: self.loop_playback,
             proxy_limit_gb: self.proxy_limit_gb,
             hardware_encoding: self.hardware_encoding,
+            eco_mode: self.eco_mode,
             encode: self.encode_settings,
             ui_scale: Some(self.ui_scale),
             tutorial_done: self.tutorial_visto,
@@ -3825,6 +3855,8 @@ impl NovaCutWindows {
         self.loop_playback = settings.loop_playback;
         self.proxy_limit_gb = settings.proxy_limit_gb.clamp(0.0, 1000.0);
         self.hardware_encoding = settings.hardware_encoding;
+        self.eco_mode = settings.eco_mode;
+        ECO_MODE.store(self.eco_mode, Ordering::Relaxed);
         self.encode_settings = settings.encode;
         if let Some(scale) = settings.ui_scale {
             self.ui_scale = scale.clamp(0.75, 2.0);
@@ -4410,6 +4442,7 @@ impl NovaCutWindows {
             hw_backends: Vec::new(),
             hw_detect: None,
             hardware_encoding: true,
+            eco_mode: false,
             ui_scale: 1.0,
             ui_scale_chosen: false,
             pending_silence_cut: None,
@@ -4443,6 +4476,7 @@ impl NovaCutWindows {
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Inspector,
             subtitle_query: String::new(),
+            window_title: String::new(),
             focus_subtitle: None,
             subtitle_offset_ms: 0.0,
             bottom_open: false,
@@ -5065,7 +5099,7 @@ impl NovaCutWindows {
                             "128k",
                         ])
                         .arg(&target)
-                        .creation_flags(CREATE_NO_WINDOW)
+                        .creation_flags(BACKGROUND_PROCESS)
                         .output()
                         .map_err(|error| format!("No se pudo iniciar FFmpeg: {error}"))?;
                     if output.status.success() {
@@ -5142,7 +5176,7 @@ impl NovaCutWindows {
                 let _graph = attach_graph(&mut command, &filters)?;
                 let output = command
                     .args(["-map", "[analysis]", "-f", "null", "NUL"])
-                    .creation_flags(CREATE_NO_WINDOW)
+                    .creation_flags(BACKGROUND_PROCESS)
                     .output()
                     .map_err(|error| format!("No se pudo iniciar FFmpeg: {error}"))?;
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5229,7 +5263,7 @@ impl NovaCutWindows {
                     "null",
                     "NUL",
                 ])
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(BACKGROUND_PROCESS)
                 .output()
                 .map_err(|error| format!("No se pudo iniciar FFmpeg: {error}"))
                 .and_then(|output| {
@@ -5365,7 +5399,7 @@ impl NovaCutWindows {
                 .args(["-i"])
                 .arg(&clip.path)
                 .args(["-vf", "scdet=threshold=10", "-f", "null", "NUL"])
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(BACKGROUND_PROCESS)
                 .output()
                 .map_err(|error| format!("No se pudo iniciar FFmpeg: {error}"))
                 .and_then(|output| {
@@ -9752,6 +9786,15 @@ impl NovaCutWindows {
                                         ui.end_row();
                                     }
                                 }
+                                ui.label("Equipo");
+                                if ui
+                                    .checkbox(&mut self.eco_mode, "Cuidar el equipo (mitad de núcleos)")
+                                    .on_hover_text("Exporta y transcribe con la mitad de los núcleos: tarda más, pero el equipo no se queda al 100 %, se calienta menos y gasta menos batería")
+                                    .changed()
+                                {
+                                    ECO_MODE.store(self.eco_mode, Ordering::Relaxed);
+                                }
+                                ui.end_row();
                                 ui.label("Duración");
                                 ui.horizontal(|ui| {
                                     let range = self.work_range();
@@ -11383,7 +11426,7 @@ impl NovaCutWindows {
                     chunks_thread.fetch_add(1, Ordering::Release);
                     // Contrapresión: no acumular más de ~1 s en el sink.
                     while sink.len() > 20 {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                 }
             });
@@ -11569,6 +11612,23 @@ impl NovaCutWindows {
         response.on_hover_text(format!("Nivel de audio · L arriba, R abajo · {db}"));
     }
 
+    /// Actualiza la imagen del monitor reutilizando la textura: crear una
+    /// nueva en cada fotograma reservaba y liberaba memoria de vídeo sin parar.
+    fn set_monitor_image(&mut self, context: &egui::Context, image: egui::ColorImage) {
+        match &mut self.preview_texture {
+            Some(texture) if texture.size() == image.size => {
+                texture.set(image, egui::TextureOptions::LINEAR)
+            }
+            _ => {
+                self.preview_texture = Some(context.load_texture(
+                    "program-monitor",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ))
+            }
+        }
+    }
+
     fn poll_playback(&mut self, context: &egui::Context) {
         // Con "solo rango" activo, la reproducción se detiene en la salida.
         let total = match self.work_range() {
@@ -11578,22 +11638,18 @@ impl NovaCutWindows {
         let Some(playback) = &mut self.playback else {
             return;
         };
-        let expected = playback.timebase.frames(playback.elapsed()).max(0) as u64;
+        let elapsed = playback.elapsed();
+        let expected = playback.timebase.frames(elapsed).max(0) as u64;
         let mut reached_end = false;
+        // Si vamos con retraso solo se sube a la GPU el último fotograma: los
+        // intermedios ya no se iban a ver y cada subida cuesta.
+        let mut newest: Option<PreviewFrame> = None;
         while playback.last_consumed < expected {
             match playback.rx.try_recv() {
                 Ok(Some(frame)) => {
                     playback.last_consumed += 1;
                     self.playhead = playback.time_of(playback.last_consumed).clamp(0.0, total);
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [frame.width, frame.height],
-                        &frame.pixels,
-                    );
-                    self.preview_texture = Some(context.load_texture(
-                        "program-monitor",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    newest = Some(frame);
                 }
                 Ok(None) => {
                     reached_end = true;
@@ -11602,14 +11658,23 @@ impl NovaCutWindows {
                 Err(_) => break,
             }
         }
+        // Se repinta cuando toca el siguiente fotograma, no cada 15 ms: a
+        // 25 fps eso eran cinco repintados por fotograma.
+        let next_due = playback.timebase.seconds(playback.last_consumed as i64 + 1) - elapsed;
+        context.request_repaint_after(std::time::Duration::from_secs_f64(next_due.clamp(0.004, 0.05)));
         let rate = playback.rate;
+        let restart_at = playback.start_playhead;
+        if let Some(frame) = newest {
+            let image =
+                egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
+            self.set_monitor_image(context, image);
+        }
         let past_edge = if rate > 0 {
             self.playhead >= total
         } else {
             self.playhead <= 0.0
         };
         if reached_end || past_edge {
-            let restart_at = playback.start_playhead;
             self.playback = None;
             if self.loop_playback && reached_end && rate > 0 {
                 self.playhead = restart_at;
@@ -11763,11 +11828,7 @@ impl NovaCutWindows {
                         [frame.width, frame.height],
                         &frame.pixels,
                     );
-                    self.preview_texture = Some(context.load_texture(
-                        "program-monitor",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.set_monitor_image(context, image);
                 }
                 Err(error) => {
                     self.preview_texture = None;
@@ -11928,9 +11989,6 @@ impl eframe::App for NovaCutWindows {
             || self.import_result.is_some()
         {
             context.request_repaint_after(std::time::Duration::from_millis(150));
-        }
-        if self.playback.is_some() {
-            context.request_repaint_after(std::time::Duration::from_millis(15));
         }
         // Decaimiento del medidor y volumen del monitor.
         if let Some(playback) = &self.playback {
@@ -12387,7 +12445,13 @@ impl eframe::App for NovaCutWindows {
             self.project.name,
             if self.has_unsaved_changes() { " *" } else { "" }
         );
-        context.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // Solo si cambia: cada orden a la ventana pide otro repintado, y
+        // enviarla en todos los fotogramas dejaba la app a 120 fps (y una
+        // CPU entera) sin hacer nada.
+        if self.window_title != title {
+            context.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
         if self.export_result.is_some()
             || self.setup_result.is_some()
             || self.preview_result.is_some()
@@ -17325,7 +17389,7 @@ fn probe_video_pts(path: &Path) -> Vec<f64> {
             "csv=p=0",
         ])
         .arg(path)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -17354,7 +17418,7 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
             "json",
         ])
         .arg(path)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .output()
         .map_err(|error| format!("FFprobe no está disponible: {error}"))?;
     if !output.status.success() {
@@ -17774,7 +17838,7 @@ fn extract_audio_envelope(path: &Path, start: f64, duration: f64) -> Result<Vec<
         ])
         .arg(path)
         .args(["-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .stderr(Stdio::null())
         .output()
         .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
@@ -18541,7 +18605,7 @@ fn render_still(job: &RenderJob) -> Result<(), String> {
         .args(["-map", "[vout]"])
         .args(["-ss", &format_seconds(job.skip), "-frames:v", "1", "-update", "1"])
         .arg(&job.output)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
@@ -18643,6 +18707,10 @@ fn run_export_once(
     let _ = std::fs::remove_file(&error_log);
     let mut command = Command::new(tool_path("ffmpeg.exe"));
     command.arg("-y");
+    let eco_threads = heavy_job_threads();
+    if let Some(threads) = eco_threads {
+        command.args(["-filter_complex_threads", &threads.to_string()]);
+    }
     let (input_indices, is_title_input) =
         push_render_inputs(&mut command, clips, size, false, timebase);
     let filters = build_render_filters(
@@ -18688,10 +18756,13 @@ fn run_export_once(
         // Búsqueda en la salida: exacta al fotograma, y el preroll es corto.
         child.args(["-ss", &format_seconds(job.skip)]);
     }
+    if let Some(threads) = eco_threads {
+        child.args(["-threads", &threads.to_string()]);
+    }
     let mut child = child
         .args(["-t", &format_seconds(total)])
         .arg(&temporary)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log_file))
         .spawn()
@@ -19285,6 +19356,7 @@ fn with_install_script(
     run: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::io::Write;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -22348,6 +22420,29 @@ mod render_real_tests {
         if std::env::var_os("NOVACUT_KEEP_RENDERS").is_none() {
             let _ = std::fs::remove_dir_all(&directory);
         }
+    }
+
+    #[test]
+    fn eco_mode_export_limits_threads_and_still_renders() {
+        if !ffmpeg_available() && skip("FFmpeg no disponible") {
+            return;
+        }
+        let directory = work_dir("modo-eco");
+        let clip = RoughClip {
+            out_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo::default()),
+            ..Default::default()
+        };
+        ECO_MODE.store(true, Ordering::Relaxed);
+        assert!(heavy_job_threads().is_some_and(|threads| threads >= 1));
+        let output = directory.join("eco.mp4");
+        let result = export(&[clip], &output, ExportFormat::Mp4Video);
+        ECO_MODE.store(false, Ordering::Relaxed);
+        result.unwrap();
+        assert!((probe_duration(&output) - 1.0).abs() < 0.2);
+        assert_eq!(heavy_job_threads(), None);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

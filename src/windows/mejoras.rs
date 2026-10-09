@@ -2927,7 +2927,7 @@ fn dimensiones_de_video(ruta: &Path) -> Option<(u32, u32)> {
             "json",
         ])
         .arg(ruta)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .output()
         .ok()?;
     if !salida.status.success() {
@@ -3089,7 +3089,7 @@ fn medir_lufs(ruta: &Path, inicio: f64, duracion: f64) -> Result<f64, String> {
             "null",
             "-",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .output()
         .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     let stderr = String::from_utf8_lossy(&salida.stderr);
@@ -3113,7 +3113,7 @@ fn envolvente(ruta: &Path, inicio: f64, duracion: f64) -> Result<Vec<f32>, Strin
         .arg("-i")
         .arg(ruta)
         .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(BACKGROUND_PROCESS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
