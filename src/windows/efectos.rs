@@ -65,6 +65,8 @@ pub struct ClipFx {
     // --- Lumetri › Curvas HSL secundarias
     /// Ajustes por familia de color (rojos, azules…), en orden.
     pub hsl: Vec<HslAdjust>,
+    /// Curvas HSL dibujables (tono/saturación, tono/tono…), vía LUT 3D.
+    pub curvas_hsl: super::curvas_hsl::CurvasHsl,
     /// Igualación de color con otro plano: ganancia y desplazamiento por
     /// canal R, G, B, calculados por `match_color`.
     pub color_match: Option<ColorMatch>,
@@ -217,7 +219,19 @@ impl ClipFx {
             || self.crop_bottom > 0.0
             || self.reverse
             || self.stabilize
-            || !self.video_color_chain().is_empty()
+            || !self.curvas_hsl.es_neutra()
+            || !self.color_chain_without_curves().is_empty()
+    }
+
+    /// La cadena de color sin las curvas HSL, que escribirían su LUT: para
+    /// preguntas baratas que se hacen en cada fotograma de la interfaz.
+    fn color_chain_without_curves(&self) -> String {
+        if self.curvas_hsl.es_neutra() {
+            return self.video_color_chain();
+        }
+        let mut copia = self.clone();
+        copia.curvas_hsl = Default::default();
+        copia.video_color_chain()
     }
 
     /// Filtros temporales que deben ir al principio de la cadena, justo tras
@@ -357,6 +371,7 @@ impl ClipFx {
                 out.push_str(&filter);
             }
         }
+        out.push_str(&self.curvas_hsl.filtro());
         if self.sharpen > 0.001 {
             out.push_str(&format!(
                 ",unsharp=5:5:{:.3}:5:5:0",
@@ -932,6 +947,22 @@ pub fn inspector_video(
             fx.hsl.push(HslAdjust::default());
             changed = true;
         }
+    });
+    ui.collapsing("Curvas HSL", |ui| {
+        ui.label(
+            egui::RichText::new("Dibuja cómo cambia cada color: la saturación, el tono o la luz de un tono concreto")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        let id = ui.id().with("curva-hsl-activa");
+        let mut curva = ui
+            .ctx()
+            .data(|d| d.get_temp::<u8>(id))
+            .and_then(|i| super::curvas_hsl::Curva::TODAS.get(i as usize).copied())
+            .unwrap_or(super::curvas_hsl::Curva::TonoSaturacion);
+        changed |= super::curvas_hsl::editor(ui, &mut fx.curvas_hsl, &mut curva);
+        let indice = super::curvas_hsl::Curva::TODAS.iter().position(|c| *c == curva).unwrap_or(0) as u8;
+        ui.ctx().data_mut(|d| d.insert_temp(id, indice));
     });
     ui.collapsing("Detalle y textura", |ui| {
         changed |= slider(ui, &mut fx.sharpen, 0.0..=1.0, "Enfocar");

@@ -22,6 +22,7 @@ use std::sync::Arc;
 mod aceleracion;
 mod animacion;
 mod batch;
+mod curvas_hsl;
 mod command_center;
 mod efectos;
 mod fuentes;
@@ -22996,6 +22997,53 @@ mod render_real_tests {
         let flow = duplicates(estabilizar::TimeInterpolation::FlujoOptico);
         assert!(sampled >= 7, "el muestreo debería repetir fotogramas: {sampled}");
         assert!(flow <= 1, "el flujo óptico no debería repetir: {flow}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn hsl_curves_desaturate_one_hue_in_monitor_and_export() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("curvas-hsl");
+        let camera = camera_clip(&directory);
+        let reference = frame_rgb(&export_and_read(camera.clone(), &directory, "referencia.mp4"), 2.0);
+        let mut graded = camera.clone();
+        // Curva tono/saturación con un valle en los azules (2/3 del círculo).
+        graded.fx.curvas_hsl.tono_saturacion = vec![
+            curvas_hsl::Punto { x: 0.45, y: 0.0 },
+            curvas_hsl::Punto { x: 0.667, y: -1.0 },
+            curvas_hsl::Punto { x: 0.85, y: 0.0 },
+        ];
+        let exported = frame_rgb(&export_and_read(graded.clone(), &directory, "curvas.mp4"), 2.0);
+        let spread = |pixel: &[u8]| {
+            (*pixel.iter().max().unwrap() as f64) - (*pixel.iter().min().unwrap() as f64)
+        };
+        let measure = |after: &[u8], before: &[u8]| {
+            let (mut blue, mut blue_n, mut red, mut red_n) = (0.0, 0.0, 0.0, 0.0);
+            for (b0, b1) in before.chunks_exact(3).zip(after.chunks_exact(3)) {
+                let (r, g, b) = (b0[0] as i32, b0[1] as i32, b0[2] as i32);
+                if b > 150 && r < 90 && g < 90 {
+                    blue += spread(b1) / spread(b0).max(1.0);
+                    blue_n += 1.0;
+                } else if r > 150 && g < 90 && b < 90 {
+                    red += spread(b1) / spread(b0).max(1.0);
+                    red_n += 1.0;
+                }
+            }
+            assert!(blue_n > 20.0 && red_n > 20.0, "la carta de prueba cambió");
+            (blue / blue_n, red / red_n)
+        };
+        let (blue, red) = measure(&exported, &reference);
+        assert!(blue < 0.35, "los azules siguen saturados ({blue:.2})");
+        assert!(red > 0.85, "los rojos no deberían cambiar ({red:.2})");
+        // El monitor compone con la misma LUT.
+        let frame = render_preview_frame(&[(graded, 2.0)], Timebase::from_fps(25.0)).unwrap();
+        let reference_frame =
+            render_preview_frame(&[(camera, 2.0)], Timebase::from_fps(25.0)).unwrap();
+        let rgb = |pixels: &[u8]| pixels.chunks_exact(4).flat_map(|p| p[..3].to_vec()).collect::<Vec<u8>>();
+        let (blue, red) = measure(&rgb(&frame.pixels), &rgb(&reference_frame.pixels));
+        assert!(blue < 0.35 && red > 0.85, "monitor: azul {blue:.2}, rojo {red:.2}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

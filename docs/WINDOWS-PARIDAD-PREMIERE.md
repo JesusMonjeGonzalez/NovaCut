@@ -262,8 +262,9 @@ Pendiente de UX:
    rechaza en vez de desincronizar.
 2. **Previsualización en el monitor** de efectos temporales (estabilizar,
    grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
-3. **Curvas HSL dibujables** (tono contra saturación); hoy la HSL secundaria es
-   por familias de color.
+3. ~~**Curvas HSL dibujables**~~ (9 oct 2026, `curvas_hsl.rs`): tono/saturación,
+   tono/tono, tono/luminancia y luminancia/saturación, aplicadas como LUT 3D
+   (.cube 33³ cacheada por contenido) con `lut3d`; monitor y exportación iguales.
 4. **Plantillas de gráficos animadas** (.mogrt) y animación de texto por letra.
 5. **Render en segundo plano de la timeline** (barra roja/amarilla/verde) para
    reproducir en tiempo real efectos pesados como el flujo óptico.
