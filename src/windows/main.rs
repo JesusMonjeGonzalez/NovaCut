@@ -5949,6 +5949,13 @@ impl NovaCutWindows {
         }
         let before = self.project.clone();
         let mut append_at = self.project.duration();
+        let batch_start = append_at;
+        let batch_has_video = target.is_none()
+            && results
+                .iter()
+                .any(|(_, result)| result.as_ref().is_ok_and(|probe| probe.has_video));
+        let mut soundtrack_at = batch_start;
+        let mut soundtrack: Vec<usize> = Vec::new();
         let mut imported = 0;
         let mut variable_frame_rate = 0;
         let mut errors: Vec<String> = Vec::new();
@@ -6013,15 +6020,43 @@ impl NovaCutWindows {
                         clip.track = target.track;
                         clip.has_video = target.is_video;
                         clip.has_audio = !target.is_video;
+                        append_at += probe.duration;
+                    } else if !clip.has_video && batch_has_video {
+                        // Música o voz en off importada junto a vídeos: va
+                        // debajo de ellos, desde su inicio, en la primera
+                        // pista de audio libre. Antes se ponía detrás de los
+                        // vídeos y dejaba la imagen en negro.
+                        clip.timeline_start = soundtrack_at;
+                        soundtrack_at += probe.duration;
+                        soundtrack.push(clips_to_add.len());
                     } else {
                         clip.timeline_start = append_at;
+                        append_at += probe.duration;
                     }
-                    append_at += probe.duration;
                     clips_to_add.push(clip);
                     imported += 1;
                 }
                 Ok(_) => errors.push("FFprobe no devolvió una duración válida".to_owned()),
                 Err(error) => errors.push(error),
+            }
+        }
+        if !soundtrack.is_empty() {
+            let span_end = soundtrack_at;
+            let lane_busy = |track: usize| {
+                self.project
+                    .clips
+                    .iter()
+                    .chain(clips_to_add.iter().filter(|clip| clip.has_video))
+                    .any(|clip| {
+                        clip.has_audio
+                            && clip.track == track
+                            && clip.timeline_start < span_end - 0.001
+                            && batch_start < clip.timeline_start + clip.duration() - 0.001
+                    })
+            };
+            let track = (0..).find(|track| !lane_busy(*track)).unwrap_or(0);
+            for index in soundtrack {
+                clips_to_add[index].track = track;
             }
         }
         let library_only = std::mem::take(&mut self.import_library_only);
