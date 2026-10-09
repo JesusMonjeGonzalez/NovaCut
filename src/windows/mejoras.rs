@@ -2574,6 +2574,58 @@ pub(super) fn enlazados(clips: &[RoughClip], indice: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Rodar, desplazar o deslizar cambian inicio, entrada y salida de uno o dos
+/// clips; su audio (o vídeo) enlazado recibe los mismos incrementos para no
+/// desincronizarse. Las parejas comparten velocidad y ancla, así que el
+/// mismo delta deja el mismo instante de origen bajo el mismo fotograma.
+/// Devuelve `false` (sin tocar nada) si alguna pareja se saldría de su medio.
+pub(super) fn sincronizar_parejas(actuales: &mut [RoughClip], antes: &[RoughClip], bloqueados: &[bool]) -> bool {
+    if actuales.len() != antes.len() {
+        return true;
+    }
+    let cambia = |a: &RoughClip, b: &RoughClip| {
+        (a.timeline_start - b.timeline_start).abs() > 1e-6
+            || (a.in_seconds - b.in_seconds).abs() > 1e-6
+            || (a.out_seconds - b.out_seconds).abs() > 1e-6
+    };
+    let cambiados: Vec<usize> = (0..antes.len()).filter(|i| cambia(&actuales[*i], &antes[*i])).collect();
+    let mut nuevos: Vec<(usize, RoughClip)> = Vec::new();
+    for &indice in &cambiados {
+        let (ahora, previo) = (&actuales[indice], &antes[indice]);
+        let delta_inicio = ahora.timeline_start - previo.timeline_start;
+        let delta_entrada = ahora.in_seconds - previo.in_seconds;
+        let delta_salida = ahora.out_seconds - previo.out_seconds;
+        for pareja in enlazados(antes, indice) {
+            if cambiados.contains(&pareja) || nuevos.iter().any(|(otro, _)| *otro == pareja) {
+                continue;
+            }
+            if bloqueados.get(pareja).copied().unwrap_or(true) {
+                return false;
+            }
+            let mut copia = antes[pareja].clone();
+            copia.timeline_start += delta_inicio;
+            copia.in_seconds += delta_entrada;
+            copia.out_seconds += delta_salida;
+            let limite = copia.source_duration_seconds.unwrap_or(f64::INFINITY);
+            if copia.in_seconds < -1e-6
+                || copia.out_seconds <= copia.in_seconds + 1e-6
+                || copia.out_seconds > limite + 1e-6
+                || copia.timeline_start < -1e-6
+            {
+                return false;
+            }
+            copia.in_seconds = copia.in_seconds.max(0.0);
+            copia.timeline_start = copia.timeline_start.max(0.0);
+            nuevos.push((pareja, copia));
+        }
+    }
+    for (pareja, copia) in nuevos {
+        actuales[pareja] = copia;
+    }
+    true
+}
+
+
 /// Recorta las parejas enlazadas del clip `indice` igual que a él:
 /// `(cabeza, cola)` como en `montaje::retime`. Con ripple, la pareja
 /// conserva su inicio y lo que viene detrás en su carril se desplaza lo
@@ -3882,6 +3934,46 @@ mod tests {
             end: fin,
             text: texto.to_owned(),
         }
+    }
+
+    #[test]
+    fn rodar_y_desplazar_arrastran_el_audio_enlazado() {
+        let tramo = |ruta: &str, inicio: f64, entrada: f64, salida: f64, video: bool| RoughClip {
+            path: PathBuf::from(ruta),
+            timeline_start: inicio,
+            in_seconds: entrada,
+            out_seconds: salida,
+            source_duration_seconds: Some(10.0),
+            has_video: video,
+            has_audio: !video,
+            ..Default::default()
+        };
+        let antes = vec![
+            tramo("a.mp4", 0.0, 0.0, 4.0, true),
+            tramo("a.mp4", 0.0, 0.0, 4.0, false),
+            tramo("b.mp4", 4.0, 2.0, 6.0, true),
+            tramo("b.mp4", 4.0, 2.0, 6.0, false),
+        ];
+        let libres = vec![false; antes.len()];
+        let mut rodado = antes.clone();
+        montaje::roll(&mut rodado, 0, 2, 1.0).unwrap();
+        assert!(sincronizar_parejas(&mut rodado, &antes, &libres));
+        assert_eq!(rodado[1].out_seconds, 5.0);
+        assert_eq!((rodado[3].timeline_start, rodado[3].in_seconds), (5.0, 3.0));
+        let mut desplazado = antes.clone();
+        montaje::slip(&mut desplazado[2], 1.0).unwrap();
+        assert!(sincronizar_parejas(&mut desplazado, &antes, &libres));
+        assert_eq!(
+            (desplazado[3].in_seconds, desplazado[3].out_seconds),
+            (desplazado[2].in_seconds, desplazado[2].out_seconds)
+        );
+        // Si el audio no tiene material, no se toca nada.
+        let mut corto = antes.clone();
+        corto[3].source_duration_seconds = Some(6.0);
+        let mut sin_sitio = corto.clone();
+        montaje::slip(&mut sin_sitio[2], 1.0).unwrap();
+        sin_sitio[2].source_duration_seconds = Some(10.0);
+        assert!(!sincronizar_parejas(&mut sin_sitio, &corto, &libres));
     }
 
     #[test]

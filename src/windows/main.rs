@@ -7682,7 +7682,22 @@ impl NovaCutWindows {
                     }
                     _ => None,
                 };
+                // El audio separado y enlazado acompaña a su vídeo: antes
+                // estas tres herramientas lo dejaban atrás, desincronizado.
+                let synced = applied.is_some()
+                    && (!self.mejoras.enlace_av || {
+                        let locked: Vec<bool> = before
+                            .clips
+                            .iter()
+                            .map(|clip| self.project.clip_locked(clip))
+                            .collect();
+                        mejoras::sincronizar_parejas(&mut clips, &before.clips, &locked)
+                    });
                 match applied {
+                    Some(_) if !synced => {
+                        self.status =
+                            "El audio enlazado no tiene material para acompañar esa edición".to_owned();
+                    }
                     Some(_) => {
                         self.project.clips = clips;
                         self.request_preview();

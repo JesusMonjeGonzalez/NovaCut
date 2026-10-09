@@ -256,9 +256,10 @@ Pendiente de UX:
 
 ## Lo que sigue faltando frente a Premiere
 
-1. **Bloqueo de sincronía completo**: arrastrar, borrar y recortar un plano
-   lleva su audio enlazado y cerrar huecos no desincroniza; rodar, desplazar
-   y deslizar siguen actuando sobre un solo clip.
+1. ~~**Bloqueo de sincronía completo**~~ (9 oct 2026): arrastrar, borrar,
+   recortar, rodar, desplazar, deslizar y cerrar huecos llevan su audio
+   enlazado; si el audio no tiene material para acompañar, la edición se
+   rechaza en vez de desincronizar.
 2. **Previsualización en el monitor** de efectos temporales (estabilizar,
    grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
 3. **Curvas HSL dibujables** (tono contra saturación); hoy la HSL secundaria es
