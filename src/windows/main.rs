@@ -5428,7 +5428,7 @@ impl NovaCutWindows {
         else {
             return;
         };
-        match std::fs::read_to_string(&path)
+        match editorcito::subtitles::read_text_file(&path)
             .map_err(|error| format!("No se pudo leer SRT: {error}"))
             .and_then(|content| parse_srt(&content))
         {
@@ -6636,13 +6636,11 @@ impl NovaCutWindows {
 
     /// Nombre de archivo propuesto: el del proyecto con la extensión.
     fn suggested_export_name(&self) -> String {
-        let stem: String = self
-            .project
-            .name
-            .chars()
-            .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
-            .collect();
-        let stem = stem.trim();
+        let stem = if self.project.name.trim().is_empty() {
+            String::new()
+        } else {
+            mejoras::nombre_de_archivo(&self.project.name)
+        };
         if stem.is_empty() {
             self.export_format.default_file_name().to_owned()
         } else {

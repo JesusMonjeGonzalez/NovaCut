@@ -95,6 +95,49 @@ fn parse_srt_timestamp(value: &str) -> Option<f64> {
     Some((hours * 3_600_000 + minutes * 60_000 + whole * 1000 + millis) as f64 / 1000.0)
 }
 
+/// Texto de un archivo de subtítulos o intercambio en la codificación en que
+/// suele llegar: UTF-8 (con o sin BOM), UTF-16 con BOM (Bloc de notas
+/// «Unicode») o, si no es UTF-8 válido, Windows-1252, la de casi todos los
+/// SRT en español descargados. Nunca falla: lo indescifrable queda como «�».
+pub fn decode_text(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    let utf16 = |rest: &[u8], little: bool| {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|pair| if little { u16::from_le_bytes([pair[0], pair[1]]) } else { u16::from_be_bytes([pair[0], pair[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, true);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, false);
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    // 0x80–0x9F de Windows-1252; el resto coincide con Latin-1.
+    const CP1252: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
+        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+    ];
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            0x80..=0x9F => CP1252[(byte - 0x80) as usize],
+            _ => byte as char,
+        })
+        .collect()
+}
+
+/// Lee un archivo de texto con `decode_text`.
+pub fn read_text_file(path: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| decode_text(&bytes))
+}
+
 pub fn parse_srt(content: &str) -> Result<Vec<Subtitle>, String> {
     let normalized = content
         .trim_start_matches('\u{feff}')
@@ -157,6 +200,26 @@ mod tests {
                 text: "HOLA otra vez".into(),
             },
         ]
+    }
+
+    #[test]
+    fn decodes_windows_1252_utf16_and_bom() {
+        let latin = b"1\r\n00:00:01,000 --> 00:00:02,000\r\n\xbfQu\xe9 tal? \x93ni\xf1o\x94 \x80\r\n";
+        let text = decode_text(latin);
+        assert!(text.contains("¿Qué tal? “niño” €"), "{text}");
+        assert_eq!(parse_srt(&text).unwrap()[0].text, "¿Qué tal? “niño” €");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "Año ñ".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        assert_eq!(decode_text(&utf16), "Año ñ");
+        let mut utf16be = vec![0xFE, 0xFF];
+        for unit in "Año".encode_utf16() {
+            utf16be.extend(unit.to_be_bytes());
+        }
+        assert_eq!(decode_text(&utf16be), "Año");
+        assert_eq!(decode_text("\u{feff}Año".as_bytes()), "Año");
+        assert_eq!(decode_text("Año".as_bytes()), "Año");
     }
 
     #[test]

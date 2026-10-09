@@ -896,7 +896,7 @@ impl NovaCutWindows {
         else {
             return;
         };
-        let texto = match std::fs::read_to_string(&ruta) {
+        let texto = match editorcito::subtitles::read_text_file(&ruta) {
             Ok(texto) => texto,
             Err(error) => {
                 self.status = format!("No se pudo leer {}: {error}", ruta.display());
@@ -3501,8 +3501,10 @@ fn nombre_libre(ruta: &Path, usados: &mut HashSet<String>) -> String {
     candidato
 }
 
-/// Nombre de proyecto apto como nombre de archivo en Windows.
-fn nombre_de_archivo(nombre: &str) -> String {
+/// Nombre de proyecto apto como nombre de archivo en Windows: sin
+/// caracteres prohibidos ni de control, sin punto o espacio final y sin
+/// nombres reservados del sistema (CON, NUL, COM1…), que Windows rechaza.
+pub(super) fn nombre_de_archivo(nombre: &str) -> String {
     let limpio: String = nombre
         .chars()
         .map(|caracter| {
@@ -3513,9 +3515,16 @@ fn nombre_de_archivo(nombre: &str) -> String {
             }
         })
         .collect();
-    let limpio = limpio.trim().trim_end_matches('.').to_owned();
+    let limpio = limpio.trim().trim_end_matches(['.', ' ']).to_owned();
+    let tallo = limpio.split('.').next().unwrap_or("").trim_end().to_uppercase();
+    let reservado = matches!(tallo.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (tallo.len() == 4
+            && (tallo.starts_with("COM") || tallo.starts_with("LPT"))
+            && tallo.as_bytes()[3].is_ascii_digit());
     if limpio.is_empty() {
         "NovaCut".to_owned()
+    } else if reservado {
+        format!("{limpio}_")
     } else {
         limpio
     }
@@ -3719,10 +3728,12 @@ fn xml(texto: &str) -> String {
 /// URL `file://` de una ruta local, con lo que no es seguro codificado.
 fn url_de_archivo(ruta: &Path) -> String {
     let texto = ruta.to_string_lossy().replace('\\', "/");
-    let mut url = String::from("file://");
-    if !texto.starts_with('/') {
-        url.push('/');
-    }
+    // Ruta de red `\\servidor\recurso`: `file://servidor/recurso`.
+    let (mut url, texto) = match texto.strip_prefix("//") {
+        Some(red) => (String::from("file://"), red.to_owned()),
+        None if texto.starts_with('/') => (String::from("file://"), texto),
+        None => (String::from("file:///"), texto),
+    };
     for byte in texto.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
@@ -4192,6 +4203,12 @@ mod tests {
             PathBuf::from("X:/Medios/plano.mp4")
         );
         assert_eq!(nombre_de_archivo("Episodio 3: ¿qué?"), "Episodio 3_ ¿qué_");
+        assert_eq!(nombre_de_archivo("con"), "con_");
+        assert_eq!(nombre_de_archivo("COM1"), "COM1_");
+        assert_eq!(nombre_de_archivo("Nul.final"), "Nul.final_");
+        assert_eq!(nombre_de_archivo("Consola"), "Consola");
+        assert_eq!(nombre_de_archivo("Toma. . "), "Toma");
+        assert_eq!(nombre_de_archivo("a\tb"), "a_b");
     }
 
     #[test]
@@ -4259,6 +4276,13 @@ mod tests {
             text: "Hola".to_owned(),
         };
         assert_eq!(dividir_subtitulos(&[corto], 42).1, 0);
+    }
+
+    #[test]
+    fn las_urls_de_medios_valen_para_discos_y_rutas_de_red() {
+        assert_eq!(url_de_archivo(Path::new("C:\\Medios\\a b.mov")), "file:///C:/Medios/a%20b.mov");
+        assert_eq!(url_de_archivo(Path::new("/Users/ana/Música.wav")), "file:///Users/ana/M%C3%BAsica.wav");
+        assert_eq!(url_de_archivo(Path::new("\\\\nas\\Medios\\a.mov")), "file://nas/Medios/a.mov");
     }
 
     #[test]
