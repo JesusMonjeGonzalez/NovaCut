@@ -44,12 +44,12 @@ impl Field {
             Self::X => ("X (px)", -7680.0, 7680.0),
             Self::Y => ("Y (px)", -4320.0, 4320.0),
             Self::Scale => ("Escala (%)", 1.0, 800.0),
-            Self::Rotation => ("Rotacion", -3600.0, 3600.0),
+            Self::Rotation => ("Rotación", -3600.0, 3600.0),
             Self::Opacity => ("Opacidad (%)", 0.0, 100.0),
-            Self::Exposure => ("Exposicion", -1.0, 1.0),
+            Self::Exposure => ("Exposición", -1.0, 1.0),
             Self::Contrast => ("Contraste", -1.0, 1.0),
-            Self::Saturation => ("Saturacion", -1.0, 1.0),
-            Self::Vignette => ("Vineta", -1.0, 1.0),
+            Self::Saturation => ("Saturación", -1.0, 1.0),
+            Self::Vignette => ("Viñeta", -1.0, 1.0),
             Self::Blur => ("Desenfoque", 0.0, 1.0),
             Self::Gain => ("Ganancia (dB)", -96.0, 24.0),
             Self::Pan => ("Balance L/R", -1.0, 1.0),
@@ -122,7 +122,7 @@ impl Field {
 }
 
 const CATEGORIES: [&str; 5] = [
-    "Transformacion",
+    "Transformación",
     "Color y efectos",
     "Audio",
     "Fundidos",
@@ -377,7 +377,7 @@ impl NovaCutWindows {
         if ui
             .add_enabled(
                 self.attribute_clipboard.is_some(),
-                egui::Button::new("Pegar atributos..."),
+                egui::Button::new("Pegar atributos…"),
             )
             .on_hover_text("Elige qué atributos copiados pegar en los seleccionados")
             .on_disabled_hover_text("Elige qué atributos copiados pegar en los seleccionados")

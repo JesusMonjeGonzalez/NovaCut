@@ -1691,6 +1691,42 @@ fn span_hits_complex_clip(
 /// Abre un hueco en una pista partiendo el clip lineal que cruce el punto y
 /// desplazando todo lo que quede a la derecha. La operación es atómica: si el
 /// corte cae dentro de una rampa o secuencia anidada, no modifica nada.
+/// Copias de `indices` justo detrás del tramo que ocupan. En sus pistas, lo
+/// que venía después se empuja para dejarles sitio (antes las copias caían
+/// encima, solapadas). Devuelve los clips empujados y las copias, o `None`
+/// si habría que partir una rampa o una secuencia anidada.
+fn duplicate_after(clips: &[RoughClip], indices: &[usize]) -> Option<(Vec<RoughClip>, Vec<RoughClip>)> {
+    let span_start = indices
+        .iter()
+        .map(|index| clips[*index].timeline_start)
+        .fold(f64::INFINITY, f64::min);
+    let span_end = indices
+        .iter()
+        .map(|index| clips[*index].timeline_start + clips[*index].duration())
+        .fold(0.0, f64::max);
+    let shift = span_end - span_start;
+    let copies: Vec<RoughClip> = indices
+        .iter()
+        .map(|index| {
+            let mut copy = clips[*index].clone();
+            copy.timeline_start += shift;
+            copy
+        })
+        .collect();
+    let mut edited = clips.to_vec();
+    let mut lanes: Vec<(usize, bool)> = Vec::new();
+    for index in indices {
+        let lane = (clips[*index].track, clips[*index].has_video);
+        if !lanes.contains(&lane) {
+            lanes.push(lane);
+            if !ripple_track_at(&mut edited, lane.0, lane.1, span_end, shift) {
+                return None;
+            }
+        }
+    }
+    Some((edited, copies))
+}
+
 fn ripple_track_at(
     clips: &mut Vec<RoughClip>,
     track: usize,
@@ -4813,7 +4849,7 @@ impl NovaCutWindows {
     /// Monitor del programa ocupando toda la ventana; Esc o el botón salen.
     fn show_fullscreen_monitor(&mut self, context: &egui::Context) {
         let mut exit =
-            context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Escape));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(context, |ui| {
@@ -10244,37 +10280,18 @@ impl NovaCutWindows {
 
     /// Pega lo copiado empezando en el cabezal, respetando las distancias
     /// originales entre clips.
+    /// Ctrl+V: pega lo copiado en el cabezal sobrescribiendo lo que haya
+    /// debajo, como en Premiere. Antes solo añadía los clips y quedaban
+    /// encima de los existentes, ocultándolos.
     fn paste_clip(&mut self) {
         if self.clip_clipboard_group.is_empty() {
             self.status = "No hay ningún clip copiado".to_owned();
             return;
         }
-        if self
-            .clip_clipboard_group
-            .iter()
-            .any(|clip| self.project.lane_locked(clip.track, clip.has_video))
-        {
-            self.status = "La pista de destino está bloqueada".to_owned();
-            return;
+        self.overwrite_at_playhead();
+        if let Some(count) = self.status.strip_suffix(" superpuesto(s) en el cabezal") {
+            self.status = format!("{count} pegado(s) en el cabezal");
         }
-        let before = self.project.clone();
-        let start = self.playhead.max(0.0);
-        let first_new = self.project.clips.len();
-        let pasted: Vec<RoughClip> = self
-            .clip_clipboard_group
-            .iter()
-            .map(|clip| {
-                let mut copy = clip.clone();
-                copy.timeline_start += start;
-                copy
-            })
-            .collect();
-        let count = pasted.len();
-        self.project.clips.extend(pasted);
-        self.selection = (first_new..self.project.clips.len()).collect();
-        self.selected = Some(first_new);
-        self.finish_edit(before);
-        self.status = format!("{count} clip(s) pegado(s) en el cabezal");
     }
 
     /// Duplica la selección justo detrás de sí misma.
@@ -10289,27 +10306,13 @@ impl NovaCutWindows {
             return;
         }
         let before = self.project.clone();
-        let span_start = indices
-            .iter()
-            .map(|index| self.project.clips[*index].timeline_start)
-            .fold(f64::INFINITY, f64::min);
-        let span_end = indices
-            .iter()
-            .map(|index| {
-                let clip = &self.project.clips[*index];
-                clip.timeline_start + clip.duration()
-            })
-            .fold(0.0, f64::max);
-        let shift = span_end - span_start;
+        let Some((edited, copies)) = duplicate_after(&self.project.clips, &indices) else {
+            self.status =
+                "No se puede duplicar delante de una rampa o secuencia anidada".to_owned();
+            return;
+        };
+        self.project.clips = edited;
         let first_new = self.project.clips.len();
-        let copies: Vec<RoughClip> = indices
-            .iter()
-            .map(|index| {
-                let mut copy = self.project.clips[*index].clone();
-                copy.timeline_start += shift;
-                copy
-            })
-            .collect();
         let count = copies.len();
         self.project.clips.extend(copies);
         self.selection = (first_new..self.project.clips.len()).collect();
@@ -11914,10 +11917,7 @@ impl eframe::App for NovaCutWindows {
             }
         }
         let center_key = context.input_mut(|input| {
-            input.consume_key(
-                egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
-                egui::Key::P,
-            )
+            consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::P)
         });
         if center_key && self.pending_document_action.is_none() && self.pending_recovery.is_none() {
             if self.command_center.open {
@@ -11929,27 +11929,27 @@ impl eframe::App for NovaCutWindows {
         let center_blocks_keys = self.command_center.open || center_key;
         let keyboard_shortcuts = !center_blocks_keys && !context.wants_keyboard_input();
         let select_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::A));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::A));
         let track_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::U));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::U));
         let blade_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::C));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::C));
         let trim_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::R));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::R));
         let ripple_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::T));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::T));
         let hand_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::H));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::H));
         let zoom_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Z));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Z));
         let magic_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::G));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::G));
         let roll_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::N));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::N));
         let slide_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Y));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::SHIFT, egui::Key::Y));
         let slip_tool_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Y));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Y));
         // Levantar (;) y Extraer ('), como en Premiere. En teclados españoles
         // «;» lleva Mayús, así que se aceptan ambas.
         let lift_key = keyboard_shortcuts
@@ -11960,94 +11960,85 @@ impl eframe::App for NovaCutWindows {
         let extract_key = keyboard_shortcuts
             && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Quote));
         let goto_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::G));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::G));
         let detach_audio_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::L));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::L));
         let undo_shortcut = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::Z));
         let redo_shortcut = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
-                    || input.consume_key(
-                        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
-                        egui::Key::Z,
-                    )
+                consume_exact(input, egui::Modifiers::CTRL, egui::Key::Y)
+                    || consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z)
             });
         let save_shortcut = !center_blocks_keys
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::S));
         let split_shortcut = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::K));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::K));
         let nle_split = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::S));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::S));
         let delete_selected = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
-                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                consume_exact(input, egui::Modifiers::NONE, egui::Key::Delete)
+                    || consume_exact(input, egui::Modifiers::NONE, egui::Key::Backspace)
             });
         let ripple_delete = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(egui::Modifiers::SHIFT, egui::Key::Delete)
-                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Backspace)
+                consume_exact(input, egui::Modifiers::SHIFT, egui::Key::Delete)
+                    || consume_exact(input, egui::Modifiers::SHIFT, egui::Key::Backspace)
             });
         let go_home = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Home));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Home));
         let go_end = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::End));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::End));
         let nudge_left = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::ArrowLeft));
         let nudge_right = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::ArrowRight));
         let jump_left = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
         let jump_right = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+                consume_exact(input, egui::Modifiers::SHIFT, egui::Key::ArrowRight)
             });
         let previous_cut = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::ArrowUp));
         let next_cut = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::ArrowDown));
         let mark_in = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::I));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::I));
         let mark_out = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::O));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::O));
         let clear_range = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::X));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::ALT, egui::Key::X));
         let trim_start_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Q));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Q));
         let trim_end_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::W));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::W));
         let extend_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::E));
         let match_frame_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::F));
         let copy_clip_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::C));
         let paste_clip_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::V));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::V));
         let duplicate_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::D));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::D));
         let copy_attributes_key = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::CTRL.plus(egui::Modifiers::ALT),
-                    egui::Key::C,
-                )
+                consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::ALT), egui::Key::C)
             });
         let paste_attributes_key = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::CTRL.plus(egui::Modifiers::ALT),
-                    egui::Key::V,
-                )
+                consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::ALT), egui::Key::V)
             });
         let fit_zoom_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Z));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::SHIFT, egui::Key::Z));
         let zoom_in_key = !center_blocks_keys
             && context.input_mut(|input| {
                 input.consume_key(egui::Modifiers::CTRL, egui::Key::CloseBracket)
@@ -12066,23 +12057,20 @@ impl eframe::App for NovaCutWindows {
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Minus));
         let taller_tracks = !center_blocks_keys
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::ALT, egui::Key::ArrowUp));
         let shorter_tracks = !center_blocks_keys
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::ALT, egui::Key::ArrowDown));
         let import_key = !center_blocks_keys
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::I));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::I));
         let open_key = !center_blocks_keys
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::O));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::O));
         let export_key = !center_blocks_keys
             && context.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
-                    egui::Key::E,
-                ) || input.consume_key(egui::Modifiers::CTRL, egui::Key::M)
+                consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::E) || consume_exact(input, egui::Modifiers::CTRL, egui::Key::M)
             });
         let select_all_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::A));
         // Con un menú abierto, Esc es para cerrarlo (y no quita la selección):
         // se deja sin consumir para que el menú lo vea.
         let menu_open =
@@ -12093,54 +12081,51 @@ impl eframe::App for NovaCutWindows {
         let deselect_key = keyboard_shortcuts
             && !menu_open
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Escape));
         let split_all_key = keyboard_shortcuts
             && context.input_mut(|input| {
-                input.consume_key(
-                    egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
-                    egui::Key::K,
-                )
+                consume_exact(input, egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::K)
             });
         let overwrite_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::B));
         let insert_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::V));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::V));
         let toggle_enabled_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::D));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::D));
         let nudge_clip_left = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::ArrowLeft));
         let nudge_clip_right = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::CTRL, egui::Key::ArrowRight));
         let shortcuts_key = keyboard_shortcuts
             && context.input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Questionmark)
             });
         let add_marker_shortcut = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::M));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::M));
         // Intro renderiza la previsualización de I–O, como en Premiere; si
         // hay un control enfocado con el teclado, Intro sigue siendo suyo.
         let render_key = keyboard_shortcuts
             && context.memory(|memory| memory.focused().is_none())
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Enter));
         let cam1 = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Num1));
         let cam2 = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Num2));
         let cam3 = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Num3));
         let cam4 = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Num4));
         let preview_shortcut = keyboard_shortcuts
             && context
-                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+                .input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::Space));
         let play_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::L));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::L));
         let stop_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::K));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::K));
         let reverse_key = keyboard_shortcuts
-            && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::J));
+            && context.input_mut(|input| consume_exact(input, egui::Modifiers::NONE, egui::Key::J));
         // Con K pulsada, J y L avanzan fotograma a fotograma, como en Premiere.
         let k_held = keyboard_shortcuts && context.input(|input| input.key_down(egui::Key::K));
         for (pressed, tool) in [
@@ -16444,10 +16429,15 @@ impl eframe::App for NovaCutWindows {
                                     format!("Fundido de salida {:.2} s", current.fade_out_seconds)
                                 }
                                 DragKind::Move => format!(
-                                    "Δ {:+.2} s  ·  {}{}",
+                                    "Δ {:+.2} s  ·  {}{}{}",
                                     current.timeline_start - original.timeline_start,
                                     if current.has_video { "V" } else { "A" },
-                                    current.track + 1
+                                    current.track + 1,
+                                    if self.selection.len() > 1 {
+                                        format!("  ·  {} clips", self.selection.len())
+                                    } else {
+                                        String::new()
+                                    }
                                 ),
                                 DragKind::TrimStart | DragKind::RippleTrimStart => format!(
                                     "Entrada {}  ·  duración {}",
@@ -16482,25 +16472,30 @@ impl eframe::App for NovaCutWindows {
                                     timecode(current.timeline_start, self.project.fps)
                                 ),
                             };
+                            // En la regla, junto al puntero: sobre las pistas
+                            // tapaba justo los clips que se estaban moviendo.
+                            let info_width = 250.0;
                             let info_rect = egui::Rect::from_min_size(
                                 egui::pos2(
-                                    (pointer.x + 14.0).min(lane_rect.right() - 212.0),
-                                    (pointer.y - 34.0).max(lanes_area.top() + 4.0),
+                                    (pointer.x + 10.0)
+                                        .min(lane_rect.right() - info_width - 4.0)
+                                        .max(lane_rect.left()),
+                                    ruler_rect.top() + 1.0,
                                 ),
-                                egui::vec2(206.0, 25.0),
+                                egui::vec2(info_width, ruler_rect.height() - 2.0),
                             );
-                            lane_painter.rect_filled(
+                            painter.rect_filled(
                                 info_rect,
                                 4.0,
-                                egui::Color32::from_black_alpha(230),
+                                egui::Color32::from_black_alpha(235),
                             );
-                            lane_painter.rect_stroke(
+                            painter.rect_stroke(
                                 info_rect,
                                 4.0,
                                 egui::Stroke::new(1.0_f32, theme::ACCENT),
                                 egui::StrokeKind::Inside,
                             );
-                            lane_painter.text(
+                            painter.text(
                                 info_rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 message,
@@ -19167,6 +19162,24 @@ fn default_fps() -> f64 {
 }
 
 /// Timecode HH:MM:SS:FF como el visor de la app macOS.
+/// Como `InputState::consume_key`, pero exige exactamente esos
+/// modificadores. egui ignora un Mayús o Alt de más, así que Mayús+Supr
+/// borraba sin cerrar el hueco, Mayús+← avanzaba un fotograma en vez de un
+/// segundo y Ctrl+Mayús+Z deshacía en lugar de rehacer.
+fn consume_exact(input: &mut egui::InputState, modifiers: egui::Modifiers, key: egui::Key) -> bool {
+    let found = input.events.iter().position(|event| {
+        matches!(
+            event,
+            egui::Event::Key { key: pressed_key, pressed: true, modifiers: pressed, .. }
+                if *pressed_key == key && pressed.matches_exact(modifiers)
+        )
+    });
+    if let Some(index) = found {
+        input.events.remove(index);
+    }
+    found.is_some()
+}
+
 fn timecode(seconds: f64, fps: f64) -> String {
     let timebase = Timebase::from_fps(if fps >= 1.0 { fps } else { default_fps() });
     timebase.timecode(timebase.frames(seconds))
@@ -20312,6 +20325,51 @@ mod tests {
         assert_eq!(project.video_track_count(), 1);
         assert_eq!(project.audio_track_count(), 2);
         assert_eq!(project.duration(), 60.0);
+    }
+
+    #[test]
+    fn duplicate_pushes_what_follows_instead_of_overlapping_it() {
+        let clip = |start: f64, length: f64| RoughClip {
+            timeline_start: start,
+            out_seconds: length,
+            has_video: true,
+            has_audio: true,
+            ..Default::default()
+        };
+        let clips = vec![clip(0.0, 3.0), clip(3.0, 4.0), clip(7.0, 2.0)];
+        let (edited, copies) = duplicate_after(&clips, &[0, 1]).unwrap();
+        let starts = |list: &[RoughClip]| list.iter().map(|c| c.timeline_start).collect::<Vec<_>>();
+        assert_eq!(starts(&copies), vec![7.0, 10.0]);
+        assert_eq!(starts(&edited), vec![0.0, 3.0, 14.0]);
+        let mut all = edited.clone();
+        all.extend(copies);
+        all.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+        for pair in all.windows(2) {
+            assert!(pair[0].timeline_start + pair[0].duration() <= pair[1].timeline_start + 1e-9);
+        }
+    }
+
+    #[test]
+    fn shortcuts_with_shift_or_alt_do_not_fire_the_plain_one() {
+        let press = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut input = egui::InputState::default();
+        input.events = vec![press(egui::Key::Delete, egui::Modifiers::SHIFT)];
+        assert!(!consume_exact(&mut input, egui::Modifiers::NONE, egui::Key::Delete));
+        assert!(consume_exact(&mut input, egui::Modifiers::SHIFT, egui::Key::Delete));
+        assert!(input.events.is_empty());
+        let redo = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+        input.events = vec![press(egui::Key::Z, redo)];
+        assert!(!consume_exact(&mut input, egui::Modifiers::CTRL, egui::Key::Z));
+        assert!(consume_exact(&mut input, redo, egui::Key::Z));
+        input.events = vec![press(egui::Key::Z, egui::Modifiers::CTRL)];
+        assert!(!consume_exact(&mut input, egui::Modifiers::NONE, egui::Key::Z));
+        assert!(consume_exact(&mut input, egui::Modifiers::CTRL, egui::Key::Z));
     }
 
     #[test]
