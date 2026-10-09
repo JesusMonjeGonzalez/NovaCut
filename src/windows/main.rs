@@ -16702,7 +16702,7 @@ impl eframe::App for NovaCutWindows {
                 let mut subtitle_jump: Option<f64> = None;
                 for (cue_index, cue) in self.project.subtitles.iter().enumerate() {
                     let (left, right) = (to_x(cue.start), to_x(cue.end));
-                    if right < lane_rect.left() || left > lane_rect.right() || !(cue.end > cue.start) {
+                    if right < lane_rect.left() || left > lane_rect.right() || cue.end.partial_cmp(&cue.start) != Some(std::cmp::Ordering::Greater) {
                         continue;
                     }
                     let bar = egui::Rect::from_min_max(
@@ -17014,10 +17014,10 @@ impl eframe::App for NovaCutWindows {
                         });
                         context.data_mut(|data| data.insert_temp(gap_menu_id, target));
                     }
-                    let mut gap_action: Option<(u8, (usize, bool, f64, f64, f64))> = None;
+                    let mut gap_action: Option<(u8, GapTarget)> = None;
                     lane_background.context_menu(|ui| {
                         let Some(Some(gap)) =
-                            ui.ctx().data(|data| data.get_temp::<Option<(usize, bool, f64, f64, f64)>>(gap_menu_id))
+                            ui.ctx().data(|data| data.get_temp::<Option<GapTarget>>(gap_menu_id))
                         else {
                             ui.close_menu();
                             return;
@@ -19356,6 +19356,9 @@ fn consume_exact(input: &mut egui::InputState, modifiers: egui::Modifiers, key: 
     }
     found.is_some()
 }
+
+/// Hueco bajo el clic derecho: pista, si es de vídeo, inicio, fin e instante.
+type GapTarget = (usize, bool, f64, f64, f64);
 
 /// Nombre de un clip en la timeline, recortado con «…» al ancho del clip.
 /// Antes los clips de menos de 42 px no tenían nombre y el resto se cortaba
