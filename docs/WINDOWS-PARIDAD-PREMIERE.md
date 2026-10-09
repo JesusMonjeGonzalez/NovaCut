@@ -241,13 +241,18 @@ Todas usan el mismo botón: ayuda en el tooltip y, desactivadas, el motivo.
 La barra de estado recorta el mensaje con «…» en vez de pisar los datos de
 la derecha (el texto completo, en el tooltip). Textos a 11 px como mínimo.
 
-Pendiente de UX, por orden:
+Pendiente de UX:
 1. El suavizado inserta keyframes intermedios y la navegación ◀◆▶ del
-   Inspector los recorre todos. Hay que guardar el tipo de curva en el
-   keyframe (campo nuevo en `animacion::Key` y `TransformKeyframe`).
-2. Revisión visual con la app abierta a 800×500, 1280×720 y 4K emulado: en
-   especial que «Herramientas ▾» no parta la barra superior en dos filas a
-   1280 px.
+   Inspector los recorre todos. **Decidido no cambiarlo por un campo de
+   curva** (9 oct 2026): al partir un clip a mitad de una curva suave, una
+   curva guardada en el keyframe cambiaría de forma en el trozo que queda;
+   los puntos intermedios la conservan exactamente. Si se retoma, partir
+   tendrá que densificar solo el tramo cortado.
+2. ~~Barra superior en varias filas~~ (hecho el 9 oct 2026): por debajo de
+   1400 px formato, tamaño y GPU se eligen en la ventana de exportar; por
+   debajo de 1100 px deshacer y partir quedan junto a la timeline y lo demás
+   (partir todas, entrada/salida, buscar, atajos, tamaño) va al menú «⋯».
+   Revisado a 800×500 (una fila, se ven V1 y A1) y 1280×720 (una fila).
 
 ## Lo que sigue faltando frente a Premiere
 

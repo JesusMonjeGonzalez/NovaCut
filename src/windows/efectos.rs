@@ -474,22 +474,27 @@ impl ClipFx {
 
     /// Valor de la banda elástica en un instante, para dibujarla y para el
     /// monitor. Devuelve dB relativos.
+    /// Mismas reglas que `volume_envelope` (sin valores no finitos, límites
+    /// de −96 a +24 dB): el monitor debe sonar como la exportación.
     pub fn volume_at(&self, t: f64) -> f64 {
         let mut keys = self.volume_keys.clone();
+        keys.retain(|key| key.t.is_finite() && key.db.is_finite());
         if keys.is_empty() {
             return 0.0;
         }
         keys.sort_by(|left, right| left.t.total_cmp(&right.t));
+        keys.dedup_by(|later, earlier| (later.t - earlier.t).abs() < 1e-6);
+        let db = |key: &VolumeKey| key.db.clamp(-96.0, 24.0);
         if t <= keys[0].t {
-            return keys[0].db;
+            return db(&keys[0]);
         }
         for pair in keys.windows(2) {
             if t < pair[1].t {
                 let mix = (t - pair[0].t) / (pair[1].t - pair[0].t).max(1e-6);
-                return pair[0].db + (pair[1].db - pair[0].db) * mix;
+                return db(&pair[0]) + (db(&pair[1]) - db(&pair[0])) * mix;
             }
         }
-        keys[keys.len() - 1].db
+        db(&keys[keys.len() - 1])
     }
 }
 
@@ -559,7 +564,7 @@ pub fn title_drawing(
             ));
         }
         parts.push(format!(
-            "drawtext=fontfile='{font}':text='{text}':expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
+            "drawtext=fontfile={font}:text={text}:expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
             position.0.clamp(0.0, 1.0),
             position.1.clamp(0.0, 1.0),
         ));
@@ -1308,6 +1313,21 @@ mod tests {
     }
 
     #[test]
+    fn monitor_volume_follows_the_export_limits() {
+        let fx = ClipFx {
+            volume_keys: vec![
+                VolumeKey { t: 0.0, db: -200.0 },
+                VolumeKey { t: f64::NAN, db: 0.0 },
+                VolumeKey { t: 2.0, db: 40.0 },
+            ],
+            ..ClipFx::default()
+        };
+        assert_eq!(fx.volume_at(-1.0), -96.0);
+        assert_eq!(fx.volume_at(1.0), -36.0);
+        assert_eq!(fx.volume_at(5.0), 24.0);
+    }
+
+    #[test]
     fn volume_envelope_is_piecewise_linear() {
         let fx = ClipFx {
             volume_keys: vec![
@@ -1412,7 +1432,7 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "drawtext=fontfile='f.ttf':text='Hola':expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
+            "drawtext=fontfile=f.ttf:text=Hola:expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
         );
         let matte_only = TitleStyle {
             matte: Some([1.0, 0.0, 0.0]),

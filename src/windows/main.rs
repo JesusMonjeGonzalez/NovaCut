@@ -1118,19 +1118,16 @@ fn zero_color() -> f64 {
     0.0
 }
 
-/// Escapa el texto para el valor entrecomillado de `drawtext`.
+/// Texto de `drawtext` sin comillas, con el escapado de dos capas de
+/// `escape_filter_value`. Entre comillas un apóstrofo («It's», «O'Brien»)
+/// cerraba la cita y la exportación entera fallaba.
 fn escape_drawtext(text: &str) -> String {
-    text.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace(':', "\\:")
+    escape_filter_value(text)
 }
 
-/// Ruta de fuente en sintaxis segura para filtergraph: barras y dos puntos
-/// del drive escapados (ffmpeg acepta `/` también en Windows).
+/// Ruta de fuente como valor de opción (`/` vale también en Windows).
 fn escape_filter_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .replace(':', "\\:")
+    escape_lut_path(path)
 }
 
 fn hex_color(red: f64, green: f64, blue: f64) -> String {
@@ -1348,7 +1345,12 @@ fn curves_filter(curves: Option<&Curves>) -> String {
 }
 
 fn escape_lut_path(path: &Path) -> String {
-    let mut escaped = path.to_string_lossy().replace('\\', "/");
+    escape_filter_value(&path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Cualquier valor de opción dentro de un grafo de filtros, sin comillas.
+fn escape_filter_value(value: &str) -> String {
+    let mut escaped = value.to_owned();
     // Escape the option value first, then preserve those escapes in the enclosing
     // filtergraph. Command::arg bypasses the shell, so there is no third layer.
     // https://ffmpeg.org/ffmpeg-filters.html#Notes-on-filtergraph-escaping
@@ -9349,7 +9351,7 @@ impl NovaCutWindows {
         // solo en la barra superior, lejos de donde se edita.
         let small = |text: &str| egui::Button::new(egui::RichText::new(text).size(15.0)).min_size(egui::vec2(30.0, 28.0));
         if ui
-            .add_enabled(!self.undo_stack.is_empty(), small("↶"))
+            .add_enabled(!self.undo_stack.is_empty() || self.pending_edit.is_some(), small("↶"))
             .on_hover_text("Deshacer (Ctrl+Z)")
             .clicked()
         {
@@ -12259,6 +12261,14 @@ impl eframe::App for NovaCutWindows {
                     // Barra en una fila desde 1280 px: la palabra NOVACUT solo
                     // aparece si sobra sitio (el logo ya identifica la app).
                     let roomy = ui.available_width() >= 1400.0;
+                    // Por debajo de 1100 px la barra partía en tres filas y
+                    // dejaba el montaje sin sitio: lo que ya está junto a la
+                    // timeline (deshacer, partir) o en la ventana de exportar
+                    // (formato, tamaño, GPU) se quita, y el resto va a «⋯».
+                    let compact = ui.available_width() < 1100.0;
+                    // Hasta 1400 px (1280×720, 1080p al 150 %) formato,
+                    // tamaño y GPU se eligen en la ventana de exportar.
+                    let export_inline = ui.available_width() >= 1400.0;
                     ui.spacing_mut().item_spacing.x = if roomy { 8.0 } else { 6.0 };
                     // Marca de la app + nombre del proyecto + punto de estado.
                     theme::logo_mark(ui);
@@ -12276,7 +12286,7 @@ impl eframe::App for NovaCutWindows {
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut self.project.name)
-                                .desired_width(140.0)
+                                .desired_width(if compact { 96.0 } else { 140.0 })
                                 .font(egui::TextStyle::Small),
                         )
                         .changed()
@@ -12359,7 +12369,7 @@ impl eframe::App for NovaCutWindows {
                     theme::bar_separator(ui);
 
                     // Historial
-                    if ui
+                    if !compact && ui
                         .add_enabled(
                             !self.undo_stack.is_empty() || self.pending_edit.is_some(),
                             egui::Button::new(egui::RichText::new("⟲").size(15.0)),
@@ -12369,7 +12379,7 @@ impl eframe::App for NovaCutWindows {
                     {
                         self.undo();
                     }
-                    if ui
+                    if !compact && ui
                         .add_enabled(
                             !self.redo_stack.is_empty(),
                             egui::Button::new(egui::RichText::new("⟳").size(15.0)),
@@ -12379,7 +12389,9 @@ impl eframe::App for NovaCutWindows {
                     {
                         self.redo();
                     }
-                    theme::bar_separator(ui);
+                    if !compact {
+                        theme::bar_separator(ui);
+                    }
 
                     // Medio
                     let import = ui
@@ -12411,13 +12423,13 @@ impl eframe::App for NovaCutWindows {
                     theme::bar_separator(ui);
 
                     // Timeline
-                    if theme::bar_button(ui, "✂ Partir")
+                    if !compact && theme::bar_button(ui, "✂ Partir")
                         .on_hover_text("Partir en el cabezal (S)")
                         .clicked()
                     {
                         self.split_at_playhead();
                     }
-                    if theme::bar_button(ui, "✂ Todas")
+                    if !compact && theme::bar_button(ui, "✂ Todas")
                         .on_hover_text("Partir todas las pistas en el cabezal (Ctrl+Mayús+K)")
                         .clicked()
                     {
@@ -12542,13 +12554,13 @@ impl eframe::App for NovaCutWindows {
                     theme::bar_separator(ui);
 
                     // Rango de trabajo: entrada, salida y limpiar.
-                    if theme::bar_button(ui, "[ Entrada")
+                    if !compact && theme::bar_button(ui, "[ Entrada")
                         .on_hover_text("Entrada de trabajo en el cabezal (I)")
                         .clicked()
                     {
                         self.mark_work_in();
                     }
-                    if theme::bar_button(ui, "Salida ]")
+                    if !compact && theme::bar_button(ui, "Salida ]")
                         .on_hover_text("Salida de trabajo en el cabezal (O)")
                         .clicked()
                     {
@@ -12582,9 +12594,10 @@ impl eframe::App for NovaCutWindows {
                     // caben, se salta de fila a mano en vez de cortarlos.
                     // En un layout con salto, `available_width` es el ancho
                     // total; lo que queda en la fila es hasta el borde.
-                    if ui.max_rect().right() - ui.cursor().min.x < 110.0 {
+                    if export_inline && ui.max_rect().right() - ui.cursor().min.x < 110.0 {
                         ui.end_row();
                     }
+                    if export_inline {
                     egui::ComboBox::from_id_salt("preset-export")
                         .width(92.0)
                         .selected_text(match self.export_size {
@@ -12647,6 +12660,7 @@ impl eframe::App for NovaCutWindows {
                         if changed {
                             self.hardware_encoding = !self.hardware_encoding;
                         }
+                    }
                     }
                     let exportar = ui
                         .add_enabled(
@@ -12712,6 +12726,50 @@ impl eframe::App for NovaCutWindows {
                     }
                     theme::bar_separator(ui);
                     let current_scale = self.ui_scale;
+                    if compact {
+                        let mut more_action: Option<u8> = None;
+                        let more = egui::menu::menu_button(ui, egui::RichText::new("⋯"), |ui| {
+                            ui.set_min_width(220.0);
+                            let mut item = |ui: &mut egui::Ui, label: &str, shortcut: &str, code: u8| {
+                                if ui.add(egui::Button::new(label).shortcut_text(shortcut)).clicked() {
+                                    more_action = Some(code);
+                                    ui.close_menu();
+                                }
+                            };
+                            item(ui, "Partir en el cabezal", "S", 0);
+                            item(ui, "Partir todas las pistas", "Ctrl+Mayús+K", 1);
+                            ui.separator();
+                            item(ui, "Entrada de trabajo", "I", 2);
+                            item(ui, "Salida de trabajo", "O", 3);
+                            ui.separator();
+                            item(ui, "Buscar acciones y clips…", "Ctrl+Mayús+P", 4);
+                            item(ui, "Atajos y recorrido guiado", "?", 5);
+                            ui.menu_button("Tamaño de la interfaz", |ui| {
+                                for scale in UI_SCALES {
+                                    let label = format!("{:.0} %", scale * 100.0);
+                                    if ui
+                                        .selectable_label((current_scale - scale).abs() < 0.01, label)
+                                        .clicked()
+                                    {
+                                        ui.ctx().set_zoom_factor(scale);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                        let more = more.response.on_hover_text("Partir todas, entrada y salida, buscar, atajos y tamaño de la interfaz");
+                        self.tutorial.marcar("ayuda", more.rect);
+                        match more_action {
+                            Some(0) => self.split_at_playhead(),
+                            Some(1) => self.split_all_tracks(),
+                            Some(2) => self.mark_work_in(),
+                            Some(3) => self.mark_work_out(),
+                            Some(4) => self.command_center.open(),
+                            Some(5) => self.show_shortcuts = !self.show_shortcuts,
+                            _ => {}
+                        }
+                    }
+                    if !compact {
                     egui::menu::menu_button(ui, egui::RichText::new("Aa"), |ui| {
                         ui.label(
                             egui::RichText::new("Tamaño de la interfaz")
@@ -12747,6 +12805,7 @@ impl eframe::App for NovaCutWindows {
                         .clicked()
                     {
                         self.command_center.open();
+                    }
                     }
                 });
             });
@@ -14445,6 +14504,9 @@ impl eframe::App for NovaCutWindows {
             .show(context, |ui| {
                 // Barra de título del monitor, al estilo de las cabeceras de panel.
                 ui.horizontal(|ui| {
+                    // En columnas estrechas el volumen se metía debajo de
+                    // los botones: textos cortos y deslizador más pequeño.
+                    let narrow_header = ui.available_width() < 480.0;
                     ui.label(
                         egui::RichText::new("MONITOR")
                             .strong()
@@ -14458,10 +14520,10 @@ impl eframe::App for NovaCutWindows {
                         .add_enabled(
                             self.frame_result.is_none(),
                             egui::Button::new(
-                                egui::RichText::new(if self.frame_result.is_some() {
-                                    "Exportando fotograma…"
-                                } else {
-                                    "Exportar fotograma"
+                                egui::RichText::new(match (self.frame_result.is_some(), narrow_header) {
+                                    (true, _) => "Exportando…",
+                                    (false, true) => "Fotograma",
+                                    (false, false) => "Exportar fotograma",
                                 })
                                 .size(11.0),
                             ),
@@ -14522,13 +14584,16 @@ impl eframe::App for NovaCutWindows {
                         self.request_preview();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let slider_width = (ui.available_width() - 24.0).clamp(36.0, 80.0);
                         ui.add_sized(
-                            [80.0, 16.0],
+                            [slider_width, 16.0],
                             egui::Slider::new(&mut self.monitor_volume, 0.0..=1.0)
                                 .show_value(false),
                         )
                         .on_hover_text("Volumen del monitor");
-                        ui.label(egui::RichText::new("🔊").size(11.0).color(theme::TEXT_DIM));
+                        if ui.available_width() >= 18.0 {
+                            ui.label(egui::RichText::new("🔊").size(11.0).color(theme::TEXT_DIM));
+                        }
                     });
                 });
                 ui.add_space(8.0);
@@ -18960,7 +19025,8 @@ fn format_clock(seconds: f64) -> String {
         )
     } else if whole >= 60 {
         format!("{}:{:02}", whole / 60, whole % 60)
-    } else if seconds < 10.0 {
+    } else if seconds < 9.95 {
+        // 9,96 s se redondeaba a «10.0s», más largo que «10s».
         format!("{seconds:.1}s")
     } else {
         format!("{whole}s")
@@ -20090,9 +20156,11 @@ mod tests {
 
     #[test]
     fn escapes_drawtext_specials() {
-        assert_eq!(escape_drawtext("Hola mundo"), "Hola mundo");
-        assert_eq!(escape_drawtext(r"ruta\C:'"), r"ruta\\C\:\'");
-        assert_eq!(escape_drawtext("a'b"), r"a\'b");
+        assert_eq!(escape_drawtext("Hola"), "Hola");
+        assert_eq!(escape_drawtext("Hola mundo"), r"Hola\\\ mundo");
+        assert_eq!(escape_drawtext(r"ruta\C:'"), r"ruta\\\\C\\:\\\'");
+        assert_eq!(escape_drawtext("a'b"), r"a\\\'b");
+        assert_eq!(escape_drawtext("[x], y;"), r"\[x\]\,\\\ y\;");
     }
 
     #[test]
@@ -21828,6 +21896,43 @@ mod render_real_tests {
         if std::env::var_os("NOVACUT_KEEP_RENDERS").is_none() {
             let _ = std::fs::remove_dir_all(&directory);
         }
+    }
+
+    #[test]
+    fn titles_with_quotes_colons_and_brackets_export() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("titulos-especiales");
+        // Entre comillas, el apóstrofo cerraba la cita y FFmpeg rechazaba
+        // el grafo entero: ni el título ni el resto del montaje salían.
+        let text = "  It's O'Brien: 50% [x], y; a\\b\nsegunda línea";
+        let clip = RoughClip {
+            out_seconds: 1.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: text.to_owned(),
+                size: 90.0,
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let frame = render_preview_frame(&[(clip.clone(), 0.5)], Timebase::from_fps(25.0)).unwrap();
+        assert!(
+            frame.pixels.chunks(4).any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200),
+            "el texto debe dibujarse en el monitor"
+        );
+        let mut captioned = clip.clone();
+        captioned.title.as_mut().unwrap().style.captions = Some(subtitulos_animados::AnimatedCaptions {
+            words: vec![transcripcion::Word { start: 0.0, end: 1.0, text: "l'amic:".to_owned() }],
+            ..Default::default()
+        });
+        for (name, clip) in [("titulo", clip), ("subtitulo", captioned)] {
+            let output = directory.join(format!("{name}.mp4"));
+            export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
+            assert!((probe_duration(&output) - 1.0).abs() < 0.2);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

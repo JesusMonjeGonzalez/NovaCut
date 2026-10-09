@@ -33,7 +33,7 @@ pub(super) struct Paso {
 pub(super) const PASOS: &[Paso] = &[
     Paso {
         zona: None,
-        titulo: "Bienvenida a NovaCut",
+        titulo: "Te damos la bienvenida a NovaCut",
         texto: "En dos minutos te enseño dónde está todo. Cada paso ilumina una zona; en algunos te pediré que lo hagas tú para que lo pruebes de verdad. Puedes seguir usando la app mientras tanto.",
         accion: None,
     },
@@ -88,13 +88,13 @@ pub(super) const PASOS: &[Paso] = &[
     Paso {
         zona: Some("exportar"),
         titulo: "9 · Exportar",
-        texto: "Cuando esté listo, «Exportar MP4». Al lado tienes la resolución (1080p, 4K…) y el formato (H.264, HEVC…); en la ventana de exportación eliges preajustes y calidad.",
+        texto: "Cuando esté listo, «Exportar MP4». Al lado tienes la resolución (1080p, 4K…) y el formato (H.264, HEVC…) si la ventana es ancha; en la ventana de exportación eliges preajustes y calidad.",
         accion: None,
     },
     Paso {
         zona: Some("ayuda"),
         titulo: "10 · Si te pierdes",
-        texto: "«?» muestra todos los atajos y desde ahí puedes repetir este recorrido. 🔍 busca cualquier acción por su nombre.",
+        texto: "«?» muestra todos los atajos y desde ahí puedes repetir este recorrido. 🔍 busca cualquier acción por su nombre. En ventanas estrechas los dos están en «⋯».",
         accion: None,
     },
 ];

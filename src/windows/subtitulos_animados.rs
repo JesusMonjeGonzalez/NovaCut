@@ -342,7 +342,7 @@ pub fn caption_filters(
                 })
                 .unwrap_or_default();
             filters.push(format!(
-                "drawtext=fontfile='{font}':text='{}':expansion=none:fontsize={:.1}:fontcolor=0x{}:x={:.1}-text_w/2:y={:.1}:borderw={outline:.0}:bordercolor=black{boxed}{enable}",
+                "drawtext=fontfile={font}:text={}:expansion=none:fontsize={:.1}:fontcolor=0x{}:x={:.1}-text_w/2:y={:.1}:borderw={outline:.0}:bordercolor=black{boxed}{enable}",
                 text_escape(&word.text),
                 look.size,
                 look.color,
@@ -473,7 +473,7 @@ mod tests {
         };
         let early = at(0.5);
         assert_eq!(early.matches("drawtext").count(), 2);
-        assert!(early.contains("text='uno'") && early.contains("fontcolor=0xFFD91A"));
+        assert!(early.contains("text=uno:") && early.contains("fontcolor=0xFFD91A"));
         assert!(!early.contains("enable"));
         let full = caption_filters(
             &captions,
