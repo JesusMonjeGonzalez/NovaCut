@@ -11067,29 +11067,75 @@ impl NovaCutWindows {
             return;
         };
         let clip = &self.project.clips[index];
-        if self.project.clip_locked(clip) {
-            self.status = "La pista está bloqueada".to_owned();
-            return;
-        }
-        let (track, start) = (clip.track, clip.timeline_start);
+        let (track, is_video, start) = (clip.track, clip.has_video, clip.timeline_start);
         let previous_end = self
             .project
             .clips
             .iter()
             .filter(|other| {
                 other.track == track
-                    && other.has_video == clip.has_video
+                    && other.has_video == is_video
                     && other.timeline_start + other.duration() <= start + 0.001
             })
             .map(|other| other.timeline_start + other.duration())
             .fold(0.0_f64, f64::max);
-        let gap = start - previous_end;
+        self.close_gap_on_lane(track, is_video, previous_end, start);
+    }
+
+    /// Cierra el hueco `[from, to]` de una pista desplazando a la izquierda
+    /// todo lo que empieza en `to` o después, con su audio enlazado. Antes
+    /// solo se movía el clip siguiente y el hueco reaparecía detrás.
+    fn close_gap_on_lane(&mut self, track: usize, is_video: bool, from: f64, to: f64) {
+        let gap = to - from;
         if gap <= 0.01 {
-            self.status = "No hay hueco que cerrar delante de este clip".to_owned();
+            self.status = "No hay hueco que cerrar aquí".to_owned();
+            return;
+        }
+        if self.project.lane_locked(track, is_video) {
+            self.status = "La pista está bloqueada".to_owned();
+            return;
+        }
+        let mut moving: Vec<usize> = self
+            .project
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(_, clip)| {
+                clip.track == track && clip.has_video == is_video && clip.timeline_start >= to - 0.001
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if self.mejoras.enlace_av {
+            let partners: Vec<usize> = moving
+                .iter()
+                .flat_map(|index| mejoras::enlazados(&self.project.clips, *index))
+                .collect();
+            moving.extend(partners);
+            moving.sort_unstable();
+            moving.dedup();
+        }
+        // Un compañero enlazado no puede chocar con lo que tiene delante en
+        // su propia pista: si no cabe, no se mueve nada.
+        let fits = moving.iter().all(|index| {
+            let clip = &self.project.clips[*index];
+            let new_start = clip.timeline_start - gap;
+            new_start >= -0.001
+                && !self.project.clips.iter().enumerate().any(|(other_index, other)| {
+                    !moving.contains(&other_index)
+                        && other.track == clip.track
+                        && other.has_video == clip.has_video
+                        && other.timeline_start < new_start + clip.duration() - 0.001
+                        && new_start < other.timeline_start + other.duration() - 0.001
+                })
+        });
+        if !fits {
+            self.status = "No se puede cerrar: el audio enlazado chocaría con otro clip".to_owned();
             return;
         }
         let before = self.project.clone();
-        self.project.clips[index].timeline_start = previous_end;
+        for index in &moving {
+            self.project.clips[*index].timeline_start -= gap;
+        }
         self.finish_edit(before);
         self.status = format!("Hueco cerrado ({gap:.2} s)");
     }
@@ -15825,24 +15871,22 @@ impl eframe::App for NovaCutWindows {
                             ui.close_menu();
                         }
                         ui.set_min_width(220.0);
-                        ui.label(
-                            egui::RichText::new(clip.name())
-                                .strong()
+                        // Una sola línea de cabecera: el menú tiene que caber
+                        // entero en una ventana de 720 px.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} · {}{} · {}",
+                                    clip.name(),
+                                    if clip.has_video { "V" } else { "A" },
+                                    clip.track + 1,
+                                    format_clock(clip.duration())
+                                ))
                                 .size(11.5)
-                                .color(theme::TEXT),
+                                .color(theme::TEXT_DIM),
+                            )
+                            .truncate(),
                         );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}{} · {} · {}",
-                                if clip.has_video { "V" } else { "A" },
-                                clip.track + 1,
-                                timecode(clip.timeline_start, self.project.fps),
-                                format_clock(clip.duration())
-                            ))
-                            .size(11.5)
-                            .color(theme::TEXT_FAINT),
-                        );
-                        ui.separator();
                         let mut pick = |ui: &mut egui::Ui, label: &str, value: ClipCommand| {
                             if ui.button(label).clicked() {
                                 command = Some(value);
@@ -15863,41 +15907,56 @@ impl eframe::App for NovaCutWindows {
                             );
                             return;
                         }
+                        // Lo de cada día arriba; lo demás en submenús. Con
+                        // todo suelto el menú no cabía en 720 px y las
+                        // últimas opciones (Quitar) quedaban fuera.
+                        if !clip.path.as_os_str().is_empty() && !clip.path.exists() {
+                            pick(ui, "Revincular medio…", ClipCommand::Relink);
+                            ui.separator();
+                        }
                         pick(ui, "Partir en el cabezal (S)", ClipCommand::Split);
-                        pick(
-                            ui,
-                            "Partir todas las pistas (Ctrl+Mayús+K)",
-                            ClipCommand::SplitAllTracks,
-                        );
-                        pick(
-                            ui,
-                            "Recortar entrada al cabezal (Q)",
-                            ClipCommand::TrimStartToPlayhead,
-                        );
-                        pick(
-                            ui,
-                            "Recortar salida al cabezal (W)",
-                            ClipCommand::TrimEndToPlayhead,
-                        );
-                        pick(ui, "Fundido de 1 s en ambos bordes", ClipCommand::QuickFade);
-                        ui.separator();
-                        pick(ui, &toggle_label, ClipCommand::ToggleEnabled);
                         pick(ui, "Duplicar (Ctrl+D)", ClipCommand::Duplicate);
-                        pick(ui, "Separar audio (Ctrl+L)", ClipCommand::DetachAudio);
                         pick(ui, "Copiar (Ctrl+C)", ClipCommand::Copy);
-                        pick(
-                            ui,
-                            "Copiar atributos (Ctrl+Alt+C)",
-                            ClipCommand::CopyAttributes,
-                        );
-                        if self.attribute_clipboard.is_some() {
+                        pick(ui, &toggle_label, ClipCommand::ToggleEnabled);
+                        ui.menu_button("Recortar", |ui| {
+                            ui.set_min_width(260.0);
+                            pick(ui, "Entrada al cabezal (Q)", ClipCommand::TrimStartToPlayhead);
+                            pick(ui, "Salida al cabezal (W)", ClipCommand::TrimEndToPlayhead);
                             pick(
                                 ui,
-                                "Pegar atributos (Ctrl+Alt+V)",
-                                ClipCommand::PasteAttributes,
+                                "Partir todas las pistas (Ctrl+Mayús+K)",
+                                ClipCommand::SplitAllTracks,
                             );
-                        }
-                        pick(ui, "Congelar fotograma (3 s)", ClipCommand::FreezeFrame);
+                            pick(ui, "Congelar fotograma (3 s)", ClipCommand::FreezeFrame);
+                        });
+                        ui.menu_button("Colocar", |ui| {
+                            ui.set_min_width(260.0);
+                            pick(ui, "Superponer en el cabezal (B)", ClipCommand::Overwrite);
+                            pick(ui, "Insertar en el cabezal (V)", ClipCommand::Insert);
+                            pick(ui, "Cerrar hueco con el anterior", ClipCommand::CloseGap);
+                            if clip.nested.is_some() {
+                                pick(ui, "Desanidar secuencia", ClipCommand::Unnest);
+                            } else {
+                                pick(ui, "Anidar pista", ClipCommand::Nest);
+                            }
+                        });
+                        ui.menu_button("Audio y atributos", |ui| {
+                            ui.set_min_width(260.0);
+                            pick(ui, "Fundido de 1 s en ambos bordes", ClipCommand::QuickFade);
+                            pick(ui, "Separar audio (Ctrl+L)", ClipCommand::DetachAudio);
+                            pick(
+                                ui,
+                                "Copiar atributos (Ctrl+Alt+C)",
+                                ClipCommand::CopyAttributes,
+                            );
+                            if self.attribute_clipboard.is_some() {
+                                pick(
+                                    ui,
+                                    "Pegar atributos (Ctrl+Alt+V)",
+                                    ClipCommand::PasteAttributes,
+                                );
+                            }
+                        });
                         // Solo las herramientas que tienen sentido para
                         // este clip; el catálogo entero está en la barra.
                         let tools = mejoras::herramientas_de_clip(clip);
@@ -15915,18 +15974,6 @@ impl eframe::App for NovaCutWindows {
                                     }
                                 }
                             });
-                        }
-                        ui.separator();
-                        pick(ui, "Superponer en el cabezal (B)", ClipCommand::Overwrite);
-                        pick(ui, "Insertar en el cabezal (V)", ClipCommand::Insert);
-                        pick(ui, "Cerrar hueco con el anterior", ClipCommand::CloseGap);
-                        if clip.nested.is_some() {
-                            pick(ui, "Desanidar secuencia", ClipCommand::Unnest);
-                        } else {
-                            pick(ui, "Anidar pista", ClipCommand::Nest);
-                        }
-                        if !clip.path.as_os_str().is_empty() && !clip.path.exists() {
-                            pick(ui, "Revincular medio…", ClipCommand::Relink);
                         }
                         ui.separator();
                         pick(
@@ -16893,6 +16940,113 @@ impl eframe::App for NovaCutWindows {
                             self.status =
                                 format!("{} clip(s) seleccionado(s)", self.selection.len());
                         }
+                    }
+                    // Clic derecho en un hueco: cerrarlo, pegar ahí o llevar
+                    // el cabezal, como el «Eliminar y cerrar hueco» de
+                    // Premiere. El hueco se fija al abrir el menú.
+                    let gap_menu_id = ui.id().with("gap-menu");
+                    if lane_background.secondary_clicked() {
+                        let target = lane_background.interact_pointer_pos().and_then(|pointer| {
+                            let row = ((tracks_bottom - pointer.y) / row_height).floor();
+                            if row < 0.0 {
+                                return None;
+                            }
+                            let row = row as usize;
+                            let (track, mut is_video) = if row >= audio_tracks {
+                                (row - audio_tracks, true)
+                            } else {
+                                (audio_tracks - 1 - row, false)
+                            };
+                            // El audio de un vídeo se mueve con su vídeo.
+                            if !is_video
+                                && self.project.clips.iter().any(|clip| {
+                                    clip.track == track && clip.has_video && clip.has_audio
+                                })
+                            {
+                                is_video = true;
+                            }
+                            let time = pointer_time(pointer.x);
+                            let lane: Vec<&RoughClip> = self
+                                .project
+                                .clips
+                                .iter()
+                                .filter(|clip| clip.track == track && clip.has_video == is_video)
+                                .collect();
+                            if lane.iter().any(|clip| {
+                                time > clip.timeline_start && time < clip.timeline_start + clip.duration()
+                            }) {
+                                return None;
+                            }
+                            let from = lane
+                                .iter()
+                                .map(|clip| clip.timeline_start + clip.duration())
+                                .filter(|end| *end <= time + 0.001)
+                                .fold(0.0_f64, f64::max);
+                            let to = lane
+                                .iter()
+                                .map(|clip| clip.timeline_start)
+                                .filter(|start| *start >= time - 0.001)
+                                .fold(f64::INFINITY, f64::min);
+                            Some((track, is_video, from, to, time))
+                        });
+                        context.data_mut(|data| data.insert_temp(gap_menu_id, target));
+                    }
+                    let mut gap_action: Option<(u8, (usize, bool, f64, f64, f64))> = None;
+                    lane_background.context_menu(|ui| {
+                        let Some(Some(gap)) =
+                            ui.ctx().data(|data| data.get_temp::<Option<(usize, bool, f64, f64, f64)>>(gap_menu_id))
+                        else {
+                            ui.close_menu();
+                            return;
+                        };
+                        let (track, is_video, from, to, _) = gap;
+                        ui.set_min_width(220.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Hueco en {}{}",
+                                if is_video { "V" } else { "A" },
+                                track + 1
+                            ))
+                            .strong()
+                            .size(11.5),
+                        );
+                        if to.is_finite() {
+                            if ui
+                                .button(format!("Cerrar este hueco ({})", format_clock(to - from)))
+                                .on_hover_text("Desplaza a la izquierda todo lo que viene después en esta pista, con su audio enlazado")
+                                .clicked()
+                            {
+                                gap_action = Some((0, gap));
+                                ui.close_menu();
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Final de la pista: no hay nada después")
+                                    .size(11.5)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                        if !self.clip_clipboard_group.is_empty()
+                            && ui.button("Pegar aquí (Ctrl+V)").clicked()
+                        {
+                            gap_action = Some((1, gap));
+                            ui.close_menu();
+                        }
+                        if ui.button("Llevar el cabezal aquí").clicked() {
+                            gap_action = Some((2, gap));
+                            ui.close_menu();
+                        }
+                    });
+                    match gap_action {
+                        Some((0, (track, is_video, from, to, _))) => {
+                            self.close_gap_on_lane(track, is_video, from, to)
+                        }
+                        Some((1, (_, _, _, _, time))) => {
+                            self.seek(time);
+                            self.paste_clip();
+                        }
+                        Some((2, (_, _, _, _, time))) => self.seek(time),
+                        _ => {}
                     }
                     // Clic en vacío: quita la selección y lleva el cabezal
                     // ahí, como en CapCut o Resolve.
