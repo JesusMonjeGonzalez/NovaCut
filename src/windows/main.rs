@@ -15670,13 +15670,14 @@ impl eframe::App for NovaCutWindows {
                             ),
                             egui::StrokeKind::Inside,
                         );
-                        if audio_rect.width() > 42.0 {
-                            lane_painter.text(
+                        if audio_rect.width() > 18.0 {
+                            clip_caption(
+                                &lane_painter,
                                 egui::pos2(audio_rect.left() + 5.0, audio_rect.top() + 9.0),
-                                egui::Align2::LEFT_CENTER,
                                 format!("🔊 {}{}", clip.name(), if clip.muted { " (silenciado)" } else { "" }),
-                                egui::FontId::proportional(11.0),
+                                11.0,
                                 egui::Color32::from_white_alpha(200),
+                                audio_rect.width() - 8.0,
                             );
                         }
                         let linked = ui
@@ -16229,7 +16230,7 @@ impl eframe::App for NovaCutWindows {
                     }
                     // Nombre arriba a la izquierda, como en los montadores clásicos,
                     // sobre una banda oscura para que se lea encima de la miniatura.
-                    if rect.width() > 42.0 {
+                    if rect.width() > 18.0 {
                         let band = egui::Rect::from_min_max(
                             egui::pos2(rect.left() + 1.0, rect.top() + 4.0),
                             egui::pos2(rect.right() - 1.0, (rect.top() + 19.0).min(rect.bottom())),
@@ -16257,16 +16258,17 @@ impl eframe::App for NovaCutWindows {
                             {
                                 caption.push_str("  ♪↓");
                             }
-                            lane_painter.text(
+                            clip_caption(
+                                &lane_painter,
                                 egui::pos2(band.left() + 4.0, band.center().y),
-                                egui::Align2::LEFT_CENTER,
                                 caption,
-                                egui::FontId::proportional(11.5),
+                                11.5,
                                 if inactive {
                                     theme::TEXT_FAINT
                                 } else {
                                     egui::Color32::WHITE
                                 },
+                                band.width() - 6.0,
                             );
                         }
                     }
@@ -19353,6 +19355,60 @@ fn consume_exact(input: &mut egui::InputState, modifiers: egui::Modifiers, key: 
         input.events.remove(index);
     }
     found.is_some()
+}
+
+/// Nombre de un clip en la timeline, recortado con «…» al ancho del clip.
+/// Antes los clips de menos de 42 px no tenían nombre y el resto se cortaba
+/// a media letra.
+fn clip_caption(
+    painter: &egui::Painter,
+    left_center: egui::Pos2,
+    text: String,
+    size: f32,
+    color: egui::Color32,
+    max_width: f32,
+) {
+    if max_width < 14.0 {
+        return;
+    }
+    let font = egui::FontId::proportional(size);
+    let fits = |text: &str| {
+        painter
+            .layout_no_wrap(text.to_owned(), font.clone(), color)
+            .size()
+            .x
+            <= max_width
+    };
+    // Si no cabe, primero sobra la extensión («green.mp4» → «green»).
+    let text = if fits(&text) {
+        text
+    } else {
+        let (name, suffix) = text.split_once("  ").unwrap_or((&text, ""));
+        match name.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() && extension.len() <= 5 => {
+                if suffix.is_empty() {
+                    stem.to_owned()
+                } else {
+                    format!("{stem}  {suffix}")
+                }
+            }
+            _ => text.clone(),
+        }
+    };
+    let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = painter.layout_job(job);
+    // Un «…» suelto no dice nada: mejor nada (el nombre está en el tooltip).
+    if galley.rows.first().is_none_or(|row| row.glyphs.len() < 2) {
+        return;
+    }
+    let top = left_center.y - galley.size().y / 2.0;
+    painter.galley(egui::pos2(left_center.x, top), galley, color);
 }
 
 fn timecode(seconds: f64, fps: f64) -> String {
