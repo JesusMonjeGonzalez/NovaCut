@@ -183,7 +183,7 @@ fn podar(carpeta: &std::path::Path) {
     if archivos.len() < MAXIMO_EN_CACHE {
         return;
     }
-    archivos.sort_by(|a, b| a.0.cmp(&b.0));
+    archivos.sort_by_key(|(fecha, _)| *fecha);
     for (_, ruta) in archivos.iter().take(archivos.len() + 1 - MAXIMO_EN_CACHE) {
         let _ = std::fs::remove_file(ruta);
     }

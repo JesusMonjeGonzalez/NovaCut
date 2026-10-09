@@ -6599,7 +6599,10 @@ impl NovaCutWindows {
             return;
         }
         let timebase = self.project.timebase();
-        let resolved = prepare_render_clips(&self.effective_clips());
+        // Con el tramo ya renderizado, el fotograma fijo sale del render: así
+        // se ven bien los efectos temporales (estabilizar, grano, barridos a
+        // mitad) que una composición de un solo fotograma no puede calcular.
+        let resolved = prepare_render_clips(&self.clips_para_reproducir());
         let mut active: Vec<(usize, RoughClip, f64)> = resolved
             .iter()
             .enumerate()

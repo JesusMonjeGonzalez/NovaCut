@@ -260,8 +260,10 @@ Pendiente de UX:
    recortar, rodar, desplazar, deslizar y cerrar huecos llevan su audio
    enlazado; si el audio no tiene material para acompañar, la edición se
    rechaza en vez de desincronizar.
-2. **Previsualización en el monitor** de efectos temporales (estabilizar,
-   grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
+2. **Previsualización en el monitor** de efectos temporales en el fotograma
+   fijo: resuelta cuando el tramo está renderizado (el fotograma sale del
+   render). Sin render, el fotograma fijo sigue sin estabilizar ni animar el
+   grano.
 3. ~~**Curvas HSL dibujables**~~ (9 oct 2026, `curvas_hsl.rs`): tono/saturación,
    tono/tono, tono/luminancia y luminancia/saturación, aplicadas como LUT 3D
    (.cube 33³ cacheada por contenido) con `lut3d`; monitor y exportación iguales.
