@@ -1017,7 +1017,7 @@ fn extract_frame(
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     if !result.status.success() {
         return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
     }
@@ -3121,6 +3121,8 @@ struct NovaCutWindows {
     /// Pestaña activa del panel inferior de herramientas.
     bottom_tab: BottomTab,
     subtitle_query: String,
+    /// Subtítulo recién creado cuyo texto recibe el foco al dibujarse.
+    focus_subtitle: Option<usize>,
     subtitle_offset_ms: f64,
     /// Panel inferior desplegado.
     bottom_open: bool,
@@ -4086,9 +4088,9 @@ impl NovaCutWindows {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(context, |ui| {
                 ui.label(format!(
-                    "NovaCut encontro cambios no guardados de «{project_name}»."
+                    "NovaCut encontró cambios no guardados de «{project_name}»."
                 ));
-                ui.label("La sesion no se carga hasta que lo confirmes.");
+                ui.label("La sesión no se carga hasta que lo confirmes.");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     recover = ui
@@ -4405,6 +4407,7 @@ impl NovaCutWindows {
             media_file_status: media_browser::FileStatus::default(),
             bottom_tab: BottomTab::Inspector,
             subtitle_query: String::new(),
+            focus_subtitle: None,
             subtitle_offset_ms: 0.0,
             bottom_open: false,
             show_shortcuts: false,
@@ -6917,13 +6920,25 @@ impl NovaCutWindows {
     fn add_subtitle(&mut self) {
         self.subtitle_query.clear();
         let before = self.project.clone();
+        // Tres segundos o hasta el siguiente subtítulo, sin pisarlo.
+        let start = self.playhead;
+        let next = self
+            .project
+            .subtitles
+            .iter()
+            .map(|cue| cue.start)
+            .filter(|time| *time > start + 0.04)
+            .fold(f64::INFINITY, f64::min);
         self.project.subtitles.push(Subtitle {
-            start: self.playhead,
-            end: self.playhead + 3.0,
+            start,
+            end: (start + 3.0).min(next).max(start + 0.5),
             text: String::new(),
         });
+        self.focus_subtitle = Some(self.project.subtitles.len() - 1);
+        // Desde «+ Insertar» la pestaña podía estar cerrada: el campo no se veía.
+        self.bottom_tab = BottomTab::Subtitles;
         self.finish_edit(before);
-        self.status = "Subtitulo añadido; escribe su texto en la lista".to_owned();
+        self.status = "Subtítulo añadido: escribe su texto".to_owned();
     }
 
     /// Desplaza todos los cues como una única edición reversible.
@@ -7068,6 +7083,46 @@ impl NovaCutWindows {
                     .join(" · ")
             ));
         }
+    }
+
+    /// Subtítulo del cabezal sobre el monitor cuando no se queman en el
+    /// vídeo (si se queman, ya llegan compuestos por FFmpeg). Sin esto no
+    /// había forma de ver un subtítulo mientras se escribía.
+    fn preview_subtitle_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.burn_subtitles {
+            return;
+        }
+        let Some(cue) = self
+            .project
+            .subtitles
+            .iter()
+            .find(|cue| self.playhead >= cue.start && self.playhead < cue.end && !cue.text.trim().is_empty())
+        else {
+            return;
+        };
+        let style = self.project.subtitle_style.clone().unwrap_or_default();
+        // El tamaño del estilo es en píxeles de una salida de 1080 de alto.
+        let size = (style.size as f32 * rect.height() / 1080.0).clamp(9.0, 64.0);
+        let color = egui::Color32::from_rgb(
+            (style.red.clamp(0.0, 1.0) * 255.0) as u8,
+            (style.green.clamp(0.0, 1.0) * 255.0) as u8,
+            (style.blue.clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        let galley = painter.layout(
+            cue.text.trim().to_owned(),
+            egui::FontId::proportional(size),
+            color,
+            rect.width() * 0.9,
+        );
+        let center_y = rect.top() + rect.height() * style.position_y.clamp(0.05, 0.98) as f32;
+        let text_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, (center_y - galley.size().y / 2.0).min(rect.bottom() - galley.size().y / 2.0 - 2.0)),
+            galley.size(),
+        );
+        painter
+            .with_clip_rect(rect)
+            .rect_filled(text_rect.expand(4.0), 3.0, egui::Color32::from_black_alpha(150));
+        painter.with_clip_rect(rect).galley(text_rect.min, galley, color);
     }
 
     /// Clips del proyecto más los subtítulos como títulos superiores.
@@ -7217,7 +7272,7 @@ impl NovaCutWindows {
                 let before = self.project.clone();
                 self.project.clips = new_clips;
                 self.finish_edit(before);
-                self.status = format!("Corte a camara {camera}");
+                self.status = format!("Corte a cámara {camera}");
             }
             Err(message) => self.status = message,
         }
@@ -8146,6 +8201,7 @@ impl NovaCutWindows {
                 "No hay subtítulos que coincidan."
             });
         }
+        let focus_subtitle = self.focus_subtitle.take();
         for subtitle_index in indices {
             let subtitle = &mut self.project.subtitles[subtitle_index];
             ui.push_id(("subtitle", subtitle_index), |ui| {
@@ -8178,13 +8234,16 @@ impl NovaCutWindows {
                         subtitle_delete = Some(subtitle_index);
                     }
                 });
-                *metadata_changed |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut subtitle.text)
-                            .hint_text("Texto del subtítulo")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed();
+                let text_field = ui.add(
+                    egui::TextEdit::singleline(&mut subtitle.text)
+                        .hint_text("Texto del subtítulo")
+                        .desired_width(f32::INFINITY),
+                );
+                if focus_subtitle == Some(subtitle_index) {
+                    text_field.request_focus();
+                    text_field.scroll_to_me(Some(egui::Align::Center));
+                }
+                *metadata_changed |= text_field.changed();
                 if start_changed || end_changed {
                     subtitle.start = subtitle.start.max(0.0);
                     subtitle.end = subtitle.end.max(subtitle.start + 0.04);
@@ -11581,7 +11640,7 @@ impl NovaCutWindows {
                 Ok(()) if self.ffmpeg_ready => {
                     "Motor multimedia instalado. Ya puedes importar videos.".to_owned()
                 }
-                Ok(()) => "FFmpeg se instalo, pero Windows aun no lo encuentra. Cierra y vuelve a abrir NovaCut.".to_owned(),
+                Ok(()) => "FFmpeg se instaló, pero Windows aún no lo encuentra. Cierra y vuelve a abrir NovaCut.".to_owned(),
                 Err(error) => format!("No se pudo instalar FFmpeg: {error}"),
             };
             self.setup_result = None;
@@ -14424,7 +14483,7 @@ impl eframe::App for NovaCutWindows {
                                     ..Titulo::default()
                                 });
                                 self.finish_edit(before_project);
-                                self.status = "Clip convertido en titulo".to_owned();
+                                self.status = "Clip convertido en título".to_owned();
                             }
                         }
                     } else {
@@ -14646,6 +14705,7 @@ impl eframe::App for NovaCutWindows {
                             if let Some(texture) = &self.preview_texture {
                                 let image = ui.image((texture.id(), monitor_size));
                                 self.dibujar_guias(ui.painter(), image.rect);
+                                self.preview_subtitle_overlay(ui.painter(), image.rect);
                                 self.monitor_direct_edit(ui, image.rect);
                             } else {
                                 ui.centered_and_justified(|ui| {
@@ -16522,6 +16582,50 @@ impl eframe::App for NovaCutWindows {
                         }
                     }
                 }
+                // Subtítulos: barras en el borde inferior de la regla, como la
+                // pista de subtítulos de Premiere. Antes no se veían en ningún
+                // sitio del montaje. Clic: al subtítulo y a su pestaña.
+                let mut subtitle_jump: Option<f64> = None;
+                for (cue_index, cue) in self.project.subtitles.iter().enumerate() {
+                    let (left, right) = (to_x(cue.start), to_x(cue.end));
+                    if right < lane_rect.left() || left > lane_rect.right() || !(cue.end > cue.start) {
+                        continue;
+                    }
+                    let bar = egui::Rect::from_min_max(
+                        egui::pos2(left.max(lane_rect.left()), ruler_rect.bottom() - 5.0),
+                        egui::pos2((right - 1.0).max(left + 2.0).min(lane_rect.right()), ruler_rect.bottom() - 1.0),
+                    );
+                    let active = self.playhead >= cue.start && self.playhead < cue.end;
+                    painter.rect_filled(
+                        bar,
+                        1.5,
+                        if active {
+                            egui::Color32::from_rgb(250, 210, 90)
+                        } else {
+                            egui::Color32::from_rgb(180, 150, 70)
+                        },
+                    );
+                    let hit = ui
+                        .interact(
+                            bar.expand2(egui::vec2(0.0, 3.0)),
+                            ui.id().with(("subtitle-cue", cue_index)),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text(format!(
+                            "Subtítulo {} · {} → {}\n{}",
+                            cue_index + 1,
+                            timecode(cue.start, self.project.fps),
+                            timecode(cue.end, self.project.fps),
+                            if cue.text.trim().is_empty() { "(sin texto)" } else { cue.text.as_str() }
+                        ));
+                    if hit.clicked() {
+                        subtitle_jump = Some(cue.start);
+                    }
+                }
+                if let Some(time) = subtitle_jump {
+                    self.seek(time);
+                    self.bottom_tab = BottomTab::Subtitles;
+                }
                 // Marcadores: triángulos verdes en la regla; clic para saltar,
                 // clic derecho para borrarlos.
                 let mut marker_jump: Option<f64> = None;
@@ -17031,7 +17135,7 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
         .arg(path)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|error| format!("FFprobe no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFprobe no está disponible: {error}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -17183,7 +17287,7 @@ fn render_preview_frame_at(
                 continue;
             };
             let Some(font) = fuentes::resolve(title.font.as_deref()) else {
-                return Err("No se encontro una fuente TTF del sistema para los titulos".to_owned());
+                return Err("No se encontró una fuente TTF del sistema para los títulos".to_owned());
             };
             // El tamano se define sobre 1080p y se escala al monitor.
             let fontsize = title.size.max(8.0) * canvas_h as f64 / 1080.0;
@@ -17322,7 +17426,7 @@ fn render_preview_frame_at(
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     if !result.status.success() {
         return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
     }
@@ -17403,7 +17507,7 @@ fn apply_multicam_cut(
     if camera > 1 {
         let Some(source) = angle_source else {
             return Err(format!(
-                "No hay medio de la camara {camera} alineado en V{}",
+                "No hay medio de la cámara {camera} alineado en V{}",
                 target_track + 1
             ));
         };
@@ -17452,7 +17556,7 @@ fn extract_audio_envelope(path: &Path, start: f64, duration: f64) -> Result<Vec<
         .creation_flags(CREATE_NO_WINDOW)
         .stderr(Stdio::null())
         .output()
-        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     if !output.status.success() {
         return Err("No se pudo leer el audio del medio".to_owned());
     }
@@ -17771,11 +17875,11 @@ fn build_render_filters(
                 // bucle de composición (más abajo).
             } else if is_title_input[index] {
                 let Some(title) = clips[index].title.as_ref() else {
-                    return Err("Entrada de titulo sin titulo".to_owned());
+                    return Err("Entrada de título sin título".to_owned());
                 };
                 let Some(font) = fuentes::resolve(title.font.as_deref()) else {
                     return Err(
-                        "No se encontro una fuente TTF del sistema para los titulos".to_owned()
+                        "No se encontró una fuente TTF del sistema para los títulos".to_owned()
                     );
                 };
                 // El tamaño se define sobre 1080p, igual que en el monitor:
@@ -18220,7 +18324,7 @@ fn render_still(job: &RenderJob) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     if output.status.success() && job.output.is_file() {
         Ok(())
     } else {
@@ -18370,7 +18474,7 @@ fn run_export_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log_file))
         .spawn()
-        .map_err(|error| format!("FFmpeg no esta disponible: {error}"))?;
+        .map_err(|error| format!("FFmpeg no está disponible: {error}"))?;
     // Hilo lector de progreso: -progress escribe pares clave=valor por stdout.
     if let Some(stdout) = child.stdout.take() {
         let progress = Arc::clone(progress);
@@ -18659,7 +18763,7 @@ fn write_text_atomically(path: &Path, contents: &str) -> Result<(), String> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "El proyecto no tiene un nombre valido".to_owned())?;
+        .ok_or_else(|| "El proyecto no tiene un nombre válido".to_owned())?;
     let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&temporary, contents)
         .map_err(|error| format!("No se pudo escribir el temporal: {error}"))?;
