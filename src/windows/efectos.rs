@@ -90,6 +90,9 @@ pub struct ClipFx {
     pub duck_db: f64,
     /// Banda elástica de volumen; vacía = ganancia fija.
     pub volume_keys: Vec<VolumeKey>,
+    // --- Composición
+    /// Mate de pista: el clip solo se ve donde otra pista tiene imagen.
+    pub mate: Option<super::mate::MatePista>,
 }
 
 /// Familias de color de `huesaturation`, en el orden de sus banderas.

@@ -25,6 +25,7 @@ mod batch;
 mod curvas_hsl;
 mod graficos;
 mod hdr;
+mod mate;
 mod render_fondo;
 mod texto_animado;
 mod command_center;
@@ -13651,6 +13652,7 @@ impl eframe::App for NovaCutWindows {
                     ui.spacing_mut().slider_width =
                         (ui.available_width() - 200.0).clamp(48.0, 220.0);
                     let fps = self.project.fps;
+                    let video_tracks = self.project.video_track_count();
                     self.batch_paste_dialog(context);
                     let selection_size = self.selected_indices().len();
                     if selection_size > 1 {
@@ -14505,6 +14507,60 @@ impl eframe::App for NovaCutWindows {
                                     });
                                 if matches!(clip.fusion, Fusion::Color | Fusion::Luminosity) {
                                     ui.small("FFmpeg aproxima este modo con composición normal.");
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Mate de pista");
+                                    let current = clip
+                                        .fx
+                                        .mate
+                                        .map(|matte| format!("V{}", matte.pista + 1))
+                                        .unwrap_or_else(|| "Ninguno".to_owned());
+                                    egui::ComboBox::from_id_salt("track_matte")
+                                        .selected_text(current)
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_label(clip.fx.mate.is_none(), "Ninguno").clicked() {
+                                                clip.fx.mate = None;
+                                                trim_changed = true;
+                                            }
+                                            for track in (0..video_tracks).filter(|track| *track != clip.track) {
+                                                let chosen = clip.fx.mate.is_some_and(|matte| matte.pista == track);
+                                                if ui.selectable_label(chosen, format!("V{}", track + 1)).clicked() {
+                                                    let previous = clip.fx.mate.unwrap_or(mate::MatePista {
+                                                        pista: track,
+                                                        modo: mate::ModoMate::Alfa,
+                                                        invertir: false,
+                                                    });
+                                                    clip.fx.mate = Some(mate::MatePista { pista: track, ..previous });
+                                                    trim_changed = true;
+                                                }
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(
+                                            "Como «Mate de pista» de Premiere: este clip solo se ve donde la pista elegida tiene imagen. Pon un texto o una forma en esa pista para meter el vídeo dentro",
+                                        );
+                                });
+                                if let Some(matte) = clip.fx.mate.as_mut() {
+                                    ui.horizontal(|ui| {
+                                        for mode in mate::ModoMate::TODOS {
+                                            trim_changed |= ui
+                                                .selectable_value(&mut matte.modo, mode, mode.nombre())
+                                                .on_hover_text(mode.ayuda())
+                                                .changed();
+                                        }
+                                        trim_changed |= ui
+                                            .checkbox(&mut matte.invertir, "Invertir")
+                                            .on_hover_text("El clip se ve donde la pista mate NO tiene imagen")
+                                            .changed();
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "V{} ya no se ve sola: recorta este clip",
+                                            matte.pista + 1
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
                                 }
                             }
                             ui.collapsing("Máscara", |ui| {
@@ -18003,15 +18059,58 @@ fn render_preview_frame_at(
             ));
         }
     }
+    // Mate de pista: igual que en la exportación (ver `mate.rs`).
+    let matte_plan = mate::planificar(&sources.iter().map(|(clip, _)| clip).collect::<Vec<_>>());
+    let place = |index: usize| {
+        let clip = &sources[index].0;
+        format!(
+            "x=(W-w)/2+{:.3}:y=(H-h)/2+{:.3}",
+            clip.position_x * canvas_w as f64 / 1920.0,
+            clip.position_y * canvas_h as f64 / 1080.0
+        )
+    };
+    let canvas_size = (canvas_w as u32, canvas_h as u32);
+    let mut matte_masks: HashMap<usize, String> = HashMap::new();
+    for (track, users) in &matte_plan.pistas {
+        let mut composite = format!("pmt{track}x0");
+        filters.push(mate::lienzo(&composite, canvas_size, &frame_rate, 0.1));
+        for (position, member) in matte_plan.miembros[track].iter().enumerate() {
+            let next = format!("pmt{track}x{}", position + 1);
+            filters.push(format!("[{composite}][pv{member}]overlay={}:format=auto[{next}]", place(*member)));
+            composite = next;
+        }
+        let (split, copies) = mate::repartir(&composite, users.len(), &format!("pmt{track}c"));
+        filters.push(split);
+        for (user, copy) in users.iter().zip(copies) {
+            if let Some(matte) = sources[*user].0.fx.mate {
+                let mask = format!("pmk{user}");
+                filters.push(mate::mascara(&copy, &matte, &mask));
+                matte_masks.insert(*user, mask);
+            }
+        }
+    }
+    let visible: Vec<usize> = (0..sources.len()).filter(|index| !matte_plan.oculto(*index)).collect();
+    if visible.is_empty() {
+        filters.push("[base]null[vcomp]".to_owned());
+    }
     let mut previous = "base".to_owned();
-    for (index, (clip, _)) in sources.iter().enumerate() {
-        let output = if index + 1 == sources.len() {
+    for (order, &index) in visible.iter().enumerate() {
+        let clip = &sources[index].0;
+        let output = if order + 1 == visible.len() {
             "vcomp".to_owned()
         } else {
             format!("po{index}")
         };
         let x = clip.position_x * canvas_w as f64 / 1920.0;
         let y = clip.position_y * canvas_h as f64 / 1080.0;
+        if let Some(mask) = matte_masks.get(&index) {
+            let alone = format!("pml{index}");
+            filters.push(mate::lienzo(&format!("{alone}b"), canvas_size, &frame_rate, 0.1));
+            filters.push(format!("[{alone}b][pv{index}]overlay={}:format=auto[{alone}]", place(index)));
+            filters.extend(mate::aplicar(&previous, &alone, mask, &format!("pma{index}"), &output));
+            previous = output;
+            continue;
+        }
         if clip.is_adjustment {
             // El monitor ya solo compone clips activos en el cabezal, así
             // que no hace falta puerta temporal: solo máscara y opacidad.
@@ -18739,8 +18838,13 @@ fn build_render_filters(
         }
     }
 
+    let matte_plan = if include_video {
+        mate::planificar(&clips.iter().collect::<Vec<_>>())
+    } else {
+        mate::Plan::default()
+    };
     let mut overlay_order: Vec<usize> = (0..clips.len())
-        .filter(|index| clips[*index].has_video && include_video)
+        .filter(|index| clips[*index].has_video && include_video && !matte_plan.oculto(*index))
         .collect();
     overlay_order.sort_by(|left, right| {
         clips[*left].track.cmp(&clips[*right].track).then_with(|| {
@@ -18749,18 +18853,11 @@ fn build_render_filters(
                 .total_cmp(&clips[*right].timeline_start)
         })
     });
-    let video_count = overlay_order.len();
-    let mut previous = "base".to_owned();
-    for (layer, index) in overlay_order.into_iter().enumerate() {
-        let output_label = if layer + 1 == video_count {
-            "vout".to_owned()
-        } else {
-            format!("overlay{layer}")
-        };
-        // La posición se guarda en píxeles de 1920×1080 (como la ve el
-        // monitor, que la escala a su tamaño): se lleva a la salida real para
-        // que 720p, 4K o vertical coloquen la capa donde se ve.
-        let (scale_x, scale_y) = (out_w as f64 / 1920.0, out_h as f64 / 1080.0);
+    // La posición se guarda en píxeles de 1920×1080 (como la ve el
+    // monitor, que la escala a su tamaño): se lleva a la salida real para
+    // que 720p, 4K o vertical coloquen la capa donde se ve.
+    let (scale_x, scale_y) = (out_w as f64 / 1920.0, out_h as f64 / 1080.0);
+    let overlay_position = |index: usize| -> String {
         let (x, y, _, _) = clips[index].evaluate_transform(0.0);
         let (x, y) = (x * scale_x, y * scale_y);
         let scaled_position = |(px, py): (String, String)| {
@@ -18770,7 +18867,74 @@ fn build_render_filters(
                 (format!("({px})*{scale_x:.6}"), format!("({py})*{scale_y:.6}"))
             }
         };
-        if clips[index].is_adjustment {
+        if let Some(((dx, dy), (px, py))) = clips[index]
+            .runtime
+            .offset_expressions()
+            .map(|offsets| (offsets, (format!("{x:.3}"), format!("{y:.3}"))))
+            .or_else(|| {
+                moving_position(&clips[index])
+                    .map(|position| ((String::new(), String::new()), position))
+            })
+        {
+            let term = |expression: String| {
+                if expression.is_empty() {
+                    String::new()
+                } else {
+                    format!("+{expression}")
+                }
+            };
+            let (px, py) = moving_position(&clips[index])
+                .map(scaled_position)
+                .unwrap_or((px, py));
+            format!("x='(W-w)/2+{px}{}':y='(H-h)/2+{py}{}':eval=frame", term(dx), term(dy))
+        } else {
+            format!("x=(W-w)/2+{x:.3}:y=(H-h)/2+{y:.3}")
+        }
+    };
+    // Cada pista mate se compone una vez en un lienzo transparente y se
+    // reparte entre los clips que la usan, ya convertida en máscara.
+    let mut matte_masks: HashMap<usize, String> = HashMap::new();
+    for (track, users) in &matte_plan.pistas {
+        let mut composite = format!("mt{track}x0");
+        filters.push(mate::lienzo(&composite, size, &frame_rate, total));
+        for (position, member) in matte_plan.miembros[track].iter().enumerate() {
+            let next = format!("mt{track}x{}", position + 1);
+            filters.push(format!(
+                "[{composite}][v{member}]overlay={}:eof_action=pass:shortest=0:format=auto[{next}]",
+                overlay_position(*member)
+            ));
+            composite = next;
+        }
+        let (split, copies) = mate::repartir(&composite, users.len(), &format!("mt{track}c"));
+        filters.push(split);
+        for (user, copy) in users.iter().zip(copies) {
+            let Some(matte) = clips[*user].fx.mate else {
+                continue;
+            };
+            let mask = format!("mk{user}");
+            filters.push(mate::mascara(&copy, &matte, &mask));
+            matte_masks.insert(*user, mask);
+        }
+    }
+    let video_count = overlay_order.len();
+    let mut previous = "base".to_owned();
+    for (layer, index) in overlay_order.into_iter().enumerate() {
+        let output_label = if layer + 1 == video_count {
+            "vout".to_owned()
+        } else {
+            format!("overlay{layer}")
+        };
+        if let Some(mask) = matte_masks.get(&index) {
+            // El clip se coloca solo en un lienzo de la salida y su alfa se
+            // multiplica por la máscara de la pista mate.
+            let alone = format!("ml{layer}");
+            filters.push(mate::lienzo(&format!("{alone}b"), size, &frame_rate, total));
+            filters.push(format!(
+                "[{alone}b][v{index}]overlay={}:eof_action=pass:shortest=0:format=auto[{alone}]",
+                overlay_position(index)
+            ));
+            filters.extend(mate::aplicar(&previous, &alone, mask, &format!("ma{layer}"), &output_label));
+        } else if clips[index].is_adjustment {
             // Capa de ajuste: sin overlay de medio propio. Gradúa una copia
             // de todo lo compuesto debajo (`[previous]`) y la recompone solo
             // donde el alfa lo permite. El alfa combina máscara espacial
@@ -18846,33 +19010,10 @@ fn build_render_filters(
             filters.push(format!(
                 "[base{layer}b][blenda{layer}]overlay=eof_action=pass:shortest=0:format=auto[{output_label}]"
             ));
-        } else if let Some(((dx, dy), (px, py))) = clips[index]
-            .runtime
-            .offset_expressions()
-            .map(|offsets| (offsets, (format!("{x:.3}"), format!("{y:.3}"))))
-            .or_else(|| {
-                moving_position(&clips[index])
-                    .map(|position| ((String::new(), String::new()), position))
-            })
-        {
-            let term = |expression: String| {
-                if expression.is_empty() {
-                    String::new()
-                } else {
-                    format!("+{expression}")
-                }
-            };
-            let (px, py) = moving_position(&clips[index])
-                .map(scaled_position)
-                .unwrap_or((px, py));
-            filters.push(format!(
-                "[{previous}][v{index}]overlay=x='(W-w)/2+{px}{}':y='(H-h)/2+{py}{}':eval=frame:eof_action=pass:shortest=0:format=auto[{output_label}]",
-                term(dx),
-                term(dy)
-            ));
         } else {
             filters.push(format!(
-                "[{previous}][v{index}]overlay=x=(W-w)/2+{x:.3}:y=(H-h)/2+{y:.3}:eof_action=pass:shortest=0:format=auto[{output_label}]"
+                "[{previous}][v{index}]overlay={}:eof_action=pass:shortest=0:format=auto[{output_label}]",
+                overlay_position(index)
             ));
         }
         previous = output_label;
@@ -23168,6 +23309,83 @@ mod render_real_tests {
         let (a, b) = (frame_rgb(&gpu, 1.0), frame_rgb(&cpu, 1.0));
         let difference = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y) as u64).sum::<u64>() / a.len() as u64;
         assert!(difference <= 3, "diferencia media GPU/CPU: {difference}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn track_matte_shows_the_clip_only_inside_the_matte() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("mate");
+        let solid = |name: &str, colour: &str| {
+            let path = directory.join(name);
+            let status = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("color=c={colour}:s=320x180:r=25:d=2"))
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let video = |path: PathBuf, track: usize| RoughClip {
+            path,
+            track,
+            out_seconds: 2.0,
+            source_duration_seconds: Some(2.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let blue = video(solid("azul.mp4", "blue"), 0);
+        let mut red = video(solid("rojo.mp4", "red"), 1);
+        red.fx.mate = Some(mate::MatePista { pista: 2, modo: mate::ModoMate::Alfa, invertir: false });
+        let shape = RoughClip {
+            track: 2,
+            out_seconds: 2.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: String::new(),
+                style: efectos::TitleStyle {
+                    grafico: Some(graficos::Grafico::Forma {
+                        tipo: graficos::TipoForma::Rectangulo,
+                        color: [1.0, 1.0, 1.0],
+                        opacidad: 1.0,
+                        caja: [0.0, 0.0, 0.5, 1.0],
+                        grosor: 8.0,
+                    }),
+                    ..Default::default()
+                },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        // (izquierda, derecha) como «r», «b» o «w» según el canal dominante.
+        let kind = |p: &[u8]| match (p[0] > 150, p[1] > 150, p[2] > 150) {
+            (true, true, true) => 'w',
+            (true, false, false) => 'r',
+            (false, false, true) => 'b',
+            _ => '?',
+        };
+        let check = |clips: &[RoughClip], expected: (char, char), what: &str| {
+            let sources: Vec<(RoughClip, f64)> = clips.iter().map(|c| (c.clone(), 1.0)).collect();
+            let frame = render_preview_frame(&sources, Timebase::from_fps(25.0)).unwrap();
+            let (w, h) = (frame.width, frame.height);
+            let at = |x: usize| kind(&frame.pixels[((h / 2) * w + x) * 4..][..3]);
+            assert_eq!((at(w / 4), at(w * 3 / 4)), expected, "monitor, {what}");
+            let output = directory.join(format!("{what}.mp4"));
+            export(clips, &output, ExportFormat::Mp4Video).unwrap();
+            let rgb = frame_rgb(&output, 1.0);
+            let at = |x: usize| kind(&rgb[(45 * 160 + x) * 3..][..3]);
+            assert_eq!((at(40), at(120)), expected, "exportación, {what}");
+        };
+        check(&[blue.clone(), red.clone(), shape.clone()], ('r', 'b'), "alfa");
+        red.fx.mate = Some(mate::MatePista { pista: 2, modo: mate::ModoMate::Luma, invertir: true });
+        check(&[blue.clone(), red.clone(), shape.clone()], ('b', 'r'), "luma invertida");
+        // Sin mate, el rectángulo blanco se ve encima de todo.
+        red.fx.mate = None;
+        check(&[blue, red, shape], ('w', 'r'), "sin mate");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

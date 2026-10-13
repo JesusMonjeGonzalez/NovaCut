@@ -301,3 +301,8 @@ Pendiente de UX:
   reproducción no saca ni un fotograma, se apaga para la sesión y se
   reintenta con CPU; si la exportación falla, se repite con CPU.
   `NOVACUT_NO_HWDECODE=1` la desactiva. Misma imagen que por CPU (probado).
+- **Mate de pista** (`mate.rs`, Inspector › Composición): como «Track Matte
+  Key», el clip se ve solo donde otra pista tiene imagen (por alfa o por
+  luminancia, con «Invertir»): vídeo dentro de un texto, revelados con
+  formas. La pista mate se compone una vez, se reparte entre quienes la
+  usan y deja de verse sola. Igual en monitor, reproducción y exportación.
