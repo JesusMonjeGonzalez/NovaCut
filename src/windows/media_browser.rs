@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,9 +45,9 @@ pub fn validate_drop_destination(
     has_audio: bool,
 ) -> Result<(), &'static str> {
     if locked {
-        Err("La pista de destino esta bloqueada")
+        Err("La pista de destino está bloqueada")
     } else if is_video && !has_video {
-        Err("Ese medio no tiene video")
+        Err("Ese medio no tiene vídeo")
     } else if !is_video && !has_audio {
         Err("Ese medio no tiene audio")
     } else {
@@ -73,10 +73,10 @@ impl FileStatus {
         }
     }
 
-    pub fn is_file(&mut self, path: &PathBuf) -> bool {
+    pub fn is_file(&mut self, path: &Path) -> bool {
         *self
             .entries
-            .entry(path.clone())
+            .entry(path.to_path_buf())
             .or_insert_with(|| path.is_file())
     }
 }
@@ -212,7 +212,7 @@ mod tests {
                 for has_audio in [false, true] {
                     assert_eq!(
                         validate_drop_destination(true, is_video, has_video, has_audio),
-                        Err("La pista de destino esta bloqueada"),
+                        Err("La pista de destino está bloqueada"),
                     );
                 }
             }
@@ -230,7 +230,7 @@ mod tests {
         for has_audio in [false, true] {
             assert_eq!(
                 validate_drop_destination(false, true, false, has_audio),
-                Err("Ese medio no tiene video"),
+                Err("Ese medio no tiene vídeo"),
             );
         }
     }

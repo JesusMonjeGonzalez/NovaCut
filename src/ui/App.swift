@@ -1359,8 +1359,21 @@ final class EditorState: ObservableObject {
         panel.title = "Importar subtítulos"
         panel.prompt = "Importar"
         panel.allowedContentTypes = [UTType(filenameExtension: "srt") ?? .text]
-        guard panel.runModal() == .OK, let url = panel.url,
-              let texto = try? String(contentsOf: url, encoding: .utf8) else { return }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // UTF-8, UTF-16 con BOM o Windows-1252: casi todos los SRT en
+        // español descargados vienen en esta última y antes no hacían nada.
+        guard let datos = try? Data(contentsOf: url) else {
+            status = "No se pudo leer el SRT"
+            return
+        }
+        let texto: String
+        if datos.starts(with: [0xFF, 0xFE]) || datos.starts(with: [0xFE, 0xFF]) {
+            texto = String(data: datos, encoding: .utf16) ?? ""
+        } else if let utf8 = String(data: datos, encoding: .utf8) {
+            texto = utf8
+        } else {
+            texto = String(data: datos, encoding: .windowsCP1252) ?? ""
+        }
         let cues = SubtitulosService.leerSRT(texto, timebase: timebase)
         guard !cues.isEmpty else { status = "El SRT no contiene subtítulos válidos"; return }
         performEdit(keepPosition: true) { montaje.subtitulos = cues }

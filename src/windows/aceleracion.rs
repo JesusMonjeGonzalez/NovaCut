@@ -201,3 +201,46 @@ mod tests {
         );
     }
 }
+
+/// Decodificación por GPU (`-hwaccel auto`: D3D11VA/DXVA2 en Windows,
+/// VideoToolbox en el Mac). Si el equipo no la tiene, FFmpeg sigue con CPU
+/// él solo; si falla a mitad (driver roto), se apaga para el resto de la
+/// sesión y la exportación se repite con CPU.
+static DECODIFICACION_ROTA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REINTENTO_PENDIENTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static SOLO_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Como mucho, cuántas entradas de un mismo render decodifica la GPU: cada
+/// una abre su decodificador y su memoria de vídeo, y un montaje largo
+/// tiene decenas de entradas.
+pub const MAX_DECODIFICADORES: usize = 8;
+
+pub fn decodificar_con_gpu() -> bool {
+    !DECODIFICACION_ROTA.load(std::sync::atomic::Ordering::Relaxed)
+        && !SOLO_CPU.with(std::cell::Cell::get)
+        && std::env::var_os("NOVACUT_NO_HWDECODE").is_none()
+}
+
+/// Ejecuta `f` decodificando solo con CPU en este hilo.
+pub fn con_cpu<T>(f: impl FnOnce() -> T) -> T {
+    let antes = SOLO_CPU.with(|solo| solo.replace(true));
+    let resultado = f();
+    SOLO_CPU.with(|solo| solo.set(antes));
+    resultado
+}
+
+/// La reproducción no sacó ni un fotograma con GPU: se apaga y se pide un
+/// reintento (lo recoge `tomar_reintento`).
+pub fn desactivar_decodificacion_gpu() {
+    if decodificar_con_gpu() {
+        DECODIFICACION_ROTA.store(true, std::sync::atomic::Ordering::Relaxed);
+        REINTENTO_PENDIENTE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn tomar_reintento() -> bool {
+    REINTENTO_PENDIENTE.swap(false, std::sync::atomic::Ordering::Relaxed)
+}

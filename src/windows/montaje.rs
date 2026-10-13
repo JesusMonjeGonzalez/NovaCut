@@ -15,11 +15,14 @@ pub const MIN_CLIP: f64 = 0.04;
 /// Secuencias anidadas y rampas no se pueden cortar por dentro: su tiempo de
 /// origen no es lineal con el de timeline.
 pub fn is_complex(clip: &RoughClip) -> bool {
-    clip.nested.is_some()
-        || clip
-            .speed_ramp
-            .as_ref()
-            .is_some_and(|points| !points.is_empty())
+    clip.nested.is_some() || has_ramp(clip)
+}
+
+/// Lo que de verdad impide recortar o partir: una rampa de velocidad. Un
+/// anidado sí se recorta y se parte: su entrada/salida es una ventana
+/// sobre sus hijos (ver `unnest_one`).
+fn has_ramp(clip: &RoughClip) -> bool {
+    clip.speed_ramp.as_ref().is_some_and(|points| !points.is_empty())
 }
 
 fn speed(clip: &RoughClip) -> f64 {
@@ -29,6 +32,13 @@ fn speed(clip: &RoughClip) -> f64 {
 /// Último segundo de origen utilizable. Sin duración conocida (títulos,
 /// capas de ajuste, imágenes) el material no se acaba.
 fn source_ceiling(clip: &RoughClip) -> f64 {
+    if let Some(children) = &clip.nested {
+        // El material de un anidado es lo que ocupan sus hijos.
+        return children
+            .iter()
+            .map(|child| child.timeline_start + child.duration())
+            .fold(clip.out_seconds, f64::max);
+    }
     clip.source_duration_seconds
         .map(|duration| duration.max(clip.out_seconds))
         .unwrap_or(f64::INFINITY)
@@ -66,7 +76,7 @@ pub fn edge_limits(clip: &RoughClip) -> (f64, f64, f64, f64) {
 /// anclados al mismo fotograma de origen. Devuelve `None` si el clip no
 /// admite la edición o se quedaría sin material.
 pub fn retime(clip: &RoughClip, head: f64, tail: f64) -> Option<RoughClip> {
-    if is_complex(clip) {
+    if has_ramp(clip) {
         return None;
     }
     let (head_min, head_max, tail_min, tail_max) = edge_limits(clip);
@@ -156,7 +166,7 @@ pub fn clip_portion(clip: &RoughClip, from: f64, to: f64) -> Option<RoughClip> {
     let duration = clip.duration();
     let from = from.clamp(0.0, duration);
     let to = to.clamp(from, duration);
-    if to - from < 0.001 || is_complex(clip) {
+    if to - from < 0.001 || has_ramp(clip) {
         return None;
     }
     let mut part = retime(clip, from, to - duration).or_else(|| {
@@ -512,13 +522,37 @@ mod tests {
     }
 
     #[test]
-    fn split_refuses_edges_and_complex_clips() {
+    fn split_refuses_edges_and_speed_ramps() {
         let clip = media(0.0, 0.0, 4.0);
         assert!(split(&clip, 0.01).is_none());
         assert!(split(&clip, 3.99).is_none());
-        let mut nested = clip.clone();
-        nested.nested = Some(vec![clip]);
-        assert!(split(&nested, 2.0).is_none());
+        let mut ramped = clip.clone();
+        ramped.speed_ramp = Some(vec![super::super::SpeedPoint { source_t: 0.0, speed: 2.0 }]);
+        assert!(split(&ramped, 2.0).is_none());
+    }
+
+    /// Partir un anidado da dos contenedores con ventanas contiguas que,
+    /// aplanados, son exactamente el original.
+    #[test]
+    fn splitting_a_nested_sequence_keeps_what_it_shows() {
+        let children = vec![media(0.0, 1.0, 4.0), media(3.0, 0.0, 3.0)];
+        let mut nest = media(10.0, 0.0, 6.0);
+        nest.path = std::path::PathBuf::new();
+        nest.nested = Some(children);
+        let (left, right) = split(&nest, 2.5).expect("un anidado se parte");
+        let pieces = |clips: &[RoughClip]| {
+            super::super::flatten_nested(clips)
+                .iter()
+                .map(|c| (c.path.clone(), c.timeline_start, c.in_seconds, c.out_seconds))
+                .collect::<Vec<_>>()
+        };
+        let whole = pieces(&[nest]);
+        let halves = pieces(&[left, right]);
+        // El primer hijo queda cortado en 2,5 s: sus dos mitades suman él.
+        assert_eq!(halves.len(), whole.len() + 1, "{halves:?}");
+        assert!(approx(halves[0].1, 10.0) && approx(halves[0].3, 3.5));
+        assert!(approx(halves[1].1, 12.5) && approx(halves[1].2, 3.5) && approx(halves[1].3, 4.0));
+        assert!(approx(halves[2].1, whole[1].1) && approx(halves[2].2, whole[1].2));
     }
 
     #[test]

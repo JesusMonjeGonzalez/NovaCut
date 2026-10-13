@@ -495,6 +495,6 @@ mod tests {
         project.delete_bin("Brutos/Día 1");
         assert_eq!(project.library[0].bin, "Brutos");
         assert!(project.add_bin(" / ").is_none());
-        assert!(project.media_in_use(std::path::Path::new("a.mp4")) == false);
+        assert!(!project.media_in_use(std::path::Path::new("a.mp4")));
     }
 }

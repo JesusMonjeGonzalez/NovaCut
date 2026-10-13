@@ -1,4 +1,5 @@
 //! Selection editing deliberately writes only explicitly chosen static fields.
+use super::animacion;
 use super::{egui, theme, NovaCutWindows, RoughClip, RoughProject};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,12 +45,12 @@ impl Field {
             Self::X => ("X (px)", -7680.0, 7680.0),
             Self::Y => ("Y (px)", -4320.0, 4320.0),
             Self::Scale => ("Escala (%)", 1.0, 800.0),
-            Self::Rotation => ("Rotacion", -3600.0, 3600.0),
+            Self::Rotation => ("Rotación", -3600.0, 3600.0),
             Self::Opacity => ("Opacidad (%)", 0.0, 100.0),
-            Self::Exposure => ("Exposicion", -1.0, 1.0),
+            Self::Exposure => ("Exposición", -1.0, 1.0),
             Self::Contrast => ("Contraste", -1.0, 1.0),
-            Self::Saturation => ("Saturacion", -1.0, 1.0),
-            Self::Vignette => ("Vineta", -1.0, 1.0),
+            Self::Saturation => ("Saturación", -1.0, 1.0),
+            Self::Vignette => ("Viñeta", -1.0, 1.0),
             Self::Blur => ("Desenfoque", 0.0, 1.0),
             Self::Gain => ("Ganancia (dB)", -96.0, 24.0),
             Self::Pan => ("Balance L/R", -1.0, 1.0),
@@ -122,7 +123,7 @@ impl Field {
 }
 
 const CATEGORIES: [&str; 5] = [
-    "Transformacion",
+    "Transformación",
     "Color y efectos",
     "Audio",
     "Fundidos",
@@ -150,6 +151,8 @@ pub(super) struct State {
     values: [Option<f64>; 15],
     categories: [bool; 5],
     pub paste: Option<(Vec<usize>, u64, Box<RoughClip>)>,
+    /// Diálogo «Quitar atributos» abierto para estos clips.
+    pub remove: Option<(Vec<usize>, u64)>,
 }
 
 pub(super) enum Operation {
@@ -221,7 +224,17 @@ fn apply(project: &mut RoughProject, indices: &[usize], operation: &Operation) -
                             field.set(&mut next, field.get(source));
                         }
                     }
+                    // Restablecer es «Quitar atributos»: también borra la
+                    // animación de la categoría. Pegar la conserva.
+                    let reset = matches!(operation, Operation::Reset(_));
                     match category {
+                        0 => {
+                            next.fx.tomar_transformacion(&source.fx);
+                            if reset {
+                                next.keyframes = None;
+                                next.anim.remove(&animacion::Param::Rotation);
+                            }
+                        }
                         1 => {
                             next.wheels = source.wheels;
                             next.curves = source.curves.clone();
@@ -229,7 +242,12 @@ fn apply(project: &mut RoughProject, indices: &[usize], operation: &Operation) -
                             next.lut = source.lut.clone();
                             next.mask = source.mask;
                             next.fusion = source.fusion;
+                            next.fx.tomar_efectos_de_video(&source.fx);
+                            if reset {
+                                next.anim.retain(|param, _| *param == animacion::Param::Rotation);
+                            }
                         }
+                        2 => next.fx.tomar_audio(&source.fx, reset),
                         4 => next.label = source.label,
                         _ => {}
                     }
@@ -377,7 +395,7 @@ impl NovaCutWindows {
         if ui
             .add_enabled(
                 self.attribute_clipboard.is_some(),
-                egui::Button::new("Pegar atributos..."),
+                egui::Button::new("Pegar atributos…"),
             )
             .on_hover_text("Elige qué atributos copiados pegar en los seleccionados")
             .on_disabled_hover_text("Elige qué atributos copiados pegar en los seleccionados")
@@ -385,16 +403,76 @@ impl NovaCutWindows {
         {
             self.paste_attributes();
         }
-        ui.collapsing("Restablecer categorias", |ui| {
+        ui.collapsing("Restablecer categorías", |ui| {
             for (category, label) in CATEGORIES.iter().enumerate() {
                 ui.checkbox(&mut self.batch_state.categories[category], *label);
             }
-            ui.small("Color incluye ruedas, curvas, chroma, LUT, mascara y fusion. No borra animacion ni transiciones.");
+            ui.small("Color incluye Lumetri, ruedas, curvas, HSL, chroma, LUT, máscara, fusión y mate. Borra también la animación de cada categoría; no toca transiciones.");
             if ui.add_enabled(self.batch_state.categories.iter().any(|v| *v), egui::Button::new("Restablecer seleccionadas")).on_hover_text("Vuelve esos atributos a sus valores por defecto").on_disabled_hover_text("Vuelve esos atributos a sus valores por defecto").clicked() {
                 self.run_batch(indices, Operation::Reset(self.batch_state.categories));
             }
         });
-        ui.small("Titulos y nidos se omiten. Capas de ajuste: solo color y etiqueta. Los keyframes existentes pueden prevalecer sobre los valores estaticos.");
+        ui.small("Títulos y nidos se omiten. Capas de ajuste: solo color y etiqueta. Los keyframes existentes pueden prevalecer sobre los valores estáticos.");
+    }
+
+    /// «Quitar atributos» de Premiere: devuelve las categorías marcadas a
+    /// sus valores por defecto, animación incluida, en uno o varios clips.
+    pub(super) fn batch_remove_dialog(&mut self, context: &egui::Context) {
+        let Some((indices, generation)) = self.batch_state.remove.take() else {
+            return;
+        };
+        if generation != self.document_generation || indices != self.selected_indices() {
+            return;
+        }
+        let mut open = true;
+        let mut apply_now = false;
+        let mut cancel = false;
+        egui::Window::new("Quitar atributos")
+            .id(egui::Id::new("batch-remove"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.colored_label(
+                    theme::ACCENT,
+                    if indices.len() == 1 {
+                        "1 clip".to_owned()
+                    } else {
+                        format!("{} clips", indices.len())
+                    },
+                );
+                for (category, label) in CATEGORIES.iter().enumerate() {
+                    ui.checkbox(&mut self.batch_state.categories[category], *label);
+                }
+                ui.small("Vuelve lo marcado a como estaba al importar, keyframes incluidos.");
+                ui.small("Color y efectos: Lumetri, ruedas, curvas, HSL, chroma, LUT, máscara, fusión y mate.");
+                ui.horizontal(|ui| {
+                    apply_now = ui
+                        .add_enabled(self.batch_state.categories.iter().any(|v| *v), egui::Button::new("Quitar"))
+                        .on_hover_text("Quita los atributos marcados")
+                        .on_disabled_hover_text("Marca al menos una categoría")
+                        .clicked();
+                    cancel = ui.button("Cancelar").on_hover_text("Cierra sin cambiar nada").clicked();
+                });
+            });
+        if apply_now {
+            self.run_batch(indices, Operation::Reset(self.batch_state.categories));
+        } else if open && !cancel {
+            self.batch_state.remove = Some((indices, generation));
+        }
+    }
+
+    pub(super) fn open_remove_attributes(&mut self) {
+        let indices = self.selected_indices();
+        if indices.is_empty() {
+            self.status = "Selecciona los clips de los que quitar atributos".to_owned();
+            return;
+        }
+        if !self.batch_state.categories.iter().any(|v| *v) {
+            // Por defecto, lo que Premiere marca: efectos y transformación.
+            self.batch_state.categories = [true, true, false, false, false];
+        }
+        self.batch_state.remove = Some((indices, self.document_generation));
     }
 
     pub(super) fn batch_paste_dialog(&mut self, context: &egui::Context) {
@@ -402,13 +480,13 @@ impl NovaCutWindows {
             return;
         };
         if generation != self.document_generation || indices != self.selected_indices() {
-            self.status = "Pegado cancelado: cambio el documento o la seleccion".to_owned();
+            self.status = "Pegado cancelado: cambió el documento o la selección".to_owned();
             return;
         }
         let mut open = true;
         let mut apply_now = false;
         let mut cancel = false;
-        egui::Window::new("Pegar atributos a la seleccion")
+        egui::Window::new("Pegar atributos a la selección")
             .id(egui::Id::new("batch-paste"))
             .collapsible(false).resizable(false).open(&mut open).show(context, |ui| {
                 ui.colored_label(theme::ACCENT, format!("Destino: {} clips", indices.len()));
@@ -418,8 +496,8 @@ impl NovaCutWindows {
                         ui.checkbox(&mut self.batch_state.categories[category], *label);
                     });
                 }
-                ui.small("Solo valores estaticos. Se conservan tiempos, rutas de medios, retiming y keyframes.");
-                ui.small("Color incluye ruedas, curvas, chroma, LUT, mascara y fusion. Fundidos limitados a media duracion por clip.");
+                ui.small("Solo valores estáticos. Se conservan tiempos, rutas de medios, retiming y keyframes.");
+                ui.small("Color incluye ruedas, curvas, chroma, LUT, máscara y fusión. Fundidos limitados a media duración por clip.");
                 ui.horizontal(|ui| {
                     apply_now = ui.add_enabled(self.batch_state.categories.iter().enumerate()
                         .any(|(i, v)| *v && supports(&source, i)), egui::Button::new("Pegar")).on_hover_text("Pega los atributos marcados").on_disabled_hover_text("Pega los atributos marcados").clicked();
@@ -446,6 +524,43 @@ mod tests {
             clips,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn paste_and_remove_cover_lumetri_audio_and_animation() {
+        let mut source = RoughClip::default();
+        source.fx.temperature = 0.4;
+        source.fx.sharpen = 0.3;
+        source.fx.flip_h = true;
+        source.fx.eq_low_db = -6.0;
+        let mut target = RoughClip::default();
+        target.fx.stabilize = true;
+        target.fx.voice_cleanup = 0.5;
+        let mut p = project(vec![target]);
+        // Solo «Color y efectos»: viaja el Lumetri y el detalle; ni el
+        // volteo (transformación), ni el EQ (audio), ni la estabilización.
+        apply(&mut p, &[0], &Operation::Paste(Box::new(source.clone()), [false, true, false, false, false]));
+        let fx = &p.clips[0].fx;
+        assert_eq!((fx.temperature, fx.sharpen), (0.4, 0.3));
+        assert!(!fx.flip_h && fx.stabilize);
+        assert_eq!((fx.eq_low_db, fx.voice_cleanup), (0.0, 0.5));
+        apply(&mut p, &[0], &Operation::Paste(Box::new(source), [true, false, true, false, false]));
+        assert!(p.clips[0].fx.flip_h);
+        assert_eq!(p.clips[0].fx.eq_low_db, -6.0);
+        // Quitar atributos de color: fuera el Lumetri y su animación, la
+        // rotación animada (transformación) se queda.
+        p.clips[0].anim.insert(animacion::Param::Temperature, vec![animacion::Key { t: 0.0, v: 0.2 }]);
+        p.clips[0].anim.insert(animacion::Param::Rotation, vec![animacion::Key { t: 0.0, v: 10.0 }]);
+        apply(&mut p, &[0], &Operation::Reset([false, true, false, false, false]));
+        let clip = &p.clips[0];
+        assert_eq!((clip.fx.temperature, clip.fx.sharpen), (0.0, 0.0));
+        assert!(clip.fx.stabilize && clip.fx.flip_h);
+        assert!(!clip.anim.contains_key(&animacion::Param::Temperature));
+        assert!(clip.anim.contains_key(&animacion::Param::Rotation));
+        apply(&mut p, &[0], &Operation::Reset([true, false, true, false, false]));
+        let clip = &p.clips[0];
+        assert!(!clip.fx.flip_h && clip.anim.is_empty());
+        assert_eq!((clip.fx.eq_low_db, clip.fx.voice_cleanup), (0.0, 0.0));
     }
 
     #[test]
@@ -595,6 +710,8 @@ mod tests {
         );
         clip.position_x = 0.0;
         clip.scale_percent = 100.0;
+        // Quitar la transformación quita también su animación.
+        clip.keyframes = None;
         assert_eq!(
             serde_json::to_value(&p.clips[0]).unwrap(),
             serde_json::to_value(&clip).unwrap()

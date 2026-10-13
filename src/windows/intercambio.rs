@@ -237,6 +237,14 @@ fn tiempo_de(nodo: &Nodo, atributo: &str) -> Option<f64> {
 fn ruta_de_url(url: &str) -> PathBuf {
     let sin_esquema = url.strip_prefix("file://").unwrap_or(url);
     let sin_host = sin_esquema.strip_prefix("localhost").unwrap_or(sin_esquema);
+    // `file://servidor/recurso/x.mov` es una ruta de red (\\servidor\recurso).
+    let con_red;
+    let sin_host = if url.starts_with("file://") && !sin_host.is_empty() && !sin_host.starts_with('/') {
+        con_red = format!("//{sin_host}");
+        con_red.as_str()
+    } else {
+        sin_host
+    };
     let bytes = sin_host.as_bytes();
     let hexadecimal = |byte: u8| (byte as char).to_digit(16).map(|valor| valor as u8);
     let mut decodificado = Vec::with_capacity(bytes.len());
@@ -581,6 +589,8 @@ mod tests {
         );
         assert_eq!(ruta_de_url("file://localhost/Volumes/X/a.mov"), PathBuf::from("/Volumes/X/a.mov"));
         assert_eq!(ruta_de_url("file:///C:/100%.mov"), PathBuf::from("C:/100%.mov"));
+        assert_eq!(ruta_de_url("file://nas/Medios/a%20b.mov"), PathBuf::from("//nas/Medios/a b.mov"));
+        assert_eq!(ruta_de_url("file:////nas/Medios/a.mov"), PathBuf::from("//nas/Medios/a.mov"));
     }
 
     /// Como lo exporta DaVinci Resolve: timecode en 01:00:00:00, medios con

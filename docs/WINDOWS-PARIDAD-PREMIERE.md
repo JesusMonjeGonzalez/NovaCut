@@ -186,7 +186,7 @@ ha cubierto de cada una:
 |---|---|---|
 | Reproducción no en tiempo real | «Renderizar previsualización» (Herramientas › Reproducción): compone I–O o todo el montaje en segundo plano; la reproducción lee ese tramo ya compuesto. Barra verde en la regla; cualquier edición la invalida | Hecho |
 | Monitor ≠ exportación | Posiciones proporcionales a la salida (en 720p y 4K caían en otro sitio); en vertical y cuadrado se respetan escala, posición y zoom animado; el monitor compone con la proporción de la exportación, con bandas | Hecho |
-| Color de 8 bits sin gestión de color | — | Pendiente: necesita medir con FFmpeg real |
+| Color de 8 bits sin gestión de color | Vídeo HDR de móvil (HLG) y HDR10 (PQ) se pasa a Rec.709 al decodificar, como Premiere: blanco de referencia BT.2408 al ~90 %, altas luces comprimidas, salida etiquetada Rec.709 (`hdr.rs`, LUT 3D propia, sin depender de zscale) | Parcial: falta exportar en HDR y trabajar en 10 bits de punta a punta |
 | Intercambio profesional | Stems de audio por pista (WAV alineados, sin máster) | Parcial: faltan AAF/OMF y plugins |
 | Audio y modelo de datos | Los recortes de borde arrastran el audio enlazado | Parcial: faltan 5.1, submezclas y un deshacer que no copie el proyecto entero |
 
@@ -241,23 +241,102 @@ Todas usan el mismo botón: ayuda en el tooltip y, desactivadas, el motivo.
 La barra de estado recorta el mensaje con «…» en vez de pisar los datos de
 la derecha (el texto completo, en el tooltip). Textos a 11 px como mínimo.
 
-Pendiente de UX, por orden:
+Pendiente de UX:
 1. El suavizado inserta keyframes intermedios y la navegación ◀◆▶ del
-   Inspector los recorre todos. Hay que guardar el tipo de curva en el
-   keyframe (campo nuevo en `animacion::Key` y `TransformKeyframe`).
-2. Revisión visual con la app abierta a 800×500, 1280×720 y 4K emulado: en
-   especial que «Herramientas ▾» no parta la barra superior en dos filas a
-   1280 px.
+   Inspector los recorre todos. **Decidido no cambiarlo por un campo de
+   curva** (9 oct 2026): al partir un clip a mitad de una curva suave, una
+   curva guardada en el keyframe cambiaría de forma en el trozo que queda;
+   los puntos intermedios la conservan exactamente. Si se retoma, partir
+   tendrá que densificar solo el tramo cortado.
+2. ~~Barra superior en varias filas~~ (hecho el 9 oct 2026): por debajo de
+   1400 px formato, tamaño y GPU se eligen en la ventana de exportar; por
+   debajo de 1100 px deshacer y partir quedan junto a la timeline y lo demás
+   (partir todas, entrada/salida, buscar, atajos, tamaño) va al menú «⋯».
+   Revisado a 800×500 (una fila, se ven V1 y A1) y 1280×720 (una fila).
 
 ## Lo que sigue faltando frente a Premiere
 
-1. **Bloqueo de sincronía completo**: arrastrar, borrar y recortar un plano
-   lleva su audio enlazado y cerrar huecos no desincroniza; rodar, desplazar
-   y deslizar siguen actuando sobre un solo clip.
-2. **Previsualización en el monitor** de efectos temporales (estabilizar,
-   grano animado, barridos a mitad) en el fotograma fijo; se ven al reproducir.
-3. **Curvas HSL dibujables** (tono contra saturación); hoy la HSL secundaria es
-   por familias de color.
-4. **Plantillas de gráficos animadas** (.mogrt) y animación de texto por letra.
-5. **Render en segundo plano de la timeline** (barra roja/amarilla/verde) para
-   reproducir en tiempo real efectos pesados como el flujo óptico.
+1. ~~**Bloqueo de sincronía completo**~~ (9 oct 2026): arrastrar, borrar,
+   recortar, rodar, desplazar, deslizar y cerrar huecos llevan su audio
+   enlazado; si el audio no tiene material para acompañar, la edición se
+   rechaza en vez de desincronizar.
+2. **Previsualización en el monitor** de efectos temporales en el fotograma
+   fijo: resuelta cuando el tramo está renderizado (el fotograma sale del
+   render). Sin render, el fotograma fijo sigue sin estabilizar ni animar el
+   grano.
+3. ~~**Curvas HSL dibujables**~~ (9 oct 2026, `curvas_hsl.rs`): tono/saturación,
+   tono/tono, tono/luminancia y luminancia/saturación, aplicadas como LUT 3D
+   (.cube 33³ cacheada por contenido) con `lut3d`; monitor y exportación iguales.
+4. ~~**Plantillas de gráficos animadas y texto por letra**~~ (9 oct 2026,
+   `texto_animado.rs`): máquina de escribir, aparecer/subir por letras,
+   aparecer por palabras y salida en ola; caja y mate entran con el texto.
+   Plantillas en «+ Insertar › Plantillas animadas». Sigue sin leerse .mogrt.
+5. ~~**Render en segundo plano de la timeline**~~ (9 oct 2026,
+   `render_fondo.rs`): tramos entre cortes con barra roja (pesado),
+   amarilla (efectos, títulos, capas) o verde (renderizado); caché por firma
+   del contenido, así que editar otra parte o desplazar no invalida nada.
+   Manual («Renderizar lo rojo y amarillo») o automático tras 3 s sin editar
+   (desactivado por defecto; prioridad baja y respeta «Cuidar el equipo»).
+
+## 13 oct 2026: capas gráficas y HDR de móvil
+
+- **Capas gráficas** (`graficos.rs`, «+ Insertar › Gráficos»): audiograma
+  (onda, línea o barras del audio que suena debajo; sigue al montaje si se
+  mueve), barra de progreso de Shorts/Reels, rectángulo y marco. Son capas
+  de título: se mueven, recortan, animan y exportan igual. Fallos que
+  destapó FFmpeg real: `showwaves` sella su primer fotograma en pts 1 (el
+  monitor lo componía vacío) y `amovie` busca al keyframe de vídeo anterior
+  en un MP4 de cámara (la onda enseñaba siempre el principio del archivo).
+- **HDR de móvil** (`hdr.rs`): un iPhone graba en HLG de 10 bits por
+  defecto; antes se veía gris y lavado en monitor y exportación. Ahora se
+  detecta con FFprobe y se convierte con una LUT 3D de 65³ calculada por
+  NovaCut, después de escalar (al reproducir se convierte la imagen del
+  monitor, no el 4K) y antes de cualquier ajuste de color. El Inspector
+  (Medio y proxy) dice «HDR (HLG) · se convierte a Rec.709».
+- **Decodificación por GPU** (`-hwaccel auto`: D3D11VA/DXVA2 en Windows):
+  solo para entradas pesadas (HEVC, AV1, VP9 o más de 1440p) y como mucho
+  8 por render, porque cada clip de la timeline es una entrada y cada
+  decodificador reserva memoria de vídeo. En el Mac de pruebas, 4K HEVC 10
+  bits: por CPU, 6 s de CPU por 8 s de vídeo; por GPU, casi nada. Si la
+  reproducción no saca ni un fotograma, se apaga para la sesión y se
+  reintenta con CPU; si la exportación falla, se repite con CPU.
+  `NOVACUT_NO_HWDECODE=1` la desactiva. Misma imagen que por CPU (probado).
+- **Mate de pista** (`mate.rs`, Inspector › Composición): como «Track Matte
+  Key», el clip se ve solo donde otra pista tiene imagen (por alfa o por
+  luminancia, con «Invertir»): vídeo dentro de un texto, revelados con
+  formas. La pista mate se compone una vez, se reparte entre quienes la
+  usan y deja de verse sola. Igual en monitor, reproducción y exportación.
+- **Pegar atributos ahora pega los efectos** y hay **Quitar atributos**
+  (clic derecho › Audio y atributos). Antes pegar y restablecer solo
+  tocaban 15 campos básicos: el Lumetri, las curvas HSL, el detalle, la EQ,
+  la limpieza de voz o el mate no viajaban. `ClipFx` reparte ahora sus
+  campos por categoría (lo nuevo de vídeo entra solo en «Color y efectos»);
+  la estabilización nunca viaja (su análisis es de cada clip). Quitar
+  atributos borra también la animación de la categoría, como en Premiere.
+
+## 13 oct 2026 (tarde): red de pruebas «lo que se ve es lo que sale»
+
+Pruebas nuevas que exportan de verdad y comparan píxel a píxel o miden:
+
+- `monitor_matches_export_across_common_edits`: 25 escenas (color, PiP,
+  velocidad, invertido, fundidos, disolvencia, barrido, título, keyframes,
+  fusión, mate, capa de ajuste, máscara, recorte, móvil girado, PNG, foto,
+  difuminar zona, congelado, rampa, anidados) monitor contra exportación.
+- `monitor_matches_vertical_export` (9:16), `monitor_shows_the_same_source_frame_as_the_export`,
+  `exports_keep_picture_and_sound_in_sync` (claqueta: cortes, ×2, ×0,5,
+  audio separado, invertido), `clips_start_on_their_exact_frame`,
+  `segmented_export_matches_a_single_pass`, igualar voces a -16 LUFS.
+
+Fallos que destaparon (todos corregidos):
+
+| Fallo | Efecto para el usuario |
+|---|---|
+| `fade` de FFmpeg sobre RGBA baja color y alfa | A mitad de un fundido la exportación iba al 25 % en vez del 50 %; las disolvencias salían oscuras |
+| El monitor buscaba el medio en el instante del cabezal | Enseñaba el fotograma siguiente al que se exporta |
+| El monitor pintaba los fundidos a blanco como a negro | — |
+| Fotos y PNG con `-ss` en el fotograma fijo | No salían en el monitor en pausa (sí al exportar) |
+| Fotograma congelado: coma mal puesta en `tpad` | Exportar con un congelado fallaba siempre; además sonaba un chasquido |
+| El monitor ignoraba `freeze_at` | Enseñaba el clip en movimiento |
+| Anidados: se ignoraba la ventana y la transformación del contenedor | Escalar o recortar un anidado no hacía nada; ahora se parte, se recorta y se escala como en Premiere |
+| `setpts` trunca: `10.2/TB` = 254,999… | Clips que empezaban un fotograma antes y tapaban el último del anterior |
+| Todos los clips en un grafo | 200 cortes: 9 min y 25 GB para exportar 48 s. Ahora por tramos (`por_tramos.rs`): 18 s y 1,7 GB; la reproducción compone 12 clips como mucho y encadena; la sonoridad y Whisper mezclan por tramos |

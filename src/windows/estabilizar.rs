@@ -14,6 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+#[cfg(not(windows))]
+use super::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stabilizer {
     /// `deshake`: un paso, sin análisis previo.
@@ -63,7 +68,9 @@ impl TimeInterpolation {
 pub fn vidstab_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
+        // Sin ocultar la consola, en Windows se abría una ventana negra.
         Command::new(super::tool_path("ffmpeg.exe"))
+            .creation_flags(super::CREATE_NO_WINDOW)
             .args(["-hide_banner", "-filters"])
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).contains("vidstabtransform"))
@@ -121,6 +128,7 @@ pub fn analyze(clip: &RoughClip) -> Result<PathBuf, String> {
         .map_err(|error| format!("No se pudo crear la caché de estabilización: {error}"))?;
     let partial = target.with_extension(format!("{}.part", std::process::id()));
     let output = Command::new(super::tool_path("ffmpeg.exe"))
+        .creation_flags(super::BACKGROUND_PROCESS)
         .args(["-v", "error", "-y", "-ss", &super::format_seconds(clip.in_seconds)])
         .args(["-t", &super::format_seconds(clip.source_duration())])
         .arg("-i")

@@ -440,7 +440,7 @@ mod tests {
             }]),
             ..Default::default()
         };
-        assert!(extract_ranges(&[nested.clone()], &[(1.0, 2.0)]).is_err());
+        assert!(extract_ranges(std::slice::from_ref(&nested), &[(1.0, 2.0)]).is_err());
         // Si el corte no lo toca, se desplaza entero sin problema.
         let mut later = nested;
         later.timeline_start = 3.0;

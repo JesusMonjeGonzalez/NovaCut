@@ -65,6 +65,8 @@ pub struct ClipFx {
     // --- Lumetri › Curvas HSL secundarias
     /// Ajustes por familia de color (rojos, azules…), en orden.
     pub hsl: Vec<HslAdjust>,
+    /// Curvas HSL dibujables (tono/saturación, tono/tono…), vía LUT 3D.
+    pub curvas_hsl: super::curvas_hsl::CurvasHsl,
     /// Igualación de color con otro plano: ganancia y desplazamiento por
     /// canal R, G, B, calculados por `match_color`.
     pub color_match: Option<ColorMatch>,
@@ -88,6 +90,54 @@ pub struct ClipFx {
     pub duck_db: f64,
     /// Banda elástica de volumen; vacía = ganancia fija.
     pub volume_keys: Vec<VolumeKey>,
+    // --- Composición
+    /// Mate de pista: el clip solo se ve donde otra pista tiene imagen.
+    pub mate: Option<super::mate::MatePista>,
+}
+
+/// Reparto de los efectos por las categorías de «Pegar/Quitar atributos».
+/// Lo de tiempo (invertir, estabilizar, interpolación) no viaja nunca: el
+/// análisis de estabilización es de cada clip.
+impl ClipFx {
+    /// Transformación: voltear y recortar.
+    pub fn tomar_transformacion(&mut self, de: &ClipFx) {
+        self.flip_h = de.flip_h;
+        self.flip_v = de.flip_v;
+        self.crop_left = de.crop_left;
+        self.crop_right = de.crop_right;
+        self.crop_top = de.crop_top;
+        self.crop_bottom = de.crop_bottom;
+    }
+
+    /// Audio: EQ, voz, compresor y rol. La banda de volumen es animación:
+    /// solo se toca si `con_volumen_animado`.
+    pub fn tomar_audio(&mut self, de: &ClipFx, con_volumen_animado: bool) {
+        self.eq_low_db = de.eq_low_db;
+        self.eq_mid_db = de.eq_mid_db;
+        self.eq_high_db = de.eq_high_db;
+        self.voice_cleanup = de.voice_cleanup;
+        self.compressor = de.compressor;
+        self.role = de.role;
+        self.duck_db = de.duck_db;
+        if con_volumen_animado {
+            self.volume_keys = de.volume_keys.clone();
+        }
+    }
+
+    /// Color y efectos de vídeo: todo lo demás (Lumetri, HSL, curvas HSL,
+    /// igualar color, detalle, mate de pista…). Se copia todo `de` y se
+    /// devuelve lo que es de otra categoría, así un efecto nuevo viaja solo.
+    pub fn tomar_efectos_de_video(&mut self, de: &ClipFx) {
+        let mut nuevo = de.clone();
+        nuevo.tomar_transformacion(self);
+        nuevo.tomar_audio(self, true);
+        nuevo.reverse = self.reverse;
+        nuevo.stabilize = self.stabilize;
+        nuevo.stabilizer = self.stabilizer;
+        nuevo.stabilize_smoothing = self.stabilize_smoothing;
+        nuevo.interpolation = self.interpolation;
+        *self = nuevo;
+    }
 }
 
 /// Familias de color de `huesaturation`, en el orden de sus banderas.
@@ -217,7 +267,19 @@ impl ClipFx {
             || self.crop_bottom > 0.0
             || self.reverse
             || self.stabilize
-            || !self.video_color_chain().is_empty()
+            || !self.curvas_hsl.es_neutra()
+            || !self.color_chain_without_curves().is_empty()
+    }
+
+    /// La cadena de color sin las curvas HSL, que escribirían su LUT: para
+    /// preguntas baratas que se hacen en cada fotograma de la interfaz.
+    fn color_chain_without_curves(&self) -> String {
+        if self.curvas_hsl.es_neutra() {
+            return self.video_color_chain();
+        }
+        let mut copia = self.clone();
+        copia.curvas_hsl = Default::default();
+        copia.video_color_chain()
     }
 
     /// Filtros temporales que deben ir al principio de la cadena, justo tras
@@ -357,6 +419,7 @@ impl ClipFx {
                 out.push_str(&filter);
             }
         }
+        out.push_str(&self.curvas_hsl.filtro());
         if self.sharpen > 0.001 {
             out.push_str(&format!(
                 ",unsharp=5:5:{:.3}:5:5:0",
@@ -474,22 +537,27 @@ impl ClipFx {
 
     /// Valor de la banda elástica en un instante, para dibujarla y para el
     /// monitor. Devuelve dB relativos.
+    /// Mismas reglas que `volume_envelope` (sin valores no finitos, límites
+    /// de −96 a +24 dB): el monitor debe sonar como la exportación.
     pub fn volume_at(&self, t: f64) -> f64 {
         let mut keys = self.volume_keys.clone();
+        keys.retain(|key| key.t.is_finite() && key.db.is_finite());
         if keys.is_empty() {
             return 0.0;
         }
         keys.sort_by(|left, right| left.t.total_cmp(&right.t));
+        keys.dedup_by(|later, earlier| (later.t - earlier.t).abs() < 1e-6);
+        let db = |key: &VolumeKey| key.db.clamp(-96.0, 24.0);
         if t <= keys[0].t {
-            return keys[0].db;
+            return db(&keys[0]);
         }
         for pair in keys.windows(2) {
             if t < pair[1].t {
                 let mix = (t - pair[0].t) / (pair[1].t - pair[0].t).max(1e-6);
-                return pair[0].db + (pair[1].db - pair[0].db) * mix;
+                return db(&pair[0]) + (db(&pair[1]) - db(&pair[0])) * mix;
             }
         }
-        keys[keys.len() - 1].db
+        db(&keys[keys.len() - 1])
     }
 }
 
@@ -507,6 +575,30 @@ pub struct TitleStyle {
     pub matte: Option<[f64; 3]>,
     /// Subtítulos animados palabra a palabra en lugar del texto fijo.
     pub captions: Option<super::subtitulos_animados::AnimatedCaptions>,
+    /// Entrada letra a letra (máquina de escribir, aparecer, subir…).
+    pub animacion: super::texto_animado::AnimacionTexto,
+    /// Las letras se van al final, en orden inverso.
+    pub salida_animada: bool,
+    /// Audiograma, barra de progreso o forma debajo del texto.
+    pub grafico: Option<super::graficos::Grafico>,
+}
+
+/// Contorno y sombra de un título en formato `:clave=valor` de `drawtext`.
+pub fn title_outline_and_shadow(style: &TitleStyle, scale: f64) -> String {
+    let mut extra = String::new();
+    if style.outline > 0.01 {
+        extra.push_str(&format!(
+            ":borderw={:.0}:bordercolor=black",
+            (style.outline * scale).max(1.0)
+        ));
+    }
+    if style.shadow {
+        let offset = (4.0 * scale).max(1.0);
+        extra.push_str(&format!(
+            ":shadowx={offset:.0}:shadowy={offset:.0}:shadowcolor=black@0.65"
+        ));
+    }
+    extra
 }
 
 fn hex(rgb: [f64; 3]) -> String {
@@ -559,7 +651,7 @@ pub fn title_drawing(
             ));
         }
         parts.push(format!(
-            "drawtext=fontfile='{font}':text='{text}':expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
+            "drawtext=fontfile={font}:text={text}:expansion=none:fontsize={fontsize}:fontcolor=0x{fontcolor}:x=W*{:.4}-text_w/2:y=H*{:.4}-text_h/2{extra}",
             position.0.clamp(0.0, 1.0),
             position.1.clamp(0.0, 1.0),
         ));
@@ -642,6 +734,9 @@ pub struct TransitionRuntime {
     /// Los fundidos del clip van a blanco en vez de a negro.
     pub white_in: bool,
     pub white_out: bool,
+    /// Solo en el monitor: cuánto del fotograma fijo va a blanco (0-1)
+    /// porque el cabezal cae en un fundido a blanco.
+    pub monitor_white: f64,
     /// Entrada en movimiento: (dx, dy, inicio en timeline, duración).
     pub slide_in: Option<(f64, f64, f64, f64)>,
     /// Salida empujada: (dx, dy, inicio en timeline, duración).
@@ -927,6 +1022,22 @@ pub fn inspector_video(
             fx.hsl.push(HslAdjust::default());
             changed = true;
         }
+    });
+    ui.collapsing("Curvas HSL", |ui| {
+        ui.label(
+            egui::RichText::new("Dibuja cómo cambia cada color: la saturación, el tono o la luz de un tono concreto")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        let id = ui.id().with("curva-hsl-activa");
+        let mut curva = ui
+            .ctx()
+            .data(|d| d.get_temp::<u8>(id))
+            .and_then(|i| super::curvas_hsl::Curva::TODAS.get(i as usize).copied())
+            .unwrap_or(super::curvas_hsl::Curva::TonoSaturacion);
+        changed |= super::curvas_hsl::editor(ui, &mut fx.curvas_hsl, &mut curva);
+        let indice = super::curvas_hsl::Curva::TODAS.iter().position(|c| *c == curva).unwrap_or(0) as u8;
+        ui.ctx().data_mut(|d| d.insert_temp(id, indice));
     });
     ui.collapsing("Detalle y textura", |ui| {
         changed |= slider(ui, &mut fx.sharpen, 0.0..=1.0, "Enfocar");
@@ -1308,6 +1419,21 @@ mod tests {
     }
 
     #[test]
+    fn monitor_volume_follows_the_export_limits() {
+        let fx = ClipFx {
+            volume_keys: vec![
+                VolumeKey { t: 0.0, db: -200.0 },
+                VolumeKey { t: f64::NAN, db: 0.0 },
+                VolumeKey { t: 2.0, db: 40.0 },
+            ],
+            ..ClipFx::default()
+        };
+        assert_eq!(fx.volume_at(-1.0), -96.0);
+        assert_eq!(fx.volume_at(1.0), -36.0);
+        assert_eq!(fx.volume_at(5.0), 24.0);
+    }
+
+    #[test]
     fn volume_envelope_is_piecewise_linear() {
         let fx = ClipFx {
             volume_keys: vec![
@@ -1412,7 +1538,7 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "drawtext=fontfile='f.ttf':text='Hola':expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
+            "drawtext=fontfile=f.ttf:text=Hola:expansion=none:fontsize=72:fontcolor=0xFFFFFF:x=W*0.5000-text_w/2:y=H*0.5000-text_h/2"
         );
         let matte_only = TitleStyle {
             matte: Some([1.0, 0.0, 0.0]),
