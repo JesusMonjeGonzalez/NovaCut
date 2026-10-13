@@ -186,7 +186,7 @@ ha cubierto de cada una:
 |---|---|---|
 | Reproducción no en tiempo real | «Renderizar previsualización» (Herramientas › Reproducción): compone I–O o todo el montaje en segundo plano; la reproducción lee ese tramo ya compuesto. Barra verde en la regla; cualquier edición la invalida | Hecho |
 | Monitor ≠ exportación | Posiciones proporcionales a la salida (en 720p y 4K caían en otro sitio); en vertical y cuadrado se respetan escala, posición y zoom animado; el monitor compone con la proporción de la exportación, con bandas | Hecho |
-| Color de 8 bits sin gestión de color | — | Pendiente: necesita medir con FFmpeg real |
+| Color de 8 bits sin gestión de color | Vídeo HDR de móvil (HLG) y HDR10 (PQ) se pasa a Rec.709 al decodificar, como Premiere: blanco de referencia BT.2408 al ~90 %, altas luces comprimidas, salida etiquetada Rec.709 (`hdr.rs`, LUT 3D propia, sin depender de zscale) | Parcial: falta exportar en HDR y trabajar en 10 bits de punta a punta |
 | Intercambio profesional | Stems de audio por pista (WAV alineados, sin máster) | Parcial: faltan AAF/OMF y plugins |
 | Audio y modelo de datos | Los recortes de borde arrastran el audio enlazado | Parcial: faltan 5.1, submezclas y un deshacer que no copie el proyecto entero |
 
@@ -277,3 +277,19 @@ Pendiente de UX:
    del contenido, así que editar otra parte o desplazar no invalida nada.
    Manual («Renderizar lo rojo y amarillo») o automático tras 3 s sin editar
    (desactivado por defecto; prioridad baja y respeta «Cuidar el equipo»).
+
+## 13 oct 2026: capas gráficas y HDR de móvil
+
+- **Capas gráficas** (`graficos.rs`, «+ Insertar › Gráficos»): audiograma
+  (onda, línea o barras del audio que suena debajo; sigue al montaje si se
+  mueve), barra de progreso de Shorts/Reels, rectángulo y marco. Son capas
+  de título: se mueven, recortan, animan y exportan igual. Fallos que
+  destapó FFmpeg real: `showwaves` sella su primer fotograma en pts 1 (el
+  monitor lo componía vacío) y `amovie` busca al keyframe de vídeo anterior
+  en un MP4 de cámara (la onda enseñaba siempre el principio del archivo).
+- **HDR de móvil** (`hdr.rs`): un iPhone graba en HLG de 10 bits por
+  defecto; antes se veía gris y lavado en monitor y exportación. Ahora se
+  detecta con FFprobe y se convierte con una LUT 3D de 65³ calculada por
+  NovaCut, después de escalar (al reproducir se convierte la imagen del
+  monitor, no el 4K) y antes de cualquier ajuste de color. El Inspector
+  (Medio y proxy) dice «HDR (HLG) · se convierte a Rec.709».

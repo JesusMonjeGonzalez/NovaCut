@@ -24,6 +24,7 @@ mod animacion;
 mod batch;
 mod curvas_hsl;
 mod graficos;
+mod hdr;
 mod render_fondo;
 mod texto_animado;
 mod command_center;
@@ -1030,7 +1031,8 @@ fn extract_frame(
             "1",
             "-vf",
             &format!(
-                "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=rgba"
+                "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2{},format=rgba",
+                hdr::cadena(path)
             ),
             "-f",
             "rawvideo",
@@ -13956,6 +13958,16 @@ impl eframe::App for NovaCutWindows {
                                 .open(media_problem.then_some(true))
                                 .show(ui, |ui| {
                             ui.small(clip.path.display().to_string());
+                            if let Some(transferencia) = hdr::detectar(&clip.path) {
+                                ui.label(
+                                    egui::RichText::new(format!("{} · se convierte a Rec.709", transferencia.nombre()))
+                                        .size(11.5)
+                                        .color(theme::TEXT_DIM),
+                                )
+                                .on_hover_text(
+                                    "Vídeo HDR de móvil o cámara: sin convertir se vería gris y lavado. El monitor y la exportación lo pasan a SDR con las altas luces comprimidas",
+                                );
+                            }
                             if !clip.path.as_os_str().is_empty() && !clip.path.exists() {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(246, 83, 83),
@@ -17955,6 +17967,7 @@ fn render_preview_frame_at(
             let lut = lut_filter(clip.lut.as_deref());
             let mask = mask_filter(clip.mask.as_ref(), width as f64, height as f64);
             let cadence = conform_video_filter(clip, &frame_rate);
+            let hdr = hdr::cadena(&clip.path);
             let geometry = clip.fx.geometry_chain(false, false);
             let fx_color = clip.fx.video_color_chain();
             let fx_alpha = clip.fx.alpha_chain();
@@ -17975,7 +17988,7 @@ fn render_preview_frame_at(
                 // `setpts=PTS-STARTPTS`: tras `-ss` el primer fotograma no
                 // empieza en 0 si el cabezal cae entre dos fotogramas del
                 // medio, y `overlay` componía el fondo negro sin él.
-                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{hdr}{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
@@ -18586,6 +18599,9 @@ fn build_render_filters(
                 let cadence = conform_video_filter(&clips[index], &frame_rate);
                 let fx = &clips[index].fx;
                 let prefix = fx.input_prefix(clips[index].freeze_at.is_some());
+                // HLG/PQ del móvil a Rec.709 tras escalar (al reproducir se
+                // convierte la imagen pequeña) y antes de cualquier ajuste de color.
+                let hdr = hdr::cadena(&clips[index].path);
                 // Pasada 2 de vidstab sobre los fotogramas tal como se leen,
                 // antes de invertir o conformar cadencia (como en el análisis).
                 let warp = if estabilizar::ready(&clips[index]) {
@@ -18620,7 +18636,7 @@ fn build_render_filters(
                 let sendcmd = animacion::sendcmd(&commands);
                 let wipe = clips[index].runtime.wipe_filter();
                 let head = format!(
-                    "[{media}:v:0]{warp}{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
+                    "[{media}:v:0]{warp}{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{hdr}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
                 );
                 let tail = format!(
                     "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
@@ -23027,6 +23043,66 @@ mod render_real_tests {
         };
         let (quiet, loud) = (white(1.0), white(3.5));
         assert!(quiet < 50 && loud > 500, "silencio {quiet}, tono {loud}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn phone_hdr_video_is_converted_to_rec709() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        // El gris al 75 % de HLG es el blanco de referencia: sin convertir
+        // se ve al 75 % (gris lavado); convertido, hacia el 90 %.
+        let directory = work_dir("hdr");
+        // Las etiquetas van en `setparams`: FFmpeg 7+ toma las del fotograma
+        // y descarta `-color_trc` de salida.
+        let make = |name: &str, tags: &str| {
+            let path = directory.join(name);
+            let status = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0xBFBFBF:s=320x180:r=25:d=2"])
+                .args(["-vf", &format!("format=yuv420p10le{tags}"), "-c:v", "libx264"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let hlg = make(
+            "hlg.mp4",
+            ",setparams=range=tv:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+        );
+        let sdr = make("sdr.mp4", "");
+        let clip = |path: PathBuf| RoughClip {
+            path,
+            out_seconds: 2.0,
+            source_duration_seconds: Some(2.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let centre = |pixels: &[u8], width: usize, height: usize, channels: usize| {
+            pixels[((height / 2) * width + width / 2) * channels]
+        };
+        assert_eq!(hdr::detectar(&hlg), Some(hdr::Transferencia::Hlg));
+        assert_eq!(hdr::detectar(&sdr), None);
+        let monitor = |path: &PathBuf| {
+            let frame = render_preview_frame(&[(clip(path.clone()), 1.0)], Timebase::from_fps(25.0)).unwrap();
+            centre(&frame.pixels, frame.width, frame.height, 4)
+        };
+        let (converted, untouched) = (monitor(&hlg), monitor(&sdr));
+        assert!((222..=238).contains(&converted), "HLG en el monitor: {converted}");
+        assert!((186..=196).contains(&untouched), "SDR en el monitor: {untouched}");
+        let output = directory.join("salida.mp4");
+        export(&[clip(hlg)], &output, ExportFormat::Mp4Video).unwrap();
+        let exported = centre(&frame_rgb(&output, 1.0), 160, 90, 3);
+        assert!((222..=238).contains(&exported), "HLG exportado: {exported}");
+        let tags = Command::new(tool_path("ffprobe.exe"))
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_transfer"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        let transfer = String::from_utf8_lossy(&tags.stdout).trim().to_owned();
+        assert!(transfer == "bt709" || transfer == "unknown", "la salida no puede ir marcada HDR: {transfer}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
