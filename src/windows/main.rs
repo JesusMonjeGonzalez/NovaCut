@@ -3388,6 +3388,7 @@ enum ClipCommand {
     Copy,
     CopyAttributes,
     PasteAttributes,
+    RemoveAttributes,
     RemoveLeavingGap,
     RemoveClosingGap,
     TrimStartToPlayhead,
@@ -11141,6 +11142,7 @@ impl NovaCutWindows {
             ClipCommand::Copy => self.copy_selected_clip(),
             ClipCommand::CopyAttributes => self.copy_attributes(),
             ClipCommand::PasteAttributes => self.paste_attributes(),
+            ClipCommand::RemoveAttributes => self.open_remove_attributes(),
             ClipCommand::RemoveLeavingGap => self.remove_selected_clip(false),
             ClipCommand::RemoveClosingGap => self.remove_selected_clip(true),
             ClipCommand::TrimStartToPlayhead => self.trim_to_playhead(true),
@@ -13654,6 +13656,7 @@ impl eframe::App for NovaCutWindows {
                     let fps = self.project.fps;
                     let video_tracks = self.project.video_track_count();
                     self.batch_paste_dialog(context);
+                    self.batch_remove_dialog(context);
                     let selection_size = self.selected_indices().len();
                     if selection_size > 1 {
                         self.batch_inspector(ui);
@@ -16464,6 +16467,7 @@ impl eframe::App for NovaCutWindows {
                                     ClipCommand::PasteAttributes,
                                 );
                             }
+                            pick(ui, "Quitar atributos…", ClipCommand::RemoveAttributes);
                         });
                         // Solo las herramientas que tienen sentido para
                         // este clip; el catálogo entero está en la barra.

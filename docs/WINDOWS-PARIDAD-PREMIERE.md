@@ -306,3 +306,10 @@ Pendiente de UX:
   luminancia, con «Invertir»): vídeo dentro de un texto, revelados con
   formas. La pista mate se compone una vez, se reparte entre quienes la
   usan y deja de verse sola. Igual en monitor, reproducción y exportación.
+- **Pegar atributos ahora pega los efectos** y hay **Quitar atributos**
+  (clic derecho › Audio y atributos). Antes pegar y restablecer solo
+  tocaban 15 campos básicos: el Lumetri, las curvas HSL, el detalle, la EQ,
+  la limpieza de voz o el mate no viajaban. `ClipFx` reparte ahora sus
+  campos por categoría (lo nuevo de vídeo entra solo en «Color y efectos»);
+  la estabilización nunca viaja (su análisis es de cada clip). Quitar
+  atributos borra también la animación de la categoría, como en Premiere.

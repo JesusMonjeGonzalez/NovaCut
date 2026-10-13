@@ -95,6 +95,51 @@ pub struct ClipFx {
     pub mate: Option<super::mate::MatePista>,
 }
 
+/// Reparto de los efectos por las categorías de «Pegar/Quitar atributos».
+/// Lo de tiempo (invertir, estabilizar, interpolación) no viaja nunca: el
+/// análisis de estabilización es de cada clip.
+impl ClipFx {
+    /// Transformación: voltear y recortar.
+    pub fn tomar_transformacion(&mut self, de: &ClipFx) {
+        self.flip_h = de.flip_h;
+        self.flip_v = de.flip_v;
+        self.crop_left = de.crop_left;
+        self.crop_right = de.crop_right;
+        self.crop_top = de.crop_top;
+        self.crop_bottom = de.crop_bottom;
+    }
+
+    /// Audio: EQ, voz, compresor y rol. La banda de volumen es animación:
+    /// solo se toca si `con_volumen_animado`.
+    pub fn tomar_audio(&mut self, de: &ClipFx, con_volumen_animado: bool) {
+        self.eq_low_db = de.eq_low_db;
+        self.eq_mid_db = de.eq_mid_db;
+        self.eq_high_db = de.eq_high_db;
+        self.voice_cleanup = de.voice_cleanup;
+        self.compressor = de.compressor;
+        self.role = de.role;
+        self.duck_db = de.duck_db;
+        if con_volumen_animado {
+            self.volume_keys = de.volume_keys.clone();
+        }
+    }
+
+    /// Color y efectos de vídeo: todo lo demás (Lumetri, HSL, curvas HSL,
+    /// igualar color, detalle, mate de pista…). Se copia todo `de` y se
+    /// devuelve lo que es de otra categoría, así un efecto nuevo viaja solo.
+    pub fn tomar_efectos_de_video(&mut self, de: &ClipFx) {
+        let mut nuevo = de.clone();
+        nuevo.tomar_transformacion(self);
+        nuevo.tomar_audio(self, true);
+        nuevo.reverse = self.reverse;
+        nuevo.stabilize = self.stabilize;
+        nuevo.stabilizer = self.stabilizer;
+        nuevo.stabilize_smoothing = self.stabilize_smoothing;
+        nuevo.interpolation = self.interpolation;
+        *self = nuevo;
+    }
+}
+
 /// Familias de color de `huesaturation`, en el orden de sus banderas.
 pub const HSL_FAMILIES: [(&str, &str); 6] = [
     ("r", "Rojos"),
