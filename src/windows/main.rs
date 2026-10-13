@@ -23348,10 +23348,14 @@ mod render_real_tests {
         assert!(end * 4 < middle, "al final ya se han ido ({end} vs {middle})");
         let output = directory.join("letras.mp4");
         export(&[clip], &output, ExportFormat::Mp4Video).unwrap();
-        let early = lit(&frame_rgb(&output, 0.08), 3);
-        let full = lit(&frame_rgb(&output, 1.2), 3);
-        // `frame_rgb` lee el fotograma reducido: basta la proporción.
-        assert!(full > 10 && early * 4 < full, "exportación: {early} → {full}");
+        // A tamaño de monitor: reducido a 160×90 los trazos finos quedan
+        // grises, y con la fuente de Windows apenas sobrevivía nada.
+        let early = lit(&export_frame_rgba(&output, 0.08), 4);
+        let full = lit(&export_frame_rgba(&output, 1.2), 4);
+        assert!(early * 4 < full, "exportación: {early} → {full}");
+        // Y sale lo mismo que enseña el monitor.
+        let ratio = full as f64 / middle as f64;
+        assert!((0.7..1.4).contains(&ratio), "exportación {full} frente a monitor {middle}");
         // Rótulo con caja que entra por palabras: el grafo con la caja
         // animada también es válido y la caja no está al principio.
         let lower_third = RoughClip {
