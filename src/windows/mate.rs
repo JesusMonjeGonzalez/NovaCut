@@ -83,7 +83,7 @@ pub fn planificar(clips: &[&RoughClip]) -> Plan {
             plan.pistas.entry(mate.pista).or_default().push(indice);
         }
     }
-    for (pista, _) in plan.pistas.iter() {
+    for pista in plan.pistas.keys() {
         let mut miembros: Vec<usize> = clips
             .iter()
             .enumerate()
