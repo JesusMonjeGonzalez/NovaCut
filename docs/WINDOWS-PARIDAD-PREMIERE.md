@@ -293,3 +293,11 @@ Pendiente de UX:
   NovaCut, después de escalar (al reproducir se convierte la imagen del
   monitor, no el 4K) y antes de cualquier ajuste de color. El Inspector
   (Medio y proxy) dice «HDR (HLG) · se convierte a Rec.709».
+- **Decodificación por GPU** (`-hwaccel auto`: D3D11VA/DXVA2 en Windows):
+  solo para entradas pesadas (HEVC, AV1, VP9 o más de 1440p) y como mucho
+  8 por render, porque cada clip de la timeline es una entrada y cada
+  decodificador reserva memoria de vídeo. En el Mac de pruebas, 4K HEVC 10
+  bits: por CPU, 6 s de CPU por 8 s de vídeo; por GPU, casi nada. Si la
+  reproducción no saca ni un fotograma, se apaga para la sesión y se
+  reintenta con CPU; si la exportación falla, se repite con CPU.
+  `NOVACUT_NO_HWDECODE=1` la desactiva. Misma imagen que por CPU (probado).

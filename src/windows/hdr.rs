@@ -158,19 +158,49 @@ fn archivo_lut(transferencia: Transferencia) -> Option<PathBuf> {
     Some(ruta)
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, Option<Transferencia>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Transferencia>>>> = OnceLock::new();
+/// Lo que hace falta saber del primer vídeo de un archivo para decodificarlo.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InfoVideo {
+    pub transferencia: Option<Transferencia>,
+    pub codec: String,
+    pub alto: u32,
+}
+
+impl InfoVideo {
+    fn desde_ffprobe(texto: &str) -> Self {
+        let mut info = InfoVideo::default();
+        for linea in texto.lines() {
+            match linea.split_once('=') {
+                Some(("codec_name", valor)) => info.codec = valor.trim().to_owned(),
+                Some(("height", valor)) => info.alto = valor.trim().parse().unwrap_or(0),
+                Some(("color_transfer", valor)) => info.transferencia = Transferencia::desde_ffprobe(valor),
+                _ => {}
+            }
+        }
+        info
+    }
+
+    /// Caro de decodificar por CPU: HEVC, AV1 o VP9 de móvil o más de
+    /// 1440p. Lo demás (H.264 1080p, ProRes, proxies) va bien por CPU y no
+    /// merece abrir un decodificador de GPU.
+    pub fn pesado(&self) -> bool {
+        matches!(self.codec.as_str(), "hevc" | "av1" | "vp9") || self.alto > 1440
+    }
+}
+
+fn cache() -> &'static Mutex<HashMap<PathBuf, Option<InfoVideo>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<InfoVideo>>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// Transferencia HDR del primer vídeo del archivo; `None` si es SDR, una
-/// imagen o no se puede leer. Se pregunta a FFprobe una vez por archivo.
-pub fn detectar(ruta: &Path) -> Option<Transferencia> {
+/// Códec, altura y transferencia del primer vídeo del archivo; `None` si es
+/// una imagen o no se puede leer. Se pregunta a FFprobe una vez por archivo.
+pub fn info(ruta: &Path) -> Option<InfoVideo> {
     if ruta.as_os_str().is_empty() || super::is_image_file(ruta) {
         return None;
     }
     if let Some(conocida) = cache().lock().ok()?.get(ruta) {
-        return *conocida;
+        return conocida.clone();
     }
     let salida = std::process::Command::new(super::tool_path("ffprobe.exe"))
         .args([
@@ -179,26 +209,29 @@ pub fn detectar(ruta: &Path) -> Option<Transferencia> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_transfer",
+            "stream=codec_name,height,color_transfer",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "default=noprint_wrappers=1",
         ])
         .arg(ruta)
         .creation_flags(super::CREATE_NO_WINDOW)
         .output()
         .ok()?;
-    let detectada = if salida.status.success() {
-        Transferencia::desde_ffprobe(&String::from_utf8_lossy(&salida.stdout))
-    } else {
-        None
-    };
-    cache().lock().ok()?.insert(ruta.to_path_buf(), detectada);
-    detectada
+    let leida = (salida.status.success() && !salida.stdout.is_empty())
+        .then(|| InfoVideo::desde_ffprobe(&String::from_utf8_lossy(&salida.stdout)));
+    cache().lock().ok()?.insert(ruta.to_path_buf(), leida.clone());
+    leida
+}
+
+/// Transferencia HDR del primer vídeo; `None` si es SDR.
+pub fn detectar(ruta: &Path) -> Option<Transferencia> {
+    info(ruta)?.transferencia
 }
 
 /// Filtros que van tras escalar al tamaño de salida y antes de cualquier
-/// ajuste de color, con la coma delante; vacío si el archivo es SDR. Los proxies conservan la señal
-/// del original, así que se decide siempre por el original.
+/// ajuste de color, con la coma delante; vacío si el archivo es SDR. Los
+/// proxies conservan la señal del original, así que se decide siempre por
+/// el original.
 pub fn cadena(ruta: &Path) -> String {
     let Some(transferencia) = detectar(ruta) else {
         return String::new();
@@ -259,6 +292,17 @@ mod tests {
         let verde_2020 = convertir(Transferencia::Pq, [0.2, 0.6, 0.2]);
         assert!(verde_2020.iter().all(|c| (0.0..=1.0).contains(c)));
         assert!(verde_2020[1] > verde_2020[0] && verde_2020[1] > verde_2020[2]);
+    }
+
+    #[test]
+    fn se_lee_lo_que_devuelve_ffprobe_y_se_decide_que_es_pesado() {
+        let iphone = InfoVideo::desde_ffprobe("codec_name=hevc\nheight=2160\ncolor_transfer=arib-std-b67\n");
+        assert_eq!(iphone.transferencia, Some(Transferencia::Hlg));
+        assert!(iphone.pesado());
+        let camara = InfoVideo::desde_ffprobe("codec_name=h264\nheight=1080\ncolor_transfer=bt709\n");
+        assert_eq!(camara.transferencia, None);
+        assert!(!camara.pesado());
+        assert!(InfoVideo::desde_ffprobe("codec_name=h264\nheight=2160\n").pesado());
     }
 
     #[test]

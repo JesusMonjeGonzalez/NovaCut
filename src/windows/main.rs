@@ -11490,6 +11490,10 @@ impl NovaCutWindows {
             let mut buffer = vec![0u8; frame_len];
             loop {
                 if reader.read_exact(&mut buffer).is_err() {
+                    if index == 0 {
+                        // Ni un fotograma: puede ser el driver de la GPU.
+                        aceleracion::desactivar_decodificacion_gpu();
+                    }
                     let _ = sender.send(None);
                     return;
                 }
@@ -11857,6 +11861,7 @@ impl NovaCutWindows {
         context.request_repaint_after(std::time::Duration::from_secs_f64(next_due.clamp(0.004, 0.05)));
         let rate = playback.rate;
         let restart_at = playback.start_playhead;
+        let nothing_played = reached_end && playback.last_consumed == 0;
         if let Some(frame) = newest {
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
@@ -11869,6 +11874,12 @@ impl NovaCutWindows {
         };
         if reached_end || past_edge {
             self.playback = None;
+            if nothing_played && aceleracion::tomar_reintento() {
+                self.playhead = restart_at;
+                self.start_playback(rate);
+                self.status = "La GPU no pudo decodificar; se reproduce con CPU".to_owned();
+                return;
+            }
             if self.loop_playback && reached_end && rate > 0 {
                 self.playhead = restart_at;
                 self.start_playback(rate);
@@ -18283,6 +18294,11 @@ fn push_render_inputs(
 ) -> (Vec<usize>, Vec<bool>) {
     let mut input_indices = Vec::with_capacity(clips.len());
     let mut is_title_input = Vec::with_capacity(clips.len());
+    let mut gpu_decoders = if aceleracion::decodificar_con_gpu() {
+        aceleracion::MAX_DECODIFICADORES
+    } else {
+        0
+    };
     for clip in clips {
         let media_index = input_indices.len();
         if clip.title.is_some() || clip.is_adjustment {
@@ -18332,6 +18348,12 @@ fn push_render_inputs(
                     .args(["-ss", &format_seconds(freeze_at), "-t", "0.04", "-i"])
                     .arg(path);
             } else {
+                // 4K HEVC de móvil por CPU no llega a tiempo real en un PC
+                // medio; la GPU lo decodifica casi gratis.
+                if gpu_decoders > 0 && clip.has_video && hdr::info(path).is_some_and(|info| info.pesado()) {
+                    command.args(["-hwaccel", "auto"]);
+                    gpu_decoders -= 1;
+                }
                 command
                     .args([
                         "-ss",
@@ -18992,13 +19014,17 @@ fn run_export(
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
     let result = run_export_once(job, job.hw, cancel, progress);
+    let decoded_on_gpu = aceleracion::decodificar_con_gpu();
     match (result, job.hw) {
-        (Err(_), Some(backend)) if !cancel.load(Ordering::Relaxed) => {
+        (Err(_), hw) if (hw.is_some() || decoded_on_gpu) && !cancel.load(Ordering::Relaxed) => {
             if let Ok(mut state) = progress.lock() {
                 state.pct = 0.0;
-                state.note = Some(format!("{} falló; se exportó con CPU", backend.label()));
+                state.note = Some(match hw {
+                    Some(backend) => format!("{} falló; se exportó con CPU", backend.label()),
+                    None => "La GPU no pudo decodificar; se exportó con CPU".to_owned(),
+                });
             }
-            run_export_once(job, None, cancel, progress)
+            aceleracion::con_cpu(|| run_export_once(job, None, cancel, progress))
         }
         (result, _) => result,
     }
@@ -23103,6 +23129,45 @@ mod render_real_tests {
             .unwrap();
         let transfer = String::from_utf8_lossy(&tags.stdout).trim().to_owned();
         assert!(transfer == "bt709" || transfer == "unknown", "la salida no puede ir marcada HDR: {transfer}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn heavy_phone_video_is_decoded_on_the_gpu_with_the_same_image() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("gpu-decod");
+        let (camera, _) = generate(&directory);
+        let phone = directory.join("movil.mov");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=2"])
+            .args(["-c:v", "libx265", "-x265-params", "log-level=error", "-tag:v", "hvc1"])
+            .arg(&phone)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let clip = |path: PathBuf| RoughClip {
+            path,
+            out_seconds: 2.0,
+            source_duration_seconds: Some(2.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let mut command = Command::new("ffmpeg");
+        push_render_inputs(&mut command, &[clip(camera), clip(phone.clone())], (640, 360), false, Timebase::P25);
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let hwaccel = args.iter().position(|a| a == "-hwaccel").expect("el HEVC va por GPU");
+        assert_eq!(args.iter().filter(|a| *a == "-hwaccel").count(), 1, "el H.264 ligero va por CPU: {args:?}");
+        assert!(args[hwaccel..].iter().any(|a| a.ends_with("movil.mov")));
+        // Misma imagen con GPU y con CPU.
+        let gpu = directory.join("gpu.mp4");
+        let cpu = directory.join("cpu.mp4");
+        export(&[clip(phone.clone())], &gpu, ExportFormat::Mp4Video).unwrap();
+        aceleracion::con_cpu(|| export(&[clip(phone)], &cpu, ExportFormat::Mp4Video)).unwrap();
+        let (a, b) = (frame_rgb(&gpu, 1.0), frame_rgb(&cpu, 1.0));
+        let difference = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y) as u64).sum::<u64>() / a.len() as u64;
+        assert!(difference <= 3, "diferencia media GPU/CPU: {difference}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
