@@ -313,3 +313,30 @@ Pendiente de UX:
   campos por categoría (lo nuevo de vídeo entra solo en «Color y efectos»);
   la estabilización nunca viaja (su análisis es de cada clip). Quitar
   atributos borra también la animación de la categoría, como en Premiere.
+
+## 13 oct 2026 (tarde): red de pruebas «lo que se ve es lo que sale»
+
+Pruebas nuevas que exportan de verdad y comparan píxel a píxel o miden:
+
+- `monitor_matches_export_across_common_edits`: 25 escenas (color, PiP,
+  velocidad, invertido, fundidos, disolvencia, barrido, título, keyframes,
+  fusión, mate, capa de ajuste, máscara, recorte, móvil girado, PNG, foto,
+  difuminar zona, congelado, rampa, anidados) monitor contra exportación.
+- `monitor_matches_vertical_export` (9:16), `monitor_shows_the_same_source_frame_as_the_export`,
+  `exports_keep_picture_and_sound_in_sync` (claqueta: cortes, ×2, ×0,5,
+  audio separado, invertido), `clips_start_on_their_exact_frame`,
+  `segmented_export_matches_a_single_pass`, igualar voces a -16 LUFS.
+
+Fallos que destaparon (todos corregidos):
+
+| Fallo | Efecto para el usuario |
+|---|---|
+| `fade` de FFmpeg sobre RGBA baja color y alfa | A mitad de un fundido la exportación iba al 25 % en vez del 50 %; las disolvencias salían oscuras |
+| El monitor buscaba el medio en el instante del cabezal | Enseñaba el fotograma siguiente al que se exporta |
+| El monitor pintaba los fundidos a blanco como a negro | — |
+| Fotos y PNG con `-ss` en el fotograma fijo | No salían en el monitor en pausa (sí al exportar) |
+| Fotograma congelado: coma mal puesta en `tpad` | Exportar con un congelado fallaba siempre; además sonaba un chasquido |
+| El monitor ignoraba `freeze_at` | Enseñaba el clip en movimiento |
+| Anidados: se ignoraba la ventana y la transformación del contenedor | Escalar o recortar un anidado no hacía nada; ahora se parte, se recorta y se escala como en Premiere |
+| `setpts` trunca: `10.2/TB` = 254,999… | Clips que empezaban un fotograma antes y tapaban el último del anterior |
+| Todos los clips en un grafo | 200 cortes: 9 min y 25 GB para exportar 48 s. Ahora por tramos (`por_tramos.rs`): 18 s y 1,7 GB; la reproducción compone 12 clips como mucho y encadena; la sonoridad y Whisper mezclan por tramos |
