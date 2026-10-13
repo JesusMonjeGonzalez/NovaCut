@@ -734,7 +734,7 @@ impl NovaCutWindows {
             .project
             .clips
             .iter()
-            .filter(|clip| visible(*clip))
+            .filter(|clip| visible(clip))
             .map(|clip| clip.track)
             .min()
         else {
@@ -746,7 +746,7 @@ impl NovaCutWindows {
                     .project
                     .clips
                     .iter()
-                    .filter(|clip| visible(*clip) && clip.track == base + angulo)
+                    .filter(|clip| visible(clip) && clip.track == base + angulo)
                     .max_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start))?;
                 let origen = match clip.freeze_at {
                     Some(congelado) => congelado,
@@ -2756,7 +2756,7 @@ pub(super) fn enlazados(clips: &[RoughClip], indice: usize) -> Vec<usize> {
                 && !clip.fx.reverse
                 && clip.nested.is_none()
                 && (clip.speed - base.speed).abs() < 1e-6
-                && (ancla(*clip) - ancla(base)).abs() < 0.02
+                && (ancla(clip) - ancla(base)).abs() < 0.02
                 && clip.timeline_start < base_fin - 0.001
                 && base.timeline_start < clip.timeline_start + clip.duration() - 0.001
         })
@@ -4625,9 +4625,9 @@ mod tests {
             ..Default::default()
         };
         // En 1080p, píxeles tal cual (como antes).
-        assert!(grafo(&[capa.clone()], (1920, 1080)).contains("x=(W-w)/2+300.000:y=(H-h)/2+-108.000"));
+        assert!(grafo(std::slice::from_ref(&capa), (1920, 1080)).contains("x=(W-w)/2+300.000:y=(H-h)/2+-108.000"));
         // En 720p, dos tercios: donde la ve el monitor.
-        assert!(grafo(&[capa.clone()], (1280, 720)).contains("x=(W-w)/2+200.000:y=(H-h)/2+-72.000"));
+        assert!(grafo(std::slice::from_ref(&capa), (1280, 720)).contains("x=(W-w)/2+200.000:y=(H-h)/2+-72.000"));
         // En 4K, el doble.
         assert!(grafo(&[capa], (3840, 2160)).contains("x=(W-w)/2+600.000:y=(H-h)/2+-216.000"));
     }
@@ -5195,7 +5195,7 @@ mod tests {
         };
         for (ancho, alto) in [(1280, 720), (854, 480), (1080, 1920)] {
             let salida = blanco_total.with_file_name(format!("borde-{ancho}x{alto}.mp4"));
-            exportar_a(&[plano.clone()], &salida, (ancho, alto));
+            exportar_a(std::slice::from_ref(&plano), &salida, (ancho, alto));
             let fotograma = extract_frame(&salida, 1.0, ancho as usize, alto as usize).unwrap();
             for (x, y) in [(4, alto as usize / 2), (ancho as usize - 5, alto as usize / 2), (ancho as usize / 2, 4), (ancho as usize / 2, alto as usize - 5)] {
                 assert!(

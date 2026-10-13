@@ -11585,7 +11585,7 @@ impl NovaCutWindows {
                 }
                 // A 2×, 4× u 8× se entrega uno de cada `step` fotogramas.
                 let played = index - skip_frames - 1;
-                if played % step != 0 {
+                if !played.is_multiple_of(step) {
                     continue;
                 }
                 // Ritmo en tiempo real: el entregado j sale en j/fps.
@@ -22066,7 +22066,7 @@ mod tests {
             nested: Some(vec![child]),
             ..Default::default()
         };
-        let flat = flatten_nested(&[nest.clone()]);
+        let flat = flatten_nested(std::slice::from_ref(&nest));
         assert_eq!(flat.len(), 1);
         let c = &flat[0];
         assert_eq!((c.timeline_start, c.scale_percent), (2.0, 40.0));
@@ -22228,8 +22228,10 @@ mod tests {
         assert!(joined.contains("r=24000/1001"));
         assert!(joined.contains("fps=24000/1001"));
 
-        let mut vfr = RoughClip::default();
-        vfr.source_vfr = true;
+        let mut vfr = RoughClip {
+            source_vfr: true,
+            ..Default::default()
+        };
         assert_eq!(
             conform_video_filter(&vfr, &rate.ffmpeg_rate()),
             ",fps=fps=24000/1001:start_time=0:round=near"
@@ -23364,7 +23366,7 @@ mod render_real_tests {
             ..Default::default()
         };
         let output = directory.join("rotulo.mp4");
-        export(&[lower_third.clone()], &output, ExportFormat::Mp4Video).unwrap();
+        export(std::slice::from_ref(&lower_third), &output, ExportFormat::Mp4Video).unwrap();
         assert!((probe_duration(&output) - 2.0).abs() < 0.2);
         let frame = render_preview_frame(&[(lower_third, 0.0)], Timebase::from_fps(25.0)).unwrap();
         let grey = frame.pixels.chunks(4).filter(|p| p[0] > 20 || p[1] > 20 || p[2] > 20).count();
@@ -24933,7 +24935,7 @@ mod render_real_tests {
             let output = directory.join(name);
             let job = RenderJob {
                 encode,
-                ..test_job(&[clip.clone()], &output, ExportFormat::Mp4Video, None)
+                ..test_job(std::slice::from_ref(&clip), &output, ExportFormat::Mp4Video, None)
             };
             run_export(
                 &job,
@@ -24990,7 +24992,7 @@ mod render_real_tests {
             ..Default::default()
         };
         let full = directory.join("completo.mp4");
-        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        export(std::slice::from_ref(&clip), &full, ExportFormat::Mp4Video).unwrap();
         let (windowed, preroll) = montaje::window(&[clip], 1.0, 1.04);
         let still = directory.join("fotograma.png");
         let job = RenderJob {
@@ -25022,7 +25024,7 @@ mod render_real_tests {
             ..Default::default()
         };
         let full = directory.join("completo.mp4");
-        export(&[clip.clone()], &full, ExportFormat::Mp4Video).unwrap();
+        export(std::slice::from_ref(&clip), &full, ExportFormat::Mp4Video).unwrap();
         let (windowed, preroll) = montaje::window(&[clip], 1.0, 3.0);
         assert!((preroll - 1.0).abs() < 1e-9, "el fundido obliga a componer desde 0");
         let ranged = directory.join("rango.mp4");

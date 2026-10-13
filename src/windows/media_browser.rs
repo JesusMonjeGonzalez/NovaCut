@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,10 +73,10 @@ impl FileStatus {
         }
     }
 
-    pub fn is_file(&mut self, path: &PathBuf) -> bool {
+    pub fn is_file(&mut self, path: &Path) -> bool {
         *self
             .entries
-            .entry(path.clone())
+            .entry(path.to_path_buf())
             .or_insert_with(|| path.is_file())
     }
 }
