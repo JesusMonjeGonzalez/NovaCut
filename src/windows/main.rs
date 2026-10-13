@@ -26,6 +26,7 @@ mod curvas_hsl;
 mod graficos;
 mod hdr;
 mod mate;
+mod por_tramos;
 mod render_fondo;
 mod texto_animado;
 mod command_center;
@@ -18768,8 +18769,11 @@ fn build_render_filters(
                 // Todo en tiempo local del título y el desplazamiento al final:
                 // los fundidos van en su tiempo, no en el segundo 0.
                 let sendcmd = animacion::sendcmd(&commands);
+                // `round`: setpts trunca, y 10.2/TB a 25 fps es 254,99999…: el
+                // clip entraba un fotograma antes y tapaba el último del
+                // anterior.
                 filters.push(format!(
-                    "[{media}:v:0]{drawing},format=rgba,setpts=PTS-STARTPTS{sendcmd}{rotate},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]",
+                    "[{media}:v:0]{drawing},format=rgba,setpts=PTS-STARTPTS{sendcmd}{rotate},{opacity_filter}{fade_filters},setpts=PTS+round({start:.6}/TB)[v{index}]",
                 ));
             } else {
                 let is_blend = clips[index].fusion.blend_mode().is_some();
@@ -18872,7 +18876,7 @@ fn build_render_filters(
                     "[{media}:v:0]{warp}{prefix}{freeze_pad}setpts=(PTS-STARTPTS)/{speed:.6}{cadence}{sendcmd}{geometry},{size_filter},setsar=1{hdr}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha}{wipe}"
                 );
                 let tail = format!(
-                    "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+{start:.6}/TB[v{index}]"
+                    "{rotate}{blend_canvas},{opacity_filter}{fade_filters},setpts=PTS+round({start:.6}/TB)[v{index}]"
                 );
                 match zoom {
                     Some(tracks) => {
@@ -19268,7 +19272,15 @@ fn run_export(
     cancel: &AtomicBool,
     progress: &Arc<std::sync::Mutex<RenderProgress>>,
 ) -> Result<(), String> {
-    let result = run_export_once(job, job.hw, cancel, progress);
+    // Con muchos clips, por tramos: memoria y tiempo acotados.
+    let once = |hw: Option<aceleracion::HwBackend>| {
+        if por_tramos::conviene(job) {
+            por_tramos::exportar(job, hw, cancel, progress)
+        } else {
+            run_export_once(job, hw, cancel, progress)
+        }
+    };
+    let result = once(job.hw);
     let decoded_on_gpu = aceleracion::decodificar_con_gpu();
     match (result, job.hw) {
         (Err(_), hw) if (hw.is_some() || decoded_on_gpu) && !cancel.load(Ordering::Relaxed) => {
@@ -19279,7 +19291,7 @@ fn run_export(
                     None => "La GPU no pudo decodificar; se exportó con CPU".to_owned(),
                 });
             }
-            aceleracion::con_cpu(|| run_export_once(job, None, cancel, progress))
+            aceleracion::con_cpu(|| once(None))
         }
         (result, _) => result,
     }
@@ -19398,6 +19410,9 @@ fn run_export_once(
     if !fast {
         let accelerated = hw.filter(|_| matches!(format, ExportFormat::Mp4Video | ExportFormat::Mp4Hevc));
         exportacion::apply(&mut codec, &job.encode, accelerated);
+    }
+    if por_tramos::en_tramo() {
+        por_tramos::ajustar_codec(&mut codec);
     }
     child.args(codec);
     if job.skip > 0.0005 {
@@ -24000,6 +24015,131 @@ mod render_real_tests {
             }
         }
         assert!(report.is_empty(), "desincronizado:\n{}", report.join("\n"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Un clip que empieza en 10,2 s debe empezar en el fotograma 255 (a
+    /// 25 fps). `setpts=PTS+10.2/TB` daba 254,99999… y FFmpeg trunca: el
+    /// clip entraba un fotograma antes y tapaba el último del anterior.
+    #[test]
+    fn clips_start_on_their_exact_frame() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("fotograma-exacto");
+        let black = directory.join("negro.mp4");
+        let white = directory.join("blanco.mp4");
+        for (path, colour) in [(&black, "black"), (&white, "white")] {
+            let status = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("color=c={colour}:s=64x36:r=25:d=12"))
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let clip = |path: &PathBuf, start: f64, length: f64| RoughClip {
+            path: path.clone(),
+            timeline_start: start,
+            out_seconds: length,
+            source_duration_seconds: Some(12.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        // 10,2 = 17 × 0,6, como lo deja una serie de cortes.
+        let start = 17.0 * 0.6;
+        let output = directory.join("corte.mp4");
+        export(&[clip(&black, 0.0, start), clip(&white, start, 1.0)], &output, ExportFormat::Mp4Video).unwrap();
+        let luma = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args(["-vf", "scale=1:1,format=gray", "-f", "rawvideo", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let first_white = luma.iter().position(|v| *v > 128).unwrap();
+        assert_eq!(first_white, 255, "el segundo clip debe empezar en el fotograma 255");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Un montaje con muchos clips se exporta por tramos: debe salir igual
+    /// que en una sola pasada (imagen, duración) y sin huecos de audio en
+    /// las uniones.
+    #[test]
+    fn segmented_export_matches_a_single_pass() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("por-tramos");
+        let source = directory.join("entrevista.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=30"])
+            .args(["-f", "lavfi", "-i", "sine=f=440:d=30"])
+            .args(["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // 30 cortes de 0,6 s con la voz, fundidos al principio y al final,
+        // una disolvencia en medio y un título que cruza varios tramos.
+        let mut clips: Vec<RoughClip> = (0..30)
+            .map(|i| RoughClip {
+                path: source.clone(),
+                in_seconds: i as f64 * 0.9,
+                out_seconds: i as f64 * 0.9 + 0.6,
+                timeline_start: i as f64 * 0.6,
+                source_duration_seconds: Some(30.0),
+                ..Default::default()
+            })
+            .collect();
+        clips[0].fade_in_seconds = 0.4;
+        clips[29].fade_out_seconds = 0.4;
+        clips[15].transition = Some("dissolve".to_owned());
+        clips[15].transition_duration = 0.2;
+        clips.push(RoughClip {
+            track: 1,
+            timeline_start: 2.0,
+            out_seconds: 8.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "Entrevista".to_owned(),
+                size: 80.0,
+                position_y: 0.8,
+                style: efectos::TitleStyle { box_opacity: 0.6, ..Default::default() },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        });
+        let job = test_job(&clips, &directory.join("tramos.mp4"), ExportFormat::Mp4Video, None);
+        assert!(por_tramos::conviene(&job), "31 clips deben ir por tramos");
+        let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
+        run_export(&job, &AtomicBool::new(false), &progress).unwrap();
+        let single = RenderJob { output: directory.join("una-pasada.mp4"), ..job.clone() };
+        run_export_once(&single, None, &AtomicBool::new(false), &progress).unwrap();
+        let (segmented, whole) = (&job.output, &single.output);
+        assert!((probe_duration(segmented) - probe_duration(whole)).abs() < 0.05);
+        for at in [0.22, 3.02, 8.98, 9.1, 15.02, 17.82] {
+            let (mean, worst) = monitor_export_difference(&export_frame_rgba(segmented, at), &export_frame_rgba(whole, at));
+            assert!(mean < 3.0 && worst < 20.0, "fotograma {at}: media {mean:.1}, peor bloque {worst:.1}");
+        }
+        // Audio: el tono suena seguido salvo en los fundidos; ningún hueco
+        // de 10 ms en las uniones de tramos.
+        let pcm = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-i"])
+            .arg(segmented)
+            .args(["-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let samples: Vec<f32> = pcm.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let rms: Vec<f32> = samples.chunks(480).map(|w| (w.iter().map(|v| v * v).sum::<f32>() / w.len() as f32).sqrt()).collect();
+        let level = rms[rms.len() / 2];
+        let dips: Vec<f64> = (50..rms.len().saturating_sub(50))
+            .filter(|&i| rms[i] < level * 0.5)
+            .map(|i| i as f64 / 100.0)
+            .collect();
+        assert!(dips.is_empty(), "huecos de audio en {dips:?}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
