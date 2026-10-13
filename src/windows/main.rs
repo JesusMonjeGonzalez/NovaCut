@@ -6638,38 +6638,8 @@ impl NovaCutWindows {
         // se ven bien los efectos temporales (estabilizar, grano, barridos a
         // mitad) que una composición de un solo fotograma no puede calcular.
         let resolved = prepare_render_clips(&self.clips_para_reproducir());
-        let mut active: Vec<(usize, RoughClip, f64)> = resolved
-            .iter()
-            .enumerate()
-            .filter(|(_, clip)| {
-                clip.has_video
-                    && self.playhead >= clip.timeline_start
-                    && self.playhead < clip.timeline_start + clip.duration()
-            })
-            .map(|(index, clip)| {
-                let advanced = (self.playhead - clip.timeline_start).clamp(0.0, clip.duration())
-                    * clip.speed.clamp(0.1, 8.0);
-                let source_time = if clip.fx.reverse {
-                    (clip.out_seconds - advanced - 0.04).max(clip.in_seconds)
-                } else {
-                    clip.in_seconds + advanced
-                };
-                let mut clip = clip.clone();
-                // Transiciones de movimiento: el monitor compone un único
-                // fotograma, así que basta con desplazar la capa.
-                let (offset_x, offset_y) = clip.runtime.offset_at(self.playhead);
-                clip.position_x += offset_x * 1920.0;
-                clip.position_y += offset_y * 1080.0;
-                (index, clip, source_time)
-            })
-            .collect();
-        active.sort_by(|left, right| {
-            left.1
-                .track
-                .cmp(&right.1.track)
-                .then_with(|| left.1.timeline_start.total_cmp(&right.1.timeline_start))
-        });
-        let Some(_) = active.last() else {
+        let sources = monitor_sources(&resolved, self.playhead, self.use_proxies, timebase);
+        if sources.is_empty() {
             let (sender, receiver) = mpsc::channel();
             self.preview_result = Some(receiver);
             let _ = sender.send(Ok(PreviewFrame {
@@ -6678,40 +6648,6 @@ impl NovaCutWindows {
                 height: 360,
             }));
             return;
-        };
-        let mut sources: Vec<(RoughClip, f64)> = active
-            .into_iter()
-            .map(|(_, clip, source_time)| (clip, source_time))
-            .collect();
-        if self.use_proxies {
-            for (clip, _) in &mut sources {
-                if let Some(proxy) = clip.proxy.as_ref().filter(|path| path.is_file()) {
-                    clip.path = proxy.clone();
-                }
-            }
-        }
-        // Keyframes evaluados exactamente en el cabezal para el monitor.
-        for (clip, _) in &mut sources {
-            let local = (self.playhead - clip.timeline_start).max(0.0);
-            clip.freeze_animation(local);
-        }
-        // Los fundidos se ven en el monitor multiplicando la opacidad efectiva.
-        for (clip, _) in &mut sources {
-            let local = self.playhead - clip.timeline_start;
-            let duration = clip.duration();
-            if duration > 0.0 {
-                let factor_in = if clip.fade_in_seconds > 0.0 {
-                    (local / clip.fade_in_seconds).min(1.0)
-                } else {
-                    1.0
-                };
-                let factor_out = if clip.fade_out_seconds > 0.0 {
-                    ((duration - local) / clip.fade_out_seconds).min(1.0)
-                } else {
-                    1.0
-                };
-                clip.opacity *= factor_in * factor_out;
-            }
         }
         let (sender, receiver) = mpsc::channel();
         self.preview_result = Some(receiver);
@@ -17908,6 +17844,99 @@ fn conform_video_filter(clip: &RoughClip, frame_rate: &str) -> String {
     }
 }
 
+/// Lo que compone el monitor en `playhead`: clips con imagen activos ahí,
+/// por pista, con el instante de su medio, los keyframes congelados en ese
+/// fotograma y los fundidos llevados a la opacidad. La app y las pruebas de
+/// paridad con la exportación usan esta misma función.
+fn monitor_sources(
+    resolved: &[RoughClip],
+    playhead: f64,
+    use_proxies: bool,
+    timebase: Timebase,
+) -> Vec<(RoughClip, f64)> {
+    // El monitor enseña el fotograma que contiene el cabezal, evaluado en
+    // su inicio como la exportación: entre fotogramas, una animación ya
+    // estaba unos píxeles por delante de lo que sale.
+    let playhead = timebase.seconds((playhead.max(0.0) * timebase.fps() + 1e-6).floor() as i64);
+    // `-ss` descarta los fotogramas anteriores al punto de búsqueda: para
+    // obtener el que empieza en P hay que buscar un poco antes de P. Antes
+    // se buscaba en P (o más tarde) y el monitor iba un fotograma por
+    // delante de la exportación.
+    let seek_margin = timebase.frame_duration() / 4.0;
+    let mut active: Vec<(usize, RoughClip, f64)> = resolved
+        .iter()
+        .enumerate()
+        .filter(|(_, clip)| {
+            clip.has_video
+                && playhead >= clip.timeline_start
+                && playhead < clip.timeline_start + clip.duration()
+        })
+        .map(|(index, clip)| {
+            let advanced = (playhead - clip.timeline_start).clamp(0.0, clip.duration())
+                * clip.speed.clamp(0.1, 8.0);
+            let source_time = if clip.fx.reverse {
+                (clip.out_seconds - advanced - 0.04).max(clip.in_seconds)
+            } else {
+                (clip.in_seconds + advanced - seek_margin).max(clip.in_seconds.min(clip.in_seconds + advanced))
+            };
+            let mut clip = clip.clone();
+            // Transiciones de movimiento: el monitor compone un único
+            // fotograma, así que basta con desplazar la capa.
+            let (offset_x, offset_y) = clip.runtime.offset_at(playhead);
+            clip.position_x += offset_x * 1920.0;
+            clip.position_y += offset_y * 1080.0;
+            (index, clip, source_time)
+        })
+        .collect();
+    active.sort_by(|left, right| {
+        left.1
+            .track
+            .cmp(&right.1.track)
+            .then_with(|| left.1.timeline_start.total_cmp(&right.1.timeline_start))
+    });
+    let mut sources: Vec<(RoughClip, f64)> = active
+        .into_iter()
+        .map(|(_, clip, source_time)| (clip, source_time))
+        .collect();
+    if use_proxies {
+        for (clip, _) in &mut sources {
+            if let Some(proxy) = clip.proxy.as_ref().filter(|path| path.is_file()) {
+                clip.path = proxy.clone();
+            }
+        }
+    }
+    // Keyframes evaluados exactamente en el cabezal para el monitor.
+    for (clip, _) in &mut sources {
+        let local = (playhead - clip.timeline_start).max(0.0);
+        clip.freeze_animation(local);
+    }
+    // Fundidos con los mismos límites que la exportación: a negro bajan la
+    // opacidad; a blanco aclaran la imagen hacia blanco.
+    for (clip, _) in &mut sources {
+        let local = playhead - clip.timeline_start;
+        let duration = clip.duration();
+        if duration > 0.0 {
+            let (fade_in, fade_out) = clip.effective_fades();
+            let factor_in = if fade_in > 0.004 { (local / fade_in).clamp(0.0, 1.0) } else { 1.0 };
+            let factor_out = if fade_out > 0.004 {
+                ((duration - local) / fade_out).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let mut white = 0.0;
+            for (factor, to_white) in [(factor_in, clip.runtime.white_in), (factor_out, clip.runtime.white_out)] {
+                if to_white {
+                    white = f64::max(white, 1.0 - factor);
+                } else {
+                    clip.opacity *= factor;
+                }
+            }
+            clip.runtime.monitor_white = white;
+        }
+    }
+    sources
+}
+
 fn render_preview_frame(
     sources: &[(RoughClip, f64)],
     timebase: Timebase,
@@ -18039,6 +18068,12 @@ fn render_preview_frame_at(
             let mask = mask_filter(clip.mask.as_ref(), width as f64, height as f64);
             let cadence = conform_video_filter(clip, &frame_rate);
             let hdr = hdr::cadena(&clip.path);
+            let to_white = match clip.runtime.monitor_white {
+                white if white > 0.001 => format!(
+                    ",format=rgb24,lutrgb=r='val+(255-val)*{white:.4}':g='val+(255-val)*{white:.4}':b='val+(255-val)*{white:.4}'"
+                ),
+                _ => String::new(),
+            };
             let geometry = clip.fx.geometry_chain(false, false);
             let fx_color = clip.fx.video_color_chain();
             let fx_alpha = clip.fx.alpha_chain();
@@ -18059,7 +18094,7 @@ fn render_preview_frame_at(
                 // `setpts=PTS-STARTPTS`: tras `-ss` el primer fotograma no
                 // empieza en 0 si el cabezal cae entre dos fotogramas del
                 // medio, y `overlay` componía el fondo negro sin él.
-                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{hdr}{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
+                "[{index}:v:0]setpts=PTS-STARTPTS{geometry},scale={width}:{height}:force_original_aspect_ratio={scale_mode}{crop},setsar=1{hdr}{cadence}{wheels}{curves}{lut}{eq}{vig}{blur}{fx_color}{to_white},format=rgba{chroma}{mask}{fx_alpha},rotate={angle:.8}:ow=rotw({angle:.8}):oh=roth({angle:.8}):c=black@0{blend_canvas},colorchannelmixer=aa={opacity:.6}[pv{index}]"
             ));
         }
     }
@@ -18621,7 +18656,12 @@ fn build_render_filters(
             let (fade_in, fade_out) = clips[index].effective_fades();
             let duration = clips[index].duration();
             let mut fade_filters = String::new();
-            let white = |on: bool| if on { ":color=white" } else { "" };
+            // A negro se funde el alfa: `fade` sobre RGBA oscurece el color Y
+            // baja el alfa, y a mitad de fundido la imagen quedaba al 25 %
+            // en vez del 50 % que enseña el monitor. Sobre V1 es el mismo
+            // paso a negro; en pistas altas deja ver lo de debajo, como la
+            // opacidad de Premiere. A blanco sí hay que fundir el color.
+            let white = |on: bool| if on { ":color=white" } else { ":alpha=1" };
             if fade_in > 0.004 {
                 fade_filters.push_str(&format!(
                     ",fade=t=in:st=0:d={fade_in:.3}{}",
@@ -23390,6 +23430,249 @@ mod render_real_tests {
         // Sin mate, el rectángulo blanco se ve encima de todo.
         red.fx.mate = None;
         check(&[blue, red, shape], ('w', 'r'), "sin mate");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Fotograma exportado en `at` a 640×360 RGBA, para compararlo con el
+    /// monitor píxel a píxel.
+    fn export_frame_rgba(path: &Path, at: f64) -> Vec<u8> {
+        // `-ss` descarta los fotogramas anteriores al punto: se busca un poco
+        // antes del inicio del fotograma que contiene `at` (a 25 fps) para
+        // obtener ese y no el siguiente.
+        let seek = (at * 25.0 + 1e-6).floor() / 25.0 - 0.01;
+        let raw = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-ss", &format_seconds(seek.max(0.0)), "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf", "scale=640:360", "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(raw.len(), 640 * 360 * 4, "no hay fotograma en {at} s de {}", path.display());
+        raw
+    }
+
+    /// Diferencia media por canal (0-255) y peor bloque de 32×32: la media
+    /// sola esconde un título descolocado en una esquina.
+    fn monitor_export_difference(a: &[u8], b: &[u8]) -> (f64, f64) {
+        let channel = |i: usize| (a[i] as f64 - b[i] as f64).abs();
+        let mut total = 0.0;
+        let mut worst: f64 = 0.0;
+        for by in 0..(360 / 32) {
+            for bx in 0..(640 / 32) {
+                let mut block = 0.0;
+                for y in by * 32..by * 32 + 32 {
+                    for x in bx * 32..bx * 32 + 32 {
+                        let i = (y * 640 + x) * 4;
+                        block += channel(i) + channel(i + 1) + channel(i + 2);
+                    }
+                }
+                worst = worst.max(block / (32.0 * 32.0 * 3.0));
+            }
+        }
+        for i in (0..a.len()).step_by(4) {
+            total += channel(i) + channel(i + 1) + channel(i + 2);
+        }
+        (total / (a.len() / 4 * 3) as f64, worst)
+    }
+
+    /// El monitor debe enseñar lo que saldrá. Cada escena se exporta de
+    /// verdad y se compara con `monitor_sources` + `render_preview_frame`,
+    /// el mismo camino que la app, en varios instantes.
+    #[test]
+    fn monitor_matches_export_across_common_edits() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("paridad");
+        let make = |name: &str, source: &str| {
+            let path = directory.join(name);
+            let status = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", source, "-f", "lavfi", "-i", "sine=f=330:d=10"])
+                .args(["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        // Contenido que cambia despacio con el tiempo (el tono rota): un
+        // error de instante de origen se nota; un fotograma de más, no. Los
+        // instantes caen en el centro de un fotograma a 25 fps: en el borde,
+        // una animación ya se mueve entre el monitor y el fotograma vecino.
+        let bars = make("barras.mp4", "smptebars=s=640x360:r=25:d=10,hue=h=t*30");
+        let other = make("otro.mp4", "testsrc2=s=640x360:r=25:d=10,hue=s=0.6");
+        let clip = |path: &PathBuf, start: f64, track: usize| RoughClip {
+            path: path.clone(),
+            timeline_start: start,
+            track,
+            in_seconds: 1.0,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(10.0),
+            ..Default::default()
+        };
+        let title = |text: &str, track: usize| RoughClip {
+            track,
+            out_seconds: 3.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: text.to_owned(),
+                size: 90.0,
+                position_y: 0.75,
+                style: efectos::TitleStyle { box_opacity: 0.6, ..Default::default() },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let mut scenes: Vec<(&str, Vec<RoughClip>, Vec<f64>)> = Vec::new();
+        let mut graded = clip(&bars, 0.0, 0);
+        graded.exposure = 0.3;
+        graded.contrast = 0.2;
+        graded.saturation = 0.4;
+        graded.vignette = 0.5;
+        graded.fx.temperature = 0.5;
+        scenes.push(("color", vec![graded], vec![0.50, 2.02]));
+        let mut pip = clip(&other, 0.0, 1);
+        pip.scale_percent = 45.0;
+        pip.position_x = 420.0;
+        pip.position_y = -220.0;
+        pip.rotation = 12.0;
+        pip.opacity = 75.0;
+        scenes.push(("pip", vec![clip(&bars, 0.0, 0), pip], vec![1.02]));
+        let mut fast = clip(&bars, 0.0, 0);
+        fast.speed = 2.0;
+        fast.out_seconds = 9.0;
+        scenes.push(("velocidad", vec![fast.clone()], vec![0.50, 3.02]));
+        fast.fx.reverse = true;
+        scenes.push(("invertido", vec![fast], vec![0.50, 3.02]));
+        let mut faded = clip(&bars, 0.0, 0);
+        faded.fade_in_seconds = 1.0;
+        faded.fade_out_seconds = 1.0;
+        scenes.push(("fundidos", vec![faded], vec![0.50, 2.50]));
+        let first = clip(&bars, 0.0, 0);
+        let mut second = clip(&other, 3.0, 0);
+        second.transition = Some("dissolve".to_owned());
+        second.transition_duration = 1.0;
+        scenes.push(("disolvencia", vec![first.clone(), second.clone()], vec![2.50, 3.02, 3.50]));
+        second.transition = Some("wipeleft".to_owned());
+        scenes.push(("barrido", vec![first, second], vec![3.02, 3.50]));
+        scenes.push(("titulo", vec![clip(&bars, 0.0, 0), title("Ana García · Directora", 1)], vec![1.02]));
+        let mut moving = clip(&other, 0.0, 1);
+        moving.scale_percent = 40.0;
+        moving.keyframes = Some(vec![
+            TransformKeyframe { t: 0.0, x: -500.0, y: 0.0, scale: 40.0, opacity: 100.0 },
+            TransformKeyframe { t: 2.0, x: 500.0, y: 200.0, scale: 60.0, opacity: 50.0 },
+        ]);
+        scenes.push(("keyframes", vec![clip(&bars, 0.0, 0), moving], vec![0.50, 1.02, 2.50]));
+        let mut screen = clip(&other, 0.0, 1);
+        screen.fusion = Fusion::Screen;
+        scenes.push(("fusion", vec![clip(&bars, 0.0, 0), screen], vec![1.02]));
+        let mut matted = clip(&other, 0.0, 0);
+        matted.fx.mate = Some(mate::MatePista { pista: 1, modo: mate::ModoMate::Alfa, invertir: false });
+        let mut big = title("NOVA", 1);
+        big.title.as_mut().unwrap().size = 300.0;
+        big.title.as_mut().unwrap().style.box_opacity = 0.0;
+        scenes.push(("mate", vec![matted, big], vec![1.02]));
+        let adjustment = RoughClip {
+            track: 1,
+            out_seconds: 3.0,
+            has_audio: false,
+            is_adjustment: true,
+            saturation: -1.0,
+            contrast: 0.3,
+            ..Default::default()
+        };
+        scenes.push(("ajuste", vec![clip(&bars, 0.0, 0), adjustment], vec![1.02]));
+        let mut masked = clip(&other, 0.0, 1);
+        masked.mask = Some(Mask { shape: MaskShape::Ellipse, ..Mask::default() });
+        scenes.push(("mascara", vec![clip(&bars, 0.0, 0), masked], vec![1.02]));
+        let mut cropped = clip(&other, 0.0, 0);
+        cropped.fx.crop_left = 0.2;
+        cropped.fx.crop_top = 0.1;
+        cropped.fx.flip_h = true;
+        scenes.push(("recorte", vec![clip(&bars, 0.0, 0), RoughClip { track: 1, ..cropped }], vec![1.02]));
+
+        let mut report = Vec::new();
+        for (name, clips, times) in &scenes {
+            let output = directory.join(format!("{name}.mp4"));
+            if let Err(error) = export(clips, &output, ExportFormat::Mp4Video) {
+                report.push(format!("{name}: la exportación falló: {error}"));
+                continue;
+            }
+            let prepared = prepare_render_clips(clips);
+            for &time in times {
+                let sources = monitor_sources(&prepared, time, false, Timebase::from_fps(25.0));
+                let monitor = match render_preview_frame(&sources, Timebase::from_fps(25.0)) {
+                    Ok(frame) => frame.pixels,
+                    Err(error) => {
+                        report.push(format!("{name} @ {time}: el monitor falló: {error}"));
+                        continue;
+                    }
+                };
+                let exported = export_frame_rgba(&output, time);
+                let (mean, worst) = monitor_export_difference(&monitor, &exported);
+                let line = format!("{name} @ {time}: media {mean:.1}, peor bloque {worst:.1}");
+                eprintln!("PARIDAD {line}");
+                if mean > 6.0 || worst > 30.0 || std::env::var_os("NOVACUT_PARIDAD_VOLCAR").is_some() {
+                    let _ = std::fs::write(directory.join(format!("{name}-{time}-monitor.rgba")), &monitor);
+                    let _ = std::fs::write(directory.join(format!("{name}-{time}-export.rgba")), &exported);
+                }
+                if mean > 6.0 || worst > 30.0 {
+                    report.push(line);
+                }
+            }
+        }
+        assert!(report.is_empty(), "el monitor no enseña lo que se exporta (en {}):\n{}", directory.display(), report.join("\n"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Fotograma N de origen = gris N·4: el monitor debe enseñar el mismo
+    /// fotograma del medio que la exportación (iba uno por delante).
+    #[test]
+    fn monitor_shows_the_same_source_frame_as_the_export() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("sonda2");
+        let path = directory.join("n.mp4");
+        // Fotograma N de origen = gris N*4 (hasta 63).
+        Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "nullsrc=s=640x360:r=25:d=2.5,geq=lum='N*4':cb=128:cr=128", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+            .arg(&path).status().unwrap();
+        let base = RoughClip { path: path.clone(), in_seconds: 0.4, out_seconds: 2.4, source_duration_seconds: Some(2.5), has_audio: false, ..Default::default() };
+        let black = RoughClip { path: path.clone(), in_seconds: 0.0, out_seconds: 2.0, source_duration_seconds: Some(2.5), has_audio: false, ..Default::default() };
+        let mut blend = RoughClip { track: 1, ..base.clone() };
+        blend.fusion = Fusion::Lighten;
+        let mut flipped = base.clone();
+        flipped.fx.flip_h = true;
+        let mut cropped = base.clone();
+        cropped.fx.crop_left = 0.1;
+        let mut opaque = base.clone();
+        opaque.opacity = 99.0;
+        for (name, clips) in [
+            ("normal", vec![base.clone()]),
+            ("volteo", vec![flipped]),
+            ("recorte", vec![cropped]),
+            ("opacidad", vec![opaque]),
+            ("fusion", vec![RoughClip { path: black.path.clone(), ..black.clone() }, blend]),
+        ] {
+            let output = directory.join(format!("{name}.mp4"));
+            export(&clips, &output, ExportFormat::Mp4Video).unwrap();
+            let prepared = prepare_render_clips(&clips);
+            let mut line = String::new();
+            for frame in [10usize, 25] {
+                let at = frame as f64 / 25.0 + 0.02;
+                let exported = export_frame_rgba(&output, at);
+                let sources = monitor_sources(&prepared, at, false, Timebase::from_fps(25.0));
+                let monitor = render_preview_frame(&sources, Timebase::from_fps(25.0)).unwrap();
+                let centre = (180 * 640 + 320) * 4;
+                line.push_str(&format!(" f{frame}: export N={:.1} monitor N={:.1};", exported[centre] as f64 / 4.0, monitor.pixels[centre] as f64 / 4.0));
+                // Un fotograma de diferencia son ~4,6 niveles de gris.
+                assert!(
+                    (exported[centre] as i32 - monitor.pixels[centre] as i32).abs() <= 2,
+                    "{name}, fotograma {frame}: el monitor enseña otro fotograma del medio ({line})"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&directory);
     }
 

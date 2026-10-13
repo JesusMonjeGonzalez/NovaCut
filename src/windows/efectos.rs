@@ -734,6 +734,9 @@ pub struct TransitionRuntime {
     /// Los fundidos del clip van a blanco en vez de a negro.
     pub white_in: bool,
     pub white_out: bool,
+    /// Solo en el monitor: cuánto del fotograma fijo va a blanco (0-1)
+    /// porque el cabezal cae en un fundido a blanco.
+    pub monitor_white: f64,
     /// Entrada en movimiento: (dx, dy, inicio en timeline, duración).
     pub slide_in: Option<(f64, f64, f64, f64)>,
     /// Salida empujada: (dx, dy, inicio en timeline, duración).
