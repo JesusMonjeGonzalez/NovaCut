@@ -18005,6 +18005,12 @@ fn render_preview_frame_at(
                 ),
             ]);
             is_title_input.push(true);
+        } else if is_image_file(&clip.path) {
+            // Una imagen tiene un solo fotograma: con `-ss` más allá de él
+            // FFmpeg no daba nada y las fotos y los PNG no salían en el
+            // monitor (sí al exportar).
+            command.arg("-i").arg(&clip.path);
+            is_title_input.push(false);
         } else {
             command
                 .args(["-ss", &format_seconds(*source_time), "-i"])
@@ -23591,6 +23597,43 @@ mod render_real_tests {
         cropped.fx.flip_h = true;
         scenes.push(("recorte", vec![clip(&bars, 0.0, 0), RoughClip { track: 1, ..cropped }], vec![1.02]));
 
+        // Móvil en vertical: el archivo es 640×360 con giro de 90° en los
+        // metadatos, como graba el iPhone.
+        // Otro nombre que la escena: su exportación se llama `girado.mp4`.
+        let rotated = directory.join("movil-vertical.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+            .arg(&other)
+            .args(["-c", "copy", "-t", "5"])
+            .arg(&rotated)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        scenes.push(("girado", vec![clip(&bars, 0.0, 0), RoughClip { scale_percent: 60.0, ..clip(&rotated, 0.0, 1) }], vec![1.02]));
+        // PNG con transparencia (un círculo) y una foto opaca.
+        let logo = directory.join("logo.png");
+        let photo = directory.join("foto.jpg");
+        for (path, source) in [
+            (&logo, "color=c=black@0:s=400x400,format=rgba,geq=r=255:g=200:b=0:a='if(lt(hypot(X-200,Y-200),150),255,0)'"),
+            (&photo, "testsrc2=s=1024x768"),
+        ] {
+            let status = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", source, "-frames:v", "1"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let still = |path: &PathBuf, track: usize| RoughClip {
+            path: path.clone(),
+            track,
+            out_seconds: 3.0,
+            has_audio: false,
+            ..Default::default()
+        };
+        scenes.push(("png", vec![clip(&bars, 0.0, 0), RoughClip { position_x: 500.0, ..still(&logo, 1) }], vec![1.02]));
+        scenes.push(("foto", vec![still(&photo, 0)], vec![1.02]));
+
         let mut report = Vec::new();
         for (name, clips, times) in &scenes {
             let output = directory.join(format!("{name}.mp4"));
@@ -23622,6 +23665,86 @@ mod render_real_tests {
             }
         }
         assert!(report.is_empty(), "el monitor no enseña lo que se exporta (en {}):\n{}", directory.display(), report.join("\n"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Lo mismo en vertical (Shorts, Reels, TikTok): el monitor compone en
+    /// 202×360 con bandas y la exportación sale a 360×640.
+    #[test]
+    fn monitor_matches_vertical_export() {
+        if (!ffmpeg_available() || !has_drawtext()) && skip("FFmpeg sin drawtext") {
+            return;
+        }
+        let directory = work_dir("paridad-vertical");
+        let bars = directory.join("barras.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "smptebars=s=640x360:r=25:d=6,hue=h=t*30"])
+            .args(["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p"])
+            .arg(&bars)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let base = RoughClip {
+            path: bars.clone(),
+            out_seconds: 3.0,
+            source_duration_seconds: Some(6.0),
+            has_audio: false,
+            ..Default::default()
+        };
+        let mut zoomed = base.clone();
+        zoomed.scale_percent = 130.0;
+        zoomed.position_x = 200.0;
+        let mut pip = RoughClip { track: 1, scale_percent: 40.0, position_y: -500.0, ..base.clone() };
+        pip.rotation = 8.0;
+        let caption = RoughClip {
+            track: 2,
+            out_seconds: 3.0,
+            has_audio: false,
+            title: Some(Titulo {
+                text: "Mira esto".to_owned(),
+                size: 120.0,
+                position_y: 0.7,
+                style: efectos::TitleStyle { box_opacity: 0.7, ..Default::default() },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        let size = (360, 640);
+        let canvas = monitor_canvas(size);
+        let mut report = Vec::new();
+        for (name, clips) in [
+            ("encuadre", vec![base.clone()]),
+            ("zoom", vec![zoomed]),
+            ("capas", vec![base, pip, caption]),
+        ] {
+            let output = directory.join(format!("{name}.mp4"));
+            let job = RenderJob { size, ..test_job(&clips, &output, ExportFormat::Mp4Video, None) };
+            run_export(&job, &AtomicBool::new(false), &Arc::new(std::sync::Mutex::new(RenderProgress::default()))).unwrap();
+            let prepared = prepare_render_clips(&clips);
+            let sources = monitor_sources(&prepared, 1.02, false, Timebase::from_fps(25.0));
+            let monitor = render_preview_frame_at(&sources, Timebase::from_fps(25.0), canvas).unwrap().pixels;
+            let raw = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-ss", "0.99", "-i"])
+                .arg(&output)
+                .args(["-frames:v", "1", "-vf"])
+                .arg(format!(
+                    "scale={}:{},pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black",
+                    canvas.0, canvas.1
+                ))
+                .args(["-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(raw.len(), 640 * 360 * 4);
+            let (mean, worst) = monitor_export_difference(&monitor, &raw);
+            eprintln!("PARIDAD vertical {name}: media {mean:.1}, peor bloque {worst:.1}");
+            if mean > 6.0 || worst > 30.0 {
+                let _ = std::fs::write(directory.join(format!("{name}-monitor.rgba")), &monitor);
+                let _ = std::fs::write(directory.join(format!("{name}-export.rgba")), &raw);
+                report.push(format!("{name}: media {mean:.1}, peor bloque {worst:.1}"));
+            }
+        }
+        assert!(report.is_empty(), "vertical (en {}):\n{}", directory.display(), report.join("\n"));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
