@@ -1569,16 +1569,60 @@ fn prepare_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
 fn flatten_nested(clips: &[RoughClip]) -> Vec<RoughClip> {
     let mut out = Vec::new();
     for clip in clips {
-        let Some(children) = &clip.nested else {
+        if clip.nested.is_some() {
+            out.extend(flatten_nested(&unnest_one(clip)));
+        } else {
             out.push(clip.clone());
-            continue;
-        };
-        for child in flatten_nested(children) {
-            let mut child = child;
-            child.timeline_start += clip.timeline_start;
-            child.track = clip.track.saturating_add(child.track).min(15);
-            out.push(child);
         }
+    }
+    out
+}
+
+/// Los hijos directos de un anidado puestos en la timeline del contenedor.
+/// El contenedor manda sobre ellos, como un anidado de Premiere: su
+/// entrada/salida es una ventana (lo de fuera se recorta) y su escala,
+/// posición y opacidad se componen con las de cada hijo. Antes solo se
+/// sumaba su posición y un anidado recortado o escalado salía entero.
+fn unnest_one(clip: &RoughClip) -> Vec<RoughClip> {
+    let Some(children) = &clip.nested else {
+        return vec![clip.clone()];
+    };
+    let window = clip.duration();
+    let factor = clip.scale_percent / 100.0;
+    let moved = (factor - 1.0).abs() > 1e-9 || clip.position_x != 0.0 || clip.position_y != 0.0;
+    let mut out = Vec::with_capacity(children.len());
+    for child in children {
+        let mut child = child.clone();
+        let start = child.timeline_start - clip.in_seconds;
+        let end = start + child.duration();
+        if end <= 0.0005 || start >= window - 0.0005 {
+            continue;
+        }
+        child.timeline_start = start;
+        let (head, tail) = ((-start).max(0.0), (end - window).max(0.0));
+        if head > 0.0 || tail > 0.0 {
+            match montaje::clip_portion(&child, head, child.duration() - tail) {
+                Some(part) => child = part,
+                None => continue,
+            }
+        }
+        child.timeline_start += clip.timeline_start;
+        child.track = clip.track.saturating_add(child.track).min(15);
+        if moved && child.has_video {
+            child.scale_percent *= factor;
+            child.position_x = clip.position_x + child.position_x * factor;
+            child.position_y = clip.position_y + child.position_y * factor;
+            if let Some(keys) = child.keyframes.as_mut() {
+                for key in keys {
+                    key.scale *= factor;
+                    key.x = clip.position_x + key.x * factor;
+                    key.y = clip.position_y + key.y * factor;
+                }
+            }
+        }
+        child.opacity *= (clip.opacity / 100.0).clamp(0.0, 1.0);
+        child.gain_db += clip.gain_db;
+        out.push(child);
     }
     out
 }
@@ -2145,10 +2189,14 @@ impl RoughClip {
 
     fn duration(&self) -> f64 {
         if let Some(children) = &self.nested {
-            return children
+            // Su entrada/salida es una ventana sobre los hijos; sin salida
+            // guardada (proyectos viejos), todo lo que ocupan.
+            let extent = children
                 .iter()
                 .map(|child| child.timeline_start + child.duration())
                 .fold(0.0, f64::max);
+            let end = if self.out_seconds > self.in_seconds { self.out_seconds.min(extent) } else { extent };
+            return (end - self.in_seconds).max(0.0);
         }
         if self
             .speed_ramp
@@ -5688,16 +5736,13 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        let Some(mut children) = self.project.clips[index].nested.clone() else {
+        if self.project.clips[index].nested.is_none() {
             return;
-        };
-        let before = self.project.clone();
-        let start = self.project.clips[index].timeline_start;
-        let track = self.project.clips[index].track;
-        for child in &mut children {
-            child.timeline_start += start;
-            child.track = track.saturating_add(child.track).min(15);
         }
+        let before = self.project.clone();
+        // Con la ventana, la escala y la opacidad del contenedor aplicadas:
+        // desanidar no cambia lo que se ve.
+        let children = unnest_one(&self.project.clips[index]);
         self.project.clips.splice(index..=index, children);
         if index < self.project.clips.len() {
             self.select_only(index);
@@ -6663,8 +6708,8 @@ impl NovaCutWindows {
     fn split_at_playhead(&mut self) {
         let contains_playhead = |clip: &RoughClip| {
             let local = self.playhead - clip.timeline_start;
-            clip.nested.is_none()
-                && clip
+            // Un anidado se parte: cada mitad es una ventana sobre sus hijos.
+            clip
                     .speed_ramp
                     .as_ref()
                     .is_none_or(|points| points.is_empty())
@@ -7622,13 +7667,12 @@ impl NovaCutWindows {
                 };
                 let ripple = kind == DragKind::RippleTrimStart;
                 let orig = before.clips[index].clone();
-                if orig.nested.is_some()
-                    || orig
-                        .speed_ramp
-                        .as_ref()
-                        .is_some_and(|points| !points.is_empty())
+                if orig
+                    .speed_ramp
+                    .as_ref()
+                    .is_some_and(|points| !points.is_empty())
                 {
-                    self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
+                    self.status = "Quita la rampa de velocidad antes de recortar bordes".to_owned();
                     return;
                 }
                 let (head_min, head_max, _, _) = montaje::edge_limits(&orig);
@@ -7697,13 +7741,12 @@ impl NovaCutWindows {
                 };
                 let ripple = kind == DragKind::RippleTrimEnd;
                 let orig = before.clips[index].clone();
-                if orig.nested.is_some()
-                    || orig
-                        .speed_ramp
-                        .as_ref()
-                        .is_some_and(|points| !points.is_empty())
+                if orig
+                    .speed_ramp
+                    .as_ref()
+                    .is_some_and(|points| !points.is_empty())
                 {
-                    self.status = "Desanida o quita la rampa antes de recortar bordes".to_owned();
+                    self.status = "Quita la rampa de velocidad antes de recortar bordes".to_owned();
                     return;
                 }
                 let orig_end = orig.timeline_start + orig.duration();
@@ -10634,8 +10677,8 @@ impl NovaCutWindows {
         let playhead = self.playhead;
         let splittable = |clip: &RoughClip| {
             let local = playhead - clip.timeline_start;
-            clip.nested.is_none()
-                && clip
+            // Un anidado se parte: cada mitad es una ventana sobre sus hijos.
+            clip
                     .speed_ramp
                     .as_ref()
                     .is_none_or(|points| points.is_empty())
@@ -10866,7 +10909,7 @@ impl NovaCutWindows {
             (0.0, self.playhead - end)
         };
         let Some(mut trimmed) = montaje::retime(&clip, head, tail) else {
-            self.status = "Desanida o quita la rampa antes de recortar".to_owned();
+            self.status = "No se puede recortar ahí (rampa de velocidad o sin material)".to_owned();
             return;
         };
         let before = self.project.clone();
@@ -10908,8 +10951,8 @@ impl NovaCutWindows {
             self.status = "La pista está bloqueada".to_owned();
             return;
         }
-        if montaje::is_complex(&clip) {
-            self.status = "Desanida o quita la rampa antes de extender".to_owned();
+        if clip.speed_ramp.as_ref().is_some_and(|points| !points.is_empty()) {
+            self.status = "Quita la rampa de velocidad antes de extender".to_owned();
             return;
         }
         let end = clip.timeline_start + clip.duration();
@@ -13664,9 +13707,23 @@ impl eframe::App for NovaCutWindows {
                         if clip.nested.is_some() {
                             ui.colored_label(
                                 egui::Color32::from_rgb(130, 190, 255),
-                                "Secuencia compuesta: edita sus clips después de desanidarla.",
+                                "Secuencia anidada: se recorta y se parte como un clip; para tocar el color o los efectos de sus clips, desanídala.",
                             );
-                            unnest_requested |= ui.button("Desanidar secuencia").on_hover_text("Devuelve los clips de la secuencia al montaje").clicked();
+                            unnest_requested |= ui.button("Desanidar secuencia").on_hover_text("Devuelve los clips de la secuencia al montaje tal y como se ven").clicked();
+                            // Lo que se aplica a todo el anidado, como el
+                            // movimiento y la opacidad de un anidado de Premiere.
+                            theme::section_label(ui, "Encuadre del anidado");
+                            trim_changed |= ui
+                                .add(egui::Slider::new(&mut clip.scale_percent, 5.0..=400.0).suffix(" %").text("Escala"))
+                                .on_hover_text("Encoge o agranda todo el anidado: con 50 % y una posición, un PiP de varios planos")
+                                .changed();
+                            trim_changed |= ui.add(egui::Slider::new(&mut clip.position_x, -1920.0..=1920.0).text("X (px)")).changed();
+                            trim_changed |= ui.add(egui::Slider::new(&mut clip.position_y, -1080.0..=1080.0).text("Y (px)")).changed();
+                            trim_changed |= ui.add(egui::Slider::new(&mut clip.opacity, 0.0..=100.0).suffix(" %").text("Opacidad")).changed();
+                            trim_changed |= ui
+                                .add(egui::Slider::new(&mut clip.gain_db, -40.0..=24.0).suffix(" dB").text("Volumen"))
+                                .on_hover_text("Se suma al volumen de cada clip de dentro")
+                                .changed();
                             ui.separator();
                             ui.disable();
                         }
@@ -14000,13 +14057,12 @@ impl eframe::App for NovaCutWindows {
                                 }
                             }
                         });
-                        let trim_allowed = clip.nested.is_none()
-                            && clip
-                                .speed_ramp
-                                .as_ref()
-                                .is_none_or(|points| points.is_empty());
+                        let trim_allowed = clip
+                            .speed_ramp
+                            .as_ref()
+                            .is_none_or(|points| points.is_empty());
                         if !trim_allowed {
-                            ui.small("Desanida o quita la rampa para editar entrada/salida.");
+                            ui.small("Quita la rampa para editar entrada/salida.");
                         }
                         let source_limit = clip
                             .source_duration_seconds
@@ -17874,7 +17930,10 @@ fn monitor_sources(
         .map(|(index, clip)| {
             let advanced = (playhead - clip.timeline_start).clamp(0.0, clip.duration())
                 * clip.speed.clamp(0.1, 8.0);
-            let source_time = if clip.fx.reverse {
+            let source_time = if let Some(frozen) = clip.freeze_at {
+                // Fotograma congelado: siempre el mismo instante del medio.
+                frozen
+            } else if clip.fx.reverse {
                 (clip.out_seconds - advanced - 0.04).max(clip.in_seconds)
             } else {
                 (clip.in_seconds + advanced - seek_margin).max(clip.in_seconds.min(clip.in_seconds + advanced))
@@ -18764,7 +18823,10 @@ fn build_render_filters(
                     .freeze_at
                     .map(|_| {
                         let pad = (clips[index].duration() - 0.04).max(0.0);
-                        format!(",tpad=stop_mode=clone:stop_duration={pad:.3}")
+                        // Coma detrás: va justo antes de `setpts`. Con la coma
+                        // delante el grafo quedaba `[0:v:0],tpad…` y exportar
+                        // un fotograma congelado fallaba siempre.
+                        format!("tpad=stop_mode=clone:stop_duration={pad:.3},")
                     })
                     .unwrap_or_default();
                 let cadence = conform_video_filter(&clips[index], &frame_rate);
@@ -18834,7 +18896,9 @@ fn build_render_filters(
                 }
             }
         }
-        if clips[index].has_audio && include_audio && !clips[index].is_adjustment {
+        // Un fotograma congelado va en silencio: su entrada son 40 ms del
+        // medio, que sonaban como un chasquido.
+        if clips[index].has_audio && include_audio && !clips[index].is_adjustment && clips[index].freeze_at.is_none() {
             let delay_ms = (start * 1000.0).round() as u64;
             let track_gain = track_gains.get(clips[index].track).copied().unwrap_or(0.0);
             let volume = if clips[index].muted {
@@ -21856,10 +21920,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_container_scales_moves_fades_and_turns_down_its_children() {
+        let child = RoughClip {
+            out_seconds: 4.0,
+            position_x: 100.0,
+            scale_percent: 80.0,
+            opacity: 50.0,
+            gain_db: -3.0,
+            ..Default::default()
+        };
+        let nest = RoughClip {
+            timeline_start: 2.0,
+            out_seconds: 4.0,
+            scale_percent: 50.0,
+            position_x: 400.0,
+            position_y: -200.0,
+            opacity: 80.0,
+            gain_db: -6.0,
+            nested: Some(vec![child]),
+            ..Default::default()
+        };
+        let flat = flatten_nested(&[nest.clone()]);
+        assert_eq!(flat.len(), 1);
+        let c = &flat[0];
+        assert_eq!((c.timeline_start, c.scale_percent), (2.0, 40.0));
+        assert_eq!((c.position_x, c.position_y), (450.0, -200.0));
+        assert!((c.opacity - 40.0).abs() < 1e-9 && (c.gain_db + 9.0).abs() < 1e-9);
+        // Desanidar deja lo mismo que se veía.
+        let unnested = unnest_one(&nest);
+        assert_eq!((unnested[0].scale_percent, unnested[0].position_x), (40.0, 450.0));
+    }
+
+    #[test]
     fn nested_sequence_flattens_at_container_time() {
+        // Como al anidar: la ventana del contenedor cubre a sus hijos.
         let nested = RoughClip {
             timeline_start: 5.0,
             track: 3,
+            out_seconds: 5.0,
             nested: Some(vec![RoughClip {
                 timeline_start: 2.0,
                 out_seconds: 3.0,
@@ -22241,8 +22339,9 @@ mod tests {
 
     #[test]
     fn overwrite_detects_complex_collisions_before_mutating() {
-        // La duración de una secuencia anidada la marcan sus hijos.
+        // La duración de una secuencia anidada es su ventana sobre los hijos.
         let clips = vec![RoughClip {
+            out_seconds: 5.0,
             nested: Some(vec![RoughClip {
                 out_seconds: 5.0,
                 ..Default::default()
@@ -23654,6 +23753,30 @@ mod render_real_tests {
         };
         scenes.push(("difuminar", vec![clip(&other, 0.0, 0), blur_zone], vec![1.02]));
 
+        // Fotograma congelado y rampa de velocidad.
+        let mut frozen = clip(&bars, 0.0, 0);
+        frozen.freeze_at = Some(2.5);
+        scenes.push(("congelado", vec![frozen], vec![0.5, 2.02]));
+        let mut ramp = clip(&bars, 0.0, 0);
+        ramp.out_seconds = 7.0;
+        ramp.speed_ramp = Some(vec![SpeedPoint { source_t: 0.0, speed: 1.0 }, SpeedPoint { source_t: 3.0, speed: 3.0 }]);
+        scenes.push(("rampa", vec![ramp], vec![0.5, 2.02]));
+        // Secuencia anidada: hijos en tiempos relativos; el contenedor se
+        // recorta (empieza 1 s dentro) y se escala.
+        let children = vec![clip(&bars, 0.0, 0), RoughClip { scale_percent: 50.0, ..clip(&other, 0.0, 1) }];
+        let nest = |in_s: f64, scale: f64| RoughClip {
+            nested: Some(children.clone()),
+            path: PathBuf::new(),
+            in_seconds: in_s,
+            out_seconds: 3.0,
+            source_duration_seconds: Some(3.0),
+            scale_percent: scale,
+            ..Default::default()
+        };
+        scenes.push(("anidada", vec![nest(0.0, 100.0)], vec![1.02]));
+        scenes.push(("anidada recortada", vec![nest(1.0, 100.0)], vec![0.5]));
+        scenes.push(("anidada escalada", vec![nest(0.0, 50.0)], vec![1.02]));
+
         let mut report = Vec::new();
         for (name, clips, times) in &scenes {
             let output = directory.join(format!("{name}.mp4"));
@@ -23685,6 +23808,15 @@ mod render_real_tests {
             }
         }
         assert!(report.is_empty(), "el monitor no enseña lo que se exporta (en {}):\n{}", directory.display(), report.join("\n"));
+        // El contenedor de una secuencia anidada manda sobre sus hijos: su
+        // recorte de entrada desplaza el contenido y su escala lo encoge.
+        let nested = |name: &str, at: f64| export_frame_rgba(&directory.join(format!("{name}.mp4")), at);
+        let (trimmed, plain_later) = (nested("anidada recortada", 0.52), nested("anidada", 1.52));
+        let (shift, _) = monitor_export_difference(&trimmed, &plain_later);
+        let (scaled, plain) = (nested("anidada escalada", 1.02), nested("anidada", 1.02));
+        let (shrink, _) = monitor_export_difference(&scaled, &plain);
+        assert!(shift < 3.0, "el recorte de entrada del anidado no desplaza a sus hijos ({shift:.1})");
+        assert!(shrink > 20.0, "la escala del anidado no encoge a sus hijos ({shrink:.1})");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
