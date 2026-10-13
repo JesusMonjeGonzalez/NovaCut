@@ -23634,6 +23634,26 @@ mod render_real_tests {
         scenes.push(("png", vec![clip(&bars, 0.0, 0), RoughClip { position_x: 500.0, ..still(&logo, 1) }], vec![1.02]));
         scenes.push(("foto", vec![still(&photo, 0)], vec![1.02]));
 
+        // «Difuminar una zona»: capa de ajuste con desenfoque y elipse.
+        let blur_zone = RoughClip {
+            track: 1,
+            out_seconds: 3.0,
+            has_audio: false,
+            is_adjustment: true,
+            blur: 0.12,
+            mask: Some(Mask {
+                shape: MaskShape::Ellipse,
+                position_x: 0.5,
+                position_y: 0.42,
+                size_x: 0.22,
+                size_y: 0.36,
+                feather: 0.2,
+                inverted: false,
+            }),
+            ..Default::default()
+        };
+        scenes.push(("difuminar", vec![clip(&other, 0.0, 0), blur_zone], vec![1.02]));
+
         let mut report = Vec::new();
         for (name, clips, times) in &scenes {
             let output = directory.join(format!("{name}.mp4"));

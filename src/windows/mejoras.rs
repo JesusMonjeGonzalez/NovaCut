@@ -1914,7 +1914,15 @@ impl NovaCutWindows {
             match (medida, self.project.clips.get_mut(index)) {
                 (Ok(lufs), Some(clip)) => {
                     clip.gain_db = ganancia_para(lufs);
-                    ajustados.push(format!("{} {:+.1} dB", clip.name(), clip.gain_db));
+                    // La ganancia tiene tope de ±24 dB: una voz casi muda
+                    // se queda por debajo y hay que decirlo.
+                    let corto = (LUFS_VOZ - lufs - clip.gain_db).abs() > 0.5;
+                    ajustados.push(format!(
+                        "{} {:+.1} dB{}",
+                        clip.name(),
+                        clip.gain_db,
+                        if corto { " (al máximo: sigue más baja; súbela en el mezclador o con Sonido esencial)" } else { "" }
+                    ));
                 }
                 (Err(error), Some(clip)) => fallos.push(format!("{}: {error}", clip.name())),
                 _ => {}
@@ -5058,6 +5066,62 @@ mod tests {
         };
         let progreso = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
         run_export(&trabajo, &AtomicBool::new(false), &progreso).unwrap();
+    }
+
+    /// «Igualar voces» debe dejar la exportación a -16 LUFS, también si la
+    /// voz se grabó en mono (micros USB, notas de voz): al exportarla en
+    /// estéreo suena 3 dB más fuerte que medida como mono.
+    #[test]
+    fn igualar_voces_deja_la_exportacion_a_menos_16_lufs() {
+        if !ffmpeg_real() {
+            return;
+        }
+        let carpeta = std::env::temp_dir().join(format!("novacut-voces-{}", std::process::id()));
+        std::fs::create_dir_all(&carpeta).unwrap();
+        let mut medidas = Vec::new();
+        for (nombre, canales) in [("mono", 1), ("estereo", 2)] {
+            let voz = carpeta.join(format!("{nombre}.wav"));
+            let estado = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "anoisesrc=color=pink:amplitude=0.3:d=8,lowpass=3000"])
+                .args(["-ac", &canales.to_string(), "-ar", "48000"])
+                .arg(&voz)
+                .status()
+                .unwrap();
+            assert!(estado.success());
+            let lufs = medir_lufs(&voz, 0.0, 8.0).unwrap();
+            let clip = RoughClip {
+                path: voz,
+                out_seconds: 8.0,
+                source_duration_seconds: Some(8.0),
+                has_video: false,
+                gain_db: ganancia_para(lufs),
+                ..Default::default()
+            };
+            let salida = carpeta.join(format!("{nombre}-salida.wav"));
+            let trabajo = RenderJob {
+                clips: vec![clip],
+                output: salida.clone(),
+                fast: false,
+                size: (640, 360),
+                audio_only: true,
+                format: ExportFormat::WavAudio,
+                track_gains: Vec::new(),
+                master_gain_db: 0.0,
+                normalize_loudness: false,
+                timebase: Timebase::P25,
+                measured_loudness: None,
+                hw: None,
+                skip: 0.0,
+                length: None,
+                encode: exportacion::EncodeSettings::default(),
+            };
+            let progreso = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
+            run_export(&trabajo, &AtomicBool::new(false), &progreso).unwrap();
+            let final_ = medir_lufs(&salida, 0.0, 8.0).unwrap();
+            medidas.push(format!("{nombre}: origen {lufs:.1}, exportado {final_:.1}"));
+            assert!((final_ - LUFS_VOZ).abs() <= 1.0, "{}", medidas.join(" · "));
+        }
+        let _ = std::fs::remove_dir_all(&carpeta);
     }
 
     #[test]
