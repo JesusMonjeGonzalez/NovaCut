@@ -23,6 +23,7 @@ mod aceleracion;
 mod animacion;
 mod batch;
 mod curvas_hsl;
+mod graficos;
 mod render_fondo;
 mod texto_animado;
 mod command_center;
@@ -1206,6 +1207,28 @@ fn title_layer_filters(
     preview_time: Option<f64>,
     duration: f64,
 ) -> String {
+    let texto = title_text_filters(title, font, fontsize, canvas, preview_time, duration);
+    let Some(grafico) = title.style.grafico.as_ref() else {
+        return texto;
+    };
+    // El gráfico va debajo y el texto (si lo hay) encima.
+    let dibujo = graficos::filtros(grafico, canvas, duration, preview_time, 30.0);
+    if texto == "null" || title.text.trim().is_empty() && title.style.captions.is_none() {
+        dibujo
+    } else {
+        format!("{dibujo},{texto}")
+    }
+}
+
+/// Texto de una capa de título (estático, animado o subtítulos).
+fn title_text_filters(
+    title: &Titulo,
+    font: &Path,
+    fontsize: f64,
+    canvas: (u32, u32),
+    preview_time: Option<f64>,
+    duration: f64,
+) -> String {
     let fontcolor = hex_color(title.red, title.green, title.blue);
     let escaped_font = escape_filter_path(font);
     if title.style.captions.is_none() {
@@ -1534,7 +1557,10 @@ fn expand_speed_ramps(clips: Vec<RoughClip>) -> Vec<RoughClip> {
 /// Pipeline compartido de preparación para render: anidados, transiciones y
 /// rampas. Los keyframes no se trocean: el grafo los anima por fotograma.
 fn prepare_render_clips(clips: &[RoughClip]) -> Vec<RoughClip> {
-    expand_speed_ramps(resolve_render_clips(&flatten_nested(clips)))
+    let mut flat = flatten_nested(clips);
+    // Cada audiograma toma el audio que suena bajo él en este montaje.
+    graficos::resolver_fuentes(&mut flat);
+    expand_speed_ramps(resolve_render_clips(&flat))
 }
 
 fn flatten_nested(clips: &[RoughClip]) -> Vec<RoughClip> {
@@ -2087,7 +2113,12 @@ impl RoughClip {
         if let Some(title) = &self.title {
             // En una sola línea: el salto salía como un recuadro en la timeline.
             return if title.text.trim().is_empty() {
-                "Título".to_owned()
+                title
+                    .style
+                    .grafico
+                    .as_ref()
+                    .map_or("Título", |grafico| grafico.nombre())
+                    .to_owned()
             } else {
                 title
                     .text
@@ -7059,6 +7090,43 @@ impl NovaCutWindows {
         self.select_only(self.project.clips.len() - 1);
         self.finish_edit(before);
         self.status = status.to_owned();
+    }
+
+    /// Capa gráfica en la pista libre de encima. El audiograma y la barra
+    /// de progreso cubren de su inicio al final del montaje (la barra, todo
+    /// el montaje); las formas, 5 s desde el cabezal.
+    fn add_graphic_layer(&mut self, grafico: graficos::Grafico) {
+        let before = self.project.clone();
+        let total = self.project.duration();
+        let (start, length) = match grafico {
+            graficos::Grafico::BarraProgreso { .. } => (0.0, total),
+            graficos::Grafico::Audiograma { .. } => {
+                let start = self.playhead.min(total);
+                (start, total - start)
+            }
+            graficos::Grafico::Forma { .. } => (self.playhead.min(total), 5.0),
+        };
+        let length = if length > 0.5 { length } else { 5.0 };
+        let track = track_above(&self.project.clips, start, start + length);
+        let nombre = grafico.nombre();
+        self.project.clips.push(RoughClip {
+            out_seconds: length,
+            timeline_start: start,
+            track,
+            has_audio: false,
+            title: Some(Titulo {
+                text: String::new(),
+                style: efectos::TitleStyle {
+                    grafico: Some(grafico),
+                    ..Default::default()
+                },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        });
+        self.select_only(self.project.clips.len() - 1);
+        self.finish_edit(before);
+        self.status = format!("Capa «{nombre}» añadida; ajústala en el Inspector");
     }
 
     /// Añade una capa de ajuste en la pista de vídeo más alta, para que
@@ -12805,6 +12873,20 @@ impl eframe::App for NovaCutWindows {
                                     }
                                 }
                             });
+                            ui.menu_button("Gráficos", |ui| {
+                                ui.set_min_width(240.0);
+                                for (code, label, hint) in [
+                                    (25, "Audiograma", "La onda de la voz que suena debajo, animada: para clips de podcast en redes"),
+                                    (26, "Barra de progreso", "Barra que avanza durante todo el montaje, como en Shorts y Reels"),
+                                    (27, "Rectángulo", "Fondo de color semitransparente para destacar texto"),
+                                    (28, "Marco", "Borde alrededor del encuadre o de una zona"),
+                                ] {
+                                    if ui.button(label).on_hover_text(hint).clicked() {
+                                        insert_action = Some(code);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                             if ui
                                 .button("Mate de color")
                                 .on_hover_text("Fondo liso a pantalla completa, como Nuevo elemento › Mate de color")
@@ -12928,6 +13010,10 @@ impl eframe::App for NovaCutWindows {
                             },
                             "Texto a máquina creado; escribe el texto en el inspector",
                         ),
+                        Some(25) => self.add_graphic_layer(graficos::Grafico::audiograma()),
+                        Some(26) => self.add_graphic_layer(graficos::Grafico::barra_de_progreso()),
+                        Some(27) => self.add_graphic_layer(graficos::Grafico::rectangulo()),
+                        Some(28) => self.add_graphic_layer(graficos::Grafico::marco()),
                         Some(1) => self.add_adjustment_layer_at_playhead(),
                         Some(2) => self.add_marker(),
                         Some(3) => self.add_subtitle(),
@@ -13634,6 +13720,59 @@ impl eframe::App for NovaCutWindows {
                             let Some(title) = clip.title.as_mut() else {
                                 unreachable!()
                             };
+                            if let Some(grafico) = title.style.grafico.as_mut() {
+                                theme::section_label(ui, grafico.nombre());
+                                let color_rgb = |ui: &mut egui::Ui, color: &mut [f64; 3]| {
+                                    let mut rgb = [color[0] as f32, color[1] as f32, color[2] as f32];
+                                    let mut changed = false;
+                                    ui.horizontal(|ui| {
+                                        ui.label("Color");
+                                        if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                            *color = [rgb[0] as f64, rgb[1] as f64, rgb[2] as f64];
+                                            changed = true;
+                                        }
+                                    });
+                                    changed
+                                };
+                                match grafico {
+                                    graficos::Grafico::Audiograma { estilo, color, alto, centro_y, .. } => {
+                                        ui.label(
+                                            egui::RichText::new("Dibuja el audio que suena debajo de esta capa; si la mueves, lo sigue")
+                                                .size(11.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            for opcion in graficos::EstiloOnda::TODOS {
+                                                trim_changed |= ui.selectable_value(estilo, opcion, opcion.nombre()).changed();
+                                            }
+                                        });
+                                        trim_changed |= color_rgb(ui, color);
+                                        trim_changed |= ui.add(egui::Slider::new(alto, 0.05..=0.8).text("Alto")).changed();
+                                        trim_changed |= ui
+                                            .add(egui::Slider::new(centro_y, 0.0..=1.0).text("Posición vertical"))
+                                            .changed();
+                                    }
+                                    graficos::Grafico::BarraProgreso { color, grosor, arriba } => {
+                                        trim_changed |= color_rgb(ui, color);
+                                        trim_changed |= ui.add(egui::Slider::new(grosor, 4.0..=60.0).text("Grosor (px)")).changed();
+                                        trim_changed |= ui.checkbox(arriba, "Arriba").on_hover_text("Por defecto va abajo").changed();
+                                    }
+                                    graficos::Grafico::Forma { tipo, color, opacidad, caja, grosor } => {
+                                        trim_changed |= color_rgb(ui, color);
+                                        trim_changed |= ui.add(egui::Slider::new(opacidad, 0.0..=1.0).text("Opacidad")).changed();
+                                        for (valor, nombre) in caja.iter_mut().zip(["X", "Y", "Ancho", "Alto"]) {
+                                            trim_changed |= ui.add(egui::Slider::new(valor, 0.0..=1.0).text(nombre)).changed();
+                                        }
+                                        if *tipo == graficos::TipoForma::Marco {
+                                            trim_changed |= ui.add(egui::Slider::new(grosor, 1.0..=60.0).text("Grosor (px)")).changed();
+                                        }
+                                    }
+                                }
+                                if ui.button("Quitar el gráfico").on_hover_text("Deja solo el texto de la capa").clicked() {
+                                    title.style.grafico = None;
+                                    trim_changed = true;
+                                }
+                            }
                             if let Some(captions) = title.style.captions.as_mut() {
                                 theme::section_label(ui, "Subtítulos animados");
                                 egui::ComboBox::from_id_salt("caption_preset")
@@ -13688,7 +13827,11 @@ impl eframe::App for NovaCutWindows {
                                     .color(theme::TEXT_FAINT),
                                 );
                             } else {
-                                ui.label("Texto del título");
+                                ui.label(if title.style.grafico.is_some() {
+                                    "Texto encima (opcional)"
+                                } else {
+                                    "Texto del título"
+                                });
                                 trim_changed |= ui
                                     .add(
                                         egui::TextEdit::multiline(&mut title.text)
@@ -22754,6 +22897,136 @@ mod render_real_tests {
         let frame = render_preview_frame(&[(lower_third, 0.0)], Timebase::from_fps(25.0)).unwrap();
         let grey = frame.pixels.chunks(4).filter(|p| p[0] > 20 || p[1] > 20 || p[2] > 20).count();
         assert_eq!(grey, 0, "la caja no debe verse antes que el texto");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn audiogram_and_progress_bar_draw_in_monitor_and_export() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("graficos");
+        let (_, music) = generate(&directory);
+        let voice = RoughClip {
+            path: music,
+            out_seconds: 4.0,
+            source_duration_seconds: Some(8.0),
+            has_video: false,
+            has_audio: true,
+            ..Default::default()
+        };
+        let layer = |grafico: graficos::Grafico| RoughClip {
+            out_seconds: 4.0,
+            has_audio: false,
+            track: 1,
+            title: Some(Titulo {
+                text: String::new(),
+                style: efectos::TitleStyle { grafico: Some(grafico), ..Default::default() },
+                ..Titulo::default()
+            }),
+            ..Default::default()
+        };
+        // Audiograma: blanco en su franja central, nada arriba.
+        let clips = vec![voice.clone(), layer(graficos::Grafico::audiograma())];
+        let prepared = prepare_render_clips(&clips);
+        let frame = render_preview_frame(&[(prepared[1].clone(), 2.0)], Timebase::from_fps(25.0)).unwrap();
+        let white_in_rows = |pixels: &[u8], width: usize, rows: std::ops::Range<usize>| {
+            rows.map(|y| {
+                (0..width)
+                    .filter(|x| {
+                        let p = &pixels[(y * width + x) * 4..][..3];
+                        p[0] > 200 && p[1] > 200 && p[2] > 200
+                    })
+                    .count()
+            })
+            .sum::<usize>()
+        };
+        let (w, h) = (frame.width, frame.height);
+        let band = white_in_rows(&frame.pixels, w, (h * 55 / 100)..(h * 70 / 100));
+        let top = white_in_rows(&frame.pixels, w, 0..(h / 4));
+        assert!(band > 200 && top == 0, "audiograma: franja {band}, arriba {top}");
+        let output = directory.join("audiograma.mp4");
+        export(&clips, &output, ExportFormat::Mp4Video).unwrap();
+        assert!((probe_duration(&output) - 4.0).abs() < 0.2);
+        let exported = frame_rgb(&output, 2.0);
+        let white = |rows: std::ops::Range<usize>| {
+            rows.map(|y| (0..160).filter(|x| exported[(y * 160 + x) * 3..][..3].iter().all(|&v| v > 160)).count())
+                .sum::<usize>()
+        };
+        assert!(white(50..63) > 20 && white(0..22) == 0, "audiograma exportado: {}", white(50..63));
+        // Barra de progreso: al 25 % del tiempo cubre la cuarta parte izquierda.
+        let bar = vec![voice, layer(graficos::Grafico::barra_de_progreso())];
+        let prepared = prepare_render_clips(&bar);
+        let frame = render_preview_frame(&[(prepared[1].clone(), 1.0)], Timebase::from_fps(25.0)).unwrap();
+        let (w, h) = (frame.width, frame.height);
+        let cyan = |x: usize| {
+            let p = &frame.pixels[((h - 2) * w + x) * 4..][..3];
+            p[2] > 150 && p[0] < 80
+        };
+        assert!(cyan(w / 10) && !cyan(w / 2), "la barra debe ir por el 25 %");
+        let output = directory.join("barra.mp4");
+        export(&bar, &output, ExportFormat::Mp4Video).unwrap();
+        let early = frame_rgb(&output, 0.5);
+        let late = frame_rgb(&output, 3.5);
+        // `frame_rgb` reduce a 160×90: la barra de 14 px a 1080p queda en
+        // la última fila.
+        let bottom_cyan = |rgb: &[u8]| {
+            let (w, h) = (160, 90);
+            (0..w)
+                .filter(|x| {
+                    let p = &rgb[((h - 1) * w + x) * 3..][..3];
+                    p[2] > 120 && p[0] < 80
+                })
+                .count()
+        };
+        assert!(bottom_cyan(&late) > bottom_cyan(&early) * 3, "la barra crece al exportar");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn audiogram_follows_the_playhead_in_camera_files() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        // Un MP4 con un solo keyframe: amovie busca a él (el segundo 0) y
+        // el audiograma enseñaba siempre el principio. Silencio 2 s y tono.
+        let directory = work_dir("audiograma-mp4");
+        let camera = directory.join("camara.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=if(gt(t\\,2)\\,0.8*sin(2*PI*330*t)\\,0):d=5")
+            .args(["-c:v", "libx264", "-g", "250", "-c:a", "aac", "-shortest"])
+            .arg(&camera)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let clips = vec![
+            RoughClip {
+                path: camera,
+                out_seconds: 5.0,
+                source_duration_seconds: Some(5.0),
+                has_audio: true,
+                ..Default::default()
+            },
+            RoughClip {
+                out_seconds: 5.0,
+                has_audio: false,
+                track: 1,
+                title: Some(Titulo {
+                    text: String::new(),
+                    style: efectos::TitleStyle { grafico: Some(graficos::Grafico::audiograma()), ..Default::default() },
+                    ..Titulo::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        let prepared = prepare_render_clips(&clips);
+        let white = |time: f64| {
+            let frame = render_preview_frame(&[(prepared[1].clone(), time)], Timebase::from_fps(25.0)).unwrap();
+            frame.pixels.chunks(4).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count()
+        };
+        let (quiet, loud) = (white(1.0), white(3.5));
+        assert!(quiet < 50 && loud > 500, "silencio {quiet}, tono {loud}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

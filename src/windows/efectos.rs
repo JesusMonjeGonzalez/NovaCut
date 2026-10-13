@@ -531,6 +531,8 @@ pub struct TitleStyle {
     pub animacion: super::texto_animado::AnimacionTexto,
     /// Las letras se van al final, en orden inverso.
     pub salida_animada: bool,
+    /// Audiograma, barra de progreso o forma debajo del texto.
+    pub grafico: Option<super::graficos::Grafico>,
 }
 
 /// Contorno y sombra de un título en formato `:clave=valor` de `drawtext`.
