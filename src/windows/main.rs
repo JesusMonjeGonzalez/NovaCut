@@ -23748,6 +23748,109 @@ mod render_real_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Claqueta: fogonazo de dos fotogramas (a ×2 se descarta uno de cada
+    /// dos) y pitido de 40 ms en 2, 5 y 8 s.
+    /// Tras cortar, acelerar, separar el audio o invertir, cada fogonazo de
+    /// la exportación debe tener su pitido a menos de un fotograma y caer
+    /// donde dice el montaje.
+    #[test]
+    fn exports_keep_picture_and_sound_in_sync() {
+        if !ffmpeg_available() && skip("sin FFmpeg") {
+            return;
+        }
+        let directory = work_dir("sincronia");
+        let clapper = directory.join("claqueta.mp4");
+        let status = Command::new(tool_path("ffmpeg.exe"))
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=320x180:r=25:d=10,format=yuv420p,geq=lum='if(eq(N\\,50)+eq(N\\,51)+eq(N\\,125)+eq(N\\,126)+eq(N\\,200)+eq(N\\,201)\\,235\\,16)':cb=128:cr=128")
+            .args(["-f", "lavfi", "-i"])
+            .arg("aevalsrc='if(between(t\\,2\\,2.04)+between(t\\,5\\,5.04)+between(t\\,8\\,8.04)\\,0.8*sin(2*PI*1000*t)\\,0)':s=48000:d=10")
+            .args(["-c:v", "libx264", "-qp", "0", "-c:a", "pcm_s16le", "-shortest"])
+            .arg(directory.join("claqueta.mov"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _ = std::fs::rename(directory.join("claqueta.mov"), &clapper);
+        let clapper = directory.join("claqueta.mp4");
+        let piece = |in_s: f64, out_s: f64, start: f64| RoughClip {
+            path: clapper.clone(),
+            in_seconds: in_s,
+            out_seconds: out_s,
+            timeline_start: start,
+            source_duration_seconds: Some(10.0),
+            ..Default::default()
+        };
+        let mut scenes: Vec<(&str, Vec<RoughClip>, Vec<f64>)> = Vec::new();
+        scenes.push(("cortes", vec![piece(1.5, 3.0, 0.0), piece(4.5, 6.0, 1.5)], vec![0.5, 2.0]));
+        scenes.push(("desplazado", vec![piece(1.5, 3.0, 3.3)], vec![3.8]));
+        let mut fast = piece(1.0, 9.0, 0.0);
+        fast.speed = 2.0;
+        scenes.push(("x2", vec![fast], vec![0.5, 2.0, 3.5]));
+        let mut slow = piece(1.5, 2.5, 0.0);
+        slow.speed = 0.5;
+        scenes.push(("x0.5", vec![slow], vec![1.0]));
+        let picture = RoughClip { has_audio: false, ..piece(1.5, 6.0, 0.0) };
+        let sound = RoughClip { has_video: false, track: 0, ..piece(1.5, 6.0, 0.0) };
+        scenes.push(("audio separado", vec![picture, sound], vec![0.5, 3.5]));
+        let mut backwards = piece(1.0, 6.0, 0.0);
+        backwards.fx.reverse = true;
+        scenes.push(("invertido", vec![backwards], vec![1.0, 4.0]));
+
+        let onsets = |samples: &[f32], rate: f64| {
+            let mut found = Vec::new();
+            let mut quiet_since = 0usize;
+            for (i, v) in samples.iter().enumerate() {
+                if v.abs() > 0.3 {
+                    if i - quiet_since > (rate * 0.2) as usize {
+                        found.push(i as f64 / rate);
+                    }
+                    quiet_since = i;
+                }
+            }
+            found
+        };
+        let mut report = Vec::new();
+        for (name, clips, expected) in &scenes {
+            let output = directory.join(format!("{}.mp4", name.replace(' ', "-")));
+            export(clips, &output, ExportFormat::Mp4Video).unwrap();
+            let luma = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-i"])
+                .arg(&output)
+                .args(["-vf", "scale=8:8,format=gray", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            // Un fogonazo es el primer fotograma de cada racha clara.
+            let lit: Vec<bool> = luma.chunks(64).map(|frame| frame[27] > 128).collect();
+            let flashes: Vec<f64> = (0..lit.len())
+                .filter(|&n| lit[n] && (n == 0 || !lit[n - 1]))
+                .map(|n| n as f64 / 25.0)
+                .collect();
+            let pcm = Command::new(tool_path("ffmpeg.exe"))
+                .args(["-v", "error", "-i"])
+                .arg(&output)
+                .args(["-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            let samples: Vec<f32> = pcm.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            let beeps = onsets(&samples, 48000.0);
+            let line = format!("{name}: fogonazos {flashes:?}, pitidos {beeps:?}, esperado {expected:?}");
+            eprintln!("SINCRONIA {line}");
+            let near = |list: &[f64], t: f64, tolerance: f64| list.iter().any(|x| (x - t).abs() <= tolerance);
+            // Invertido: el fogonazo y el pitido van al revés y empiezan
+            // un fotograma (40 ms) antes.
+            let tolerance = if *name == "invertido" { 0.09 } else { 0.045 };
+            let ok = flashes.len() == expected.len()
+                && expected.iter().all(|t| near(&flashes, *t, tolerance) && near(&beeps, *t, tolerance));
+            if !ok {
+                report.push(line);
+            }
+        }
+        assert!(report.is_empty(), "desincronizado:\n{}", report.join("\n"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// Fotograma N de origen = gris N·4: el monitor debe enseñar el mismo
     /// fotograma del medio que la exportación (iba uno por delante).
     #[test]
