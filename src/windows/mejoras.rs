@@ -4992,7 +4992,21 @@ mod tests {
 
     /// Vídeo de prueba de 2 s con una fuente lavfi (y tono de 440 Hz).
     fn medio_de_prueba(nombre: &str, fuente: &str) -> PathBuf {
-        let carpeta = std::env::temp_dir().join(format!("novacut-mejoras-{}", std::process::id()));
+        let propia = format!("novacut-mejoras-{}", std::process::id());
+        // La comparten pruebas en paralelo y ninguna puede borrarla: cada
+        // ejecución borra las que dejaron las anteriores.
+        static LIMPIEZA: std::sync::Once = std::sync::Once::new();
+        LIMPIEZA.call_once(|| {
+            if let Ok(entradas) = std::fs::read_dir(std::env::temp_dir()) {
+                for entrada in entradas.filter_map(Result::ok) {
+                    let nombre = entrada.file_name().to_string_lossy().into_owned();
+                    if nombre.starts_with("novacut-mejoras-") && nombre != propia {
+                        let _ = std::fs::remove_dir_all(entrada.path());
+                    }
+                }
+            }
+        });
+        let carpeta = std::env::temp_dir().join(propia);
         std::fs::create_dir_all(&carpeta).unwrap();
         let ruta = carpeta.join(nombre);
         let estado = Command::new(tool_path("ffmpeg.exe"))

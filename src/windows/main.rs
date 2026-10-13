@@ -11474,6 +11474,12 @@ impl NovaCutWindows {
             return;
         }
         let rate = rate.clamp(1, 8);
+        // Con el cabezal al final, reproducir vuelve al principio (como
+        // Premiere): antes no pasaba nada.
+        let frame = self.project.timebase().seconds(1);
+        if !self.export_range_only && self.playhead >= self.project.duration() - frame {
+            self.playhead = 0.0;
+        }
         // Reproducir dentro del rango arranca en su entrada si el cabezal
         // está fuera, para no esperar a que llegue.
         if self.export_range_only {
