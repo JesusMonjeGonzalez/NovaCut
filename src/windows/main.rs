@@ -2409,7 +2409,7 @@ fn split_by_scene_cuts(clip: &RoughClip, cut_source_times: &[f64]) -> Vec<RoughC
 /// Mezcla el montaje a WAV 16 kHz y lo transcribe palabra a palabra con
 /// Whisper. Los tiempos quedan en segundos de timeline.
 fn transcribe_mix(
-    prepared: &[RoughClip],
+    clips: &[RoughClip],
     track_gains: &[f64],
     master_gain_db: f64,
     timebase: Timebase,
@@ -2423,10 +2423,40 @@ fn transcribe_mix(
     let json = prefix.with_extension("json");
     let _ = std::fs::remove_file(&wav);
     let _ = std::fs::remove_file(&json);
+    let prepared = &prepare_render_clips(clips);
     let mut ffmpeg = Command::new(tool_path("ffmpeg.exe"));
     ffmpeg.args(["-y", "-v", "error"]);
-    let (indices, titles) = push_render_inputs(&mut ffmpeg, prepared, (640, 360), false, timebase);
-    let result = build_render_filters(
+    // Con cientos de cortes (lo normal tras editar por texto), la mezcla se
+    // hace por tramos y se pasa a 16 kHz mono para Whisper.
+    let many = prepared.len() > por_tramos::UMBRAL_CLIPS;
+    let mix = prefix.with_extension("mezcla.wav");
+    if many {
+        let job = RenderJob {
+            clips: clips.to_vec(),
+            output: mix.clone(),
+            fast: false,
+            size: (640, 360),
+            audio_only: true,
+            format: ExportFormat::WavAudio,
+            track_gains: track_gains.to_vec(),
+            master_gain_db,
+            normalize_loudness: false,
+            timebase,
+            measured_loudness: None,
+            hw: None,
+            skip: 0.0,
+            length: None,
+            encode: exportacion::EncodeSettings::default(),
+        };
+        let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
+        run_export(&job, &AtomicBool::new(false), &progress)?;
+        ffmpeg.arg("-i").arg(&mix);
+    }
+    let result = if many {
+        Ok(vec!["[0:a:0]anull[aout]".to_owned()])
+    } else {
+        let (indices, titles) = push_render_inputs(&mut ffmpeg, prepared, (640, 360), false, timebase);
+        build_render_filters(
         prepared,
         &indices,
         &titles,
@@ -2439,7 +2469,8 @@ fn transcribe_mix(
         timebase,
         None,
     )
-    .and_then(|filters| {
+    };
+    let result = result.and_then(|filters| {
         let _graph = attach_graph(&mut ffmpeg, &filters)?;
         let output = ffmpeg
             .args([
@@ -2486,6 +2517,7 @@ fn transcribe_mix(
     });
     let _ = std::fs::remove_file(wav);
     let _ = std::fs::remove_file(json);
+    let _ = std::fs::remove_file(mix);
     result
 }
 
@@ -5303,7 +5335,8 @@ impl NovaCutWindows {
         if self.loudness_result.is_some() || self.project.clips.is_empty() {
             return;
         }
-        let prepared = prepare_render_clips(&self.effective_clips());
+        let effective = self.effective_clips();
+        let prepared = prepare_render_clips(&effective);
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
         let timebase = self.project.timebase();
@@ -5311,6 +5344,49 @@ impl NovaCutWindows {
         let (sender, receiver) = mpsc::channel();
         self.loudness_result = Some(receiver);
         self.status = "Analizando sonoridad del montaje...".to_owned();
+        if prepared.len() > por_tramos::UMBRAL_CLIPS {
+            // Con cientos de clips, un grafo único abriría todos a la vez:
+            // se mezcla a WAV por tramos y se mide ese archivo.
+            std::thread::spawn(move || {
+                let wav = std::env::temp_dir().join(format!("novacut-sonoridad-{}.wav", std::process::id()));
+                let job = RenderJob {
+                    clips: effective,
+                    output: wav.clone(),
+                    fast: false,
+                    size: (640, 360),
+                    audio_only: true,
+                    format: ExportFormat::WavAudio,
+                    track_gains,
+                    master_gain_db,
+                    normalize_loudness: false,
+                    timebase,
+                    measured_loudness: None,
+                    hw: None,
+                    skip: 0.0,
+                    length: None,
+                    encode: exportacion::EncodeSettings::default(),
+                };
+                let progress = Arc::new(std::sync::Mutex::new(RenderProgress::default()));
+                let result = run_export(&job, &AtomicBool::new(false), &progress).and_then(|()| {
+                    let output = Command::new(tool_path("ffmpeg.exe"))
+                        .args(["-v", "info", "-i"])
+                        .arg(&wav)
+                        .args(["-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json", "-f", "null", "-"])
+                        .creation_flags(BACKGROUND_PROCESS)
+                        .output()
+                        .map_err(|error| format!("No se pudo iniciar FFmpeg: {error}"))?;
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if output.status.success() {
+                        parse_loudness(&stderr)
+                    } else {
+                        Err(stderr.trim().to_owned())
+                    }
+                });
+                let _ = std::fs::remove_file(&wav);
+                let _ = sender.send((generation, result));
+            });
+            return;
+        }
         std::thread::spawn(move || {
             let mut command = Command::new(tool_path("ffmpeg.exe"));
             command.args(["-v", "info"]);
@@ -5836,7 +5912,7 @@ impl NovaCutWindows {
             };
             return;
         };
-        let prepared = prepare_render_clips(&self.project.clips);
+        let clips = self.project.clips.clone();
         let track_gains = self.project.track_gains.clone();
         let master_gain_db = self.project.master_gain_db;
         let timebase = self.project.timebase();
@@ -5846,7 +5922,7 @@ impl NovaCutWindows {
         self.status = "Preparando audio para Whisper...".to_owned();
         std::thread::spawn(move || {
             let result = transcribe_mix(
-                &prepared,
+                &clips,
                 &track_gains,
                 master_gain_db,
                 timebase,
@@ -23047,7 +23123,7 @@ mod render_real_tests {
         let timebase = Timebase::from_fps(25.0);
         let transcribe = |clips: &[RoughClip]| {
             transcribe_mix(
-                &prepare_render_clips(clips),
+                clips,
                 &[],
                 0.0,
                 timebase,
@@ -23076,6 +23152,20 @@ mod render_real_tests {
         assert!(!after.contains("sea"), "tras el corte: {after}");
         assert!(after.contains("fácil"), "tras el corte: {after}");
         assert!(after.contains("bienvenidos"), "tras el corte: {after}");
+        // Muchos cortes contiguos (como tras editar por texto): la mezcla
+        // va por tramos y Whisper oye lo mismo.
+        let piece = duration / 30.0;
+        let pieces: Vec<RoughClip> = (0..30)
+            .map(|i| RoughClip {
+                in_seconds: i as f64 * piece,
+                out_seconds: (i + 1) as f64 * piece,
+                timeline_start: i as f64 * piece,
+                ..clips[0].clone()
+            })
+            .collect();
+        assert!(prepare_render_clips(&pieces).len() > por_tramos::UMBRAL_CLIPS);
+        let cut_up = joined(&transcribe(&pieces));
+        assert!(cut_up.contains("bienvenidos") && cut_up.contains("fácil"), "por tramos: {cut_up}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
