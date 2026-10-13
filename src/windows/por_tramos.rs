@@ -96,6 +96,29 @@ pub fn ventanas(clips: &[RoughClip], desde: f64, hasta: f64, fps: f64) -> Vec<(f
     salida
 }
 
+/// Hasta dónde puede componer la reproducción desde `desde` sin pasar de
+/// `max` clips a la vez: el final de la primera ventana. Al llegar ahí, la
+/// reproducción sigue con la siguiente.
+pub fn horizonte(clips: &[RoughClip], desde: f64, hasta: f64, fps: f64, max: usize) -> f64 {
+    let fotograma = |t: f64| (t * fps).round() / fps;
+    let mut cortes: Vec<f64> = clips
+        .iter()
+        .flat_map(|clip| [clip.timeline_start, clip.timeline_start + clip.duration()])
+        .map(fotograma)
+        .filter(|t| *t > desde + 0.5 / fps && *t < hasta)
+        .collect();
+    cortes.push(hasta);
+    cortes.sort_by(f64::total_cmp);
+    let mut fin = cortes[0];
+    for corte in cortes.into_iter().skip(1) {
+        if montaje::window(clips, desde, corte).0.len() > max {
+            break;
+        }
+        fin = corte;
+    }
+    fin
+}
+
 fn comillas(ruta: &Path) -> String {
     ruta.to_string_lossy().replace('\'', "'\\''")
 }
@@ -296,6 +319,16 @@ mod tests {
         let tramos = ventanas(&clips, 0.0, 40.0, 30.0);
         assert_eq!(tramos.last().unwrap().1, 40.0);
         assert!(tramos.len() > 1);
+    }
+
+    #[test]
+    fn la_reproduccion_mira_hasta_donde_caben_pocos_clips() {
+        let clips: Vec<RoughClip> = (0..200).map(|i| corte(i as f64 * 0.5, 0.5)).collect();
+        let fin = horizonte(&clips, 10.0, 100.0, 25.0, 12);
+        assert!(fin > 10.0 && fin < 100.0);
+        assert!(montaje::window(&clips, 10.0, fin).0.len() <= 12);
+        // Con pocos clips llega hasta el final.
+        assert_eq!(horizonte(&clips[..5], 0.0, 2.5, 25.0, 12), 2.5);
     }
 
     #[test]

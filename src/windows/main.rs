@@ -900,6 +900,9 @@ const THUMB_WIDTH: usize = 160;
 const THUMB_HEIGHT: usize = 90;
 
 const MONITOR_WIDTH: usize = 640;
+/// Clips que la reproducción compone a la vez como mucho; con más, sigue
+/// por tramos (ver `por_tramos::horizonte`).
+const PLAYBACK_MAX_CLIPS: usize = 12;
 const MONITOR_HEIGHT: usize = 360;
 /// Duración por defecto de una imagen fija al importarla.
 const DEFAULT_IMAGE_DURATION: f64 = 5.0;
@@ -939,6 +942,9 @@ struct Playback {
     audio_chunks: Arc<AtomicU64>,
     /// Grafos de los procesos en curso; se borran al parar.
     _graphs: Vec<GraphFile>,
+    /// Fin del tramo compuesto si no llega al final del montaje: ahí la
+    /// reproducción sigue con el siguiente (ver `por_tramos::horizonte`).
+    window_end: Option<f64>,
 }
 
 impl Playback {
@@ -11405,8 +11411,22 @@ impl NovaCutWindows {
         let start_playhead = timebase.seconds(timebase.frames(self.playhead));
         // Con un render de previsualización vigente, su tramo se lee ya
         // compuesto y suena y se ve en tiempo real.
-        let (windowed, preroll) =
-            montaje::window(&self.clips_para_reproducir(), start_playhead, f64::INFINITY);
+        // Hasta donde quepan pocos clips: con cientos de cortes, componerlos
+        // todos a la vez agotaba la memoria (cada clip es un decodificador).
+        let source_clips = self.clips_para_reproducir();
+        let sequence_end = source_clips
+            .iter()
+            .map(|clip| clip.timeline_start + clip.duration())
+            .fold(0.0, f64::max);
+        let horizon = por_tramos::horizonte(
+            &source_clips,
+            start_playhead,
+            sequence_end,
+            timebase.fps(),
+            PLAYBACK_MAX_CLIPS,
+        );
+        let window_end = (horizon < sequence_end - 0.001).then_some(horizon);
+        let (windowed, preroll) = montaje::window(&source_clips, start_playhead, horizon);
         let mut prepared = prepare_render_clips(&windowed);
         if self.use_proxies {
             use_proxy_paths(&mut prepared);
@@ -11446,6 +11466,9 @@ impl NovaCutWindows {
                 return;
             }
         };
+        if let Some(end) = window_end {
+            command.args(["-t", &format_seconds(preroll + end - start_playhead)]);
+        }
         let Ok(mut child) = command
             .args(["-map", &format!("[{monitor_label}]")])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
@@ -11533,8 +11556,11 @@ impl NovaCutWindows {
             self.status = "El montaje no se puede reproducir (revisa titulos y medios)".to_owned();
             return;
         };
+        let audio_end = window_end
+            .map(|end| format!(":duration={:.6}", end - start_playhead))
+            .unwrap_or_default();
         audio_filters.push(format!(
-            "[aout]atrim=start={preroll:.6},asetpts=PTS-STARTPTS{}[aplay]",
+            "[aout]atrim=start={preroll:.6}{audio_end},asetpts=PTS-STARTPTS{}[aplay]",
             atempo_chain(rate as u32)
         ));
         let audio_graph = match attach_graph(&mut audio_command, &audio_filters) {
@@ -11625,6 +11651,7 @@ impl NovaCutWindows {
             sink: Some(sink),
             audio_chunks,
             _graphs: vec![video_graph, audio_graph],
+            window_end,
         });
         self.status = if rate == 1 {
             "Reproduciendo el montaje".to_owned()
@@ -11753,6 +11780,7 @@ impl NovaCutWindows {
             sink: None,
             audio_chunks: Arc::new(AtomicU64::new(0)),
             _graphs: Vec::new(),
+            window_end: None,
         });
         self.status = format!("Marcha atrás a {step}× (J acelera, K para)");
     }
@@ -11845,6 +11873,7 @@ impl NovaCutWindows {
         let rate = playback.rate;
         let restart_at = playback.start_playhead;
         let nothing_played = reached_end && playback.last_consumed == 0;
+        let window_end = playback.window_end;
         if let Some(frame) = newest {
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
@@ -11861,6 +11890,12 @@ impl NovaCutWindows {
                 self.playhead = restart_at;
                 self.start_playback(rate);
                 self.status = "La GPU no pudo decodificar; se reproduce con CPU".to_owned();
+                return;
+            }
+            // Fin de un tramo que no es el final: sigue con el siguiente.
+            if let Some(end) = window_end.filter(|end| reached_end && !nothing_played && *end < total - 0.02) {
+                self.playhead = end;
+                self.start_playback(rate);
                 return;
             }
             if self.loop_playback && reached_end && rate > 0 {
